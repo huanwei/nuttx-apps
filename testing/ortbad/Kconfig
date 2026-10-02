@@ -1,0 +1,22 @@
+config TESTING_ORTBAD
+	tristate "[ORT] ORT-A user-fault isolation test"
+	default n
+	---help---
+		[ORT] 验证 MMU 平台（ARMv7-A）：用户进程越界只终止该进程，
+		不 panic 内核。
+
+		与 ortmem 的区别：那边验证的是 MPU 的**隔离机制**；
+		这边 MMU 的隔离是天然给的，要验证的是**故障处理策略** ——
+		NuttX 默认 PANIC_WITH_REGS，一个进程越界会带走整机。
+
+if TESTING_ORTBAD
+
+config TESTING_ORTBAD_PRIORITY
+	int "ortbad task priority"
+	default 100
+
+config TESTING_ORTBAD_STACKSIZE
+	int "ortbad stack size"
+	default 2048
+
+endif # TESTING_ORTBAD

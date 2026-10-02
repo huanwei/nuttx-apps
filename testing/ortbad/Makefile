@@ -1,0 +1,10 @@
+include $(APPDIR)/Make.defs
+
+PROGNAME  = ortbad
+PRIORITY  = $(CONFIG_TESTING_ORTBAD_PRIORITY)
+STACKSIZE = $(CONFIG_TESTING_ORTBAD_STACKSIZE)
+MODULE    = $(CONFIG_TESTING_ORTBAD)
+
+MAINSRC = ortbad_main.c
+
+include $(APPDIR)/Application.mk
