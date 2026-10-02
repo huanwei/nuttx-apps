@@ -1,0 +1,10 @@
+include $(APPDIR)/Make.defs
+
+PROGNAME  = orttest
+PRIORITY  = $(CONFIG_TESTING_ORTMEM_PRIORITY)
+STACKSIZE = $(CONFIG_TESTING_ORTMEM_STACKSIZE)
+MODULE    = $(CONFIG_TESTING_ORTMEM)
+
+MAINSRC = orttest_main.c
+
+include $(APPDIR)/Application.mk

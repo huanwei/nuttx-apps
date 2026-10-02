@@ -1,0 +1,17 @@
+config TESTING_ORTMEM
+	tristate "[ORT] MPU memory domain isolation test"
+	default n
+	---help---
+		[ORT] 验证 MPU 内存域隔离是否生效。
+
+if TESTING_ORTMEM
+
+config TESTING_ORTMEM_PRIORITY
+	int "ortmem task priority"
+	default 100
+
+config TESTING_ORTMEM_STACKSIZE
+	int "ortmem stack size"
+	default 2048
+
+endif # TESTING_ORTMEM
