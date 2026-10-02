@@ -18,7 +18,10 @@
 #include <signal.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/wait.h>
 #include <sys/prctl.h>
+#include <errno.h>
+#include <nuttx/sched.h>
 
 /* 与 arch/arm/src/armv7-m/arm_memdomain.h 保持一致 */
 
@@ -45,6 +48,62 @@ static int touch(volatile uint32_t *p, uint32_t val)
 #define CONC_ITERS  500
 
 static volatile int g_conc_err;
+
+/* --- 内核 → 监督者故障通道 ----------------------------------------------
+ *
+ * 为什么这条通道必须独立于容器的 SIGSEGV 处理器：
+ *   容器可控。`sigaction(SIGSEGV, SIG_IGN)` 在 NuttX 里等于把动作整个删掉，
+ *   容器一删，靠信号感知故障的监督者就瞎了。
+ *
+ *   ★ 终止权已经不由容器决定（arm_memfault.c 会升级到 SIGKILL），
+ *     但「知道出事了」不能也依赖容器 —— 那是降级状态机的输入。
+ */
+
+static volatile int g_fault_events;
+static volatile int g_fault_pid;
+static volatile int g_fault_count_seen;
+
+static void fault_sig_handler(int signo, FAR siginfo_t *info, FAR void *ctx)
+{
+  struct ort_faultrec_s rec;
+
+  g_fault_events++;
+  g_fault_pid = info->si_value.sival_int;
+
+  prctl(PR_GET_ORT_FAULT, &rec);
+  g_fault_count_seen = (int)rec.faults;
+
+  printf("[ortmem] supervisor: 收到故障通知 #%u victim=%d pc=%p addr=%p faults=%u\n",
+         rec.seq, rec.victim, (void *)rec.pc, (void *)rec.addr, rec.faults);
+  fflush(stdout);
+}
+
+/* 被监督的容器：绑域 1，去写域 2 的块 —— 必然故障。
+ *
+ * ★ 必须是**独立任务**，不能是监督者的 pthread：
+ *   nxsig_queue() 走的是 group 派发 —— 监督者与容器同组时，
+ *   故障通知会被投进容器自己，监督者根本收不到。
+ *   真实设计里 ort_safety 本来就是独立任务，这里如实模拟。
+ */
+
+static volatile uint32_t *g_container_target;
+
+static int faulty_container(int argc, FAR char *argv[])
+{
+  FAR char *endp;
+  long v = strtol(argv[1], &endp, 0);
+
+  prctl(PR_SET_ORT_DOMAIN, (int)v);
+
+  printf("[ortmem] container(domain %ld): writing %p, 应当被终止\n",
+         v, (void *)g_container_target);
+  fflush(stdout);
+
+  touch(g_container_target, 0xbadbadu);
+
+  printf("[ortmem] *** 容器存活 *** 隔离失效\n");
+  return 9;
+}
 
 /* --- 容器可否决终止？ ----------------------------------------------------
  *
@@ -198,6 +257,71 @@ int main(int argc, FAR char *argv[])
 
       printf("[ortmem] *** handler returned *** 监督者应当升级到 SIGKILL\n");
       return 6;
+    }
+
+  /* --- 监督者通道：容器故障必须能通知到监督者 --------------------------- */
+
+  if (argc > 1 && strcmp(argv[1], "supervise") == 0)
+    {
+      struct sigaction sa;
+      FAR char *cargv[2];
+      int status;
+      pid_t cpid;
+      int i;
+
+      printf("[ortmem] === supervisor channel test ===\n");
+
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_sigaction = fault_sig_handler;
+      sa.sa_flags     = SA_SIGINFO;
+      sigaction(ORT_SIGFAULT, &sa, NULL);
+
+      if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
+        {
+          printf("[ortmem] FAIL: PR_SET_ORT_SUPERVISOR 注册失败\n");
+          return 1;
+        }
+
+      printf("[ortmem] registered as supervisor (signal %d)\n", ORT_SIGFAULT);
+      fflush(stdout);
+
+      g_fault_events = 0;
+      g_container_target = (volatile uint32_t *)(POOL_BASE + 2 * BLOCK_SIZE);
+
+      /* 容器 = 独立任务（独立 group），绑域 1 去写域 2 */
+
+      cargv[0] = (FAR char *)"1";
+      cargv[1] = NULL;
+
+      cpid = task_create("ortfault", 100, 2048, faulty_container, cargv);
+      if (cpid < 0)
+        {
+          printf("[ortmem] FAIL: task_create = %d\n", (int)cpid);
+          return 1;
+        }
+
+      printf("[ortmem] container pid=%d spawned\n", (int)cpid);
+
+      /* 监督者等容器退出。注意 waitpid 会被 ORT_SIGFAULT 打断（EINTR）——
+       * 这本身是**正确**行为：故障通知应当能立即打断监督者的等待。
+       * 所以只重试 EINTR，其它错误才值得报。
+       */
+
+      while (waitpid(cpid, &status, 0) < 0 && errno == EINTR)
+        {
+        }
+
+      /* 信号可能在容器退出之后才投递，等一小会儿 */
+
+      for (i = 0; i < 20 && g_fault_events == 0; i++)
+        {
+          usleep(50000);
+        }
+
+      printf("[ortmem] SUPERVISE RESULT: %s (events=%d victim=%d faults=%d)\n",
+             g_fault_events == 1 ? "PASS" : "*** FAIL ***",
+             g_fault_events, g_fault_pid, g_fault_count_seen);
+      return g_fault_events == 1 ? 0 : 8;
     }
 
   /* --- 危险路径：处理器返回 → 必须升级到 SIGKILL ------------------------ */
