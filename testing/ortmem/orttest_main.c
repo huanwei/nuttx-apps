@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
+#include <pthread.h>
 #include <sys/prctl.h>
 
 /* 与 arch/arm/src/armv7-m/arm_memdomain.h 保持一致 */
@@ -28,12 +30,119 @@ static int touch(volatile uint32_t *p, uint32_t val)
   return (int)*p;
 }
 
+/* --- 并发测试 ------------------------------------------------------------
+ *
+ * 单线程测试只证明了「region 编程正确」，证明不了「切换时重编程正确」——
+ * 后者才是这套机制的核心风险：如果 ort_memdomain_switch() 的时机或
+ * region 编号搞错了，抢占发生时任务会拿到别人的块（读到别人的值）
+ * 或者访问自己的块反而 fault。
+ *
+ * 所以让多个线程绑不同域、同时高频读写各自的块，制造大量上下文切换。
+ */
+
+#define CONC_ITERS  500
+
+static volatile int g_conc_err;
+
+static FAR void *conc_worker(FAR void *arg)
+{
+  int domain = (int)(uintptr_t)arg;
+  volatile uint32_t *own =
+      (volatile uint32_t *)(POOL_BASE + (uint32_t)domain * BLOCK_SIZE);
+  uint32_t pattern = 0xc0de0000u + (uint32_t)domain;
+  int i;
+
+  if (prctl(PR_SET_ORT_DOMAIN, domain) != 0)
+    {
+      printf("[ortmem] worker %d: prctl FAILED\n", domain);
+      g_conc_err++;
+      return NULL;
+    }
+
+  for (i = 0; i < CONC_ITERS; i++)
+    {
+      *own = pattern;
+
+      /* 写回后立刻读；若期间被切走且 region 没被正确重编程，
+       * 要么读到别人的 pattern，要么直接 fault。
+       */
+
+      if (*own != pattern)
+        {
+          printf("[ortmem] worker %d: *** MISMATCH *** iter=%d got=%08x want=%08x\n",
+                 domain, i, (unsigned)*own, (unsigned)pattern);
+          g_conc_err++;
+          break;
+        }
+
+      if ((i & 0x3f) == 0)
+        {
+          sched_yield();
+        }
+    }
+
+  printf("[ortmem] worker domain %d: %d iters done\n", domain, i);
+  return NULL;
+}
+
 int main(int argc, FAR char *argv[])
 {
   volatile uint32_t *own;
   volatile uint32_t *other;
   int domain = 0;
   int ok;
+
+  /* --- 负向对照 T0：未绑定任务不应该能访问任何域块 ---
+   *
+   * 用法：orttest probe
+   *
+   * 期望（修复后）：fault，任务被 SIGSEGV 终止
+   * 反例（fail-open）：写入成功 —— 说明未绑定任务拿到了某个域
+   */
+
+  if (argc > 1 && strcmp(argv[1], "probe") == 0)
+    {
+      printf("[ortmem] T0 (negative control): UNBOUND task writing block 0 %p\n",
+             (void *)POOL_BASE);
+      fflush(stdout);
+
+      ok = touch((volatile uint32_t *)POOL_BASE, 0xDEADBEEFu);
+      printf("[ortmem] T0 RESULT: *** FAIL-OPEN *** unbound task wrote block 0, "
+             "value=%08x\n", ok);
+      return 3;
+    }
+
+  /* --- 并发测试：多个线程绑不同域，高频切换下验证各自只能碰自己的块 --- */
+
+  if (argc > 1 && strcmp(argv[1], "conc") == 0)
+    {
+      pthread_t tid[NBLOCKS];
+      int i;
+
+      printf("[ortmem] === concurrent domain test (%d threads x %d iters) ===\n",
+             NBLOCKS, CONC_ITERS);
+
+      g_conc_err = 0;
+
+      for (i = 0; i < NBLOCKS; i++)
+        {
+          if (pthread_create(&tid[i], NULL, conc_worker,
+                             (FAR void *)(uintptr_t)i) != 0)
+            {
+              printf("[ortmem] pthread_create(%d) FAILED\n", i);
+              return 1;
+            }
+        }
+
+      for (i = 0; i < NBLOCKS; i++)
+        {
+          pthread_join(tid[i], NULL);
+        }
+
+      printf("[ortmem] CONC RESULT: %s (errors=%d)\n",
+             g_conc_err == 0 ? "PASS" : "*** FAIL ***", g_conc_err);
+      return g_conc_err == 0 ? 0 : 4;
+    }
 
   if (argc > 1)
     {
