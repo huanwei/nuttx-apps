@@ -52,9 +52,13 @@ static void fault_sig_handler(int signo, FAR siginfo_t *info, FAR void *ctx)
   struct ort_faultrec_s rec;
   int n;
 
-  (void)signo;
   (void)info;
   (void)ctx;
+
+  /* hchild 模式下这一行就是"trampoline 路径确实把信号送到了用户态"的证据 */
+
+  printf("[ortbad] 用户信号处理器被调用: signo=%d\n", signo);
+  fflush(stdout);
 
   /* 排空事件队列（信号只作唤醒，可能合并） */
 
@@ -101,6 +105,10 @@ int main(int argc, FAR char *argv[])
       else if (argv[ai] != NULL && strcmp(argv[ai], "sup") == 0)
         {
           mode = "sup";
+        }
+      else if (argv[ai] != NULL && strcmp(argv[ai], "hchild") == 0)
+        {
+          mode = "hchild";
         }
     }
 
@@ -178,7 +186,30 @@ int main(int argc, FAR char *argv[])
 
   /* --- 默认 / child：越界 ---------------------------------------------- */
 
-  if (strcmp(mode, "child") == 0)
+  if (strcmp(mode, "hchild") == 0)
+    {
+      /* ★ 故意让进程"能接住"SIGSEGV，验证两条边：
+       *   ① 用户处理器必须走 trampoline 回到**用户态/用户栈**去跑 ——
+       *      绝不能被放到内核栈上执行（那样是特权提升）；
+       *   ② 处理器返回后必然再踩同一条故障指令，内核由此升级到 SIGKILL，
+       *      而 SIGKILL 的默认动作仍应在内核栈上完成。
+       */
+
+      struct sigaction sa;
+
+      /* ★ 这里装的必须是 **SIGSEGV**，不是 ORT_SIGFAULT（=SIGUSR1，
+       *   那是内核叫醒监督者用的）。装错信号这一模式就白测了。 */
+
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_sigaction = fault_sig_handler;
+      sa.sa_flags     = SA_SIGINFO;
+      sigaction(SIGSEGV, &sa, NULL);
+
+      printf("[ortbad] 容器进程: 已装 SIGSEGV 处理器，即将越界写 %p\n",
+             (void *)BAD_ADDR);
+      fflush(stdout);
+    }
+  else if (strcmp(mode, "child") == 0)
     {
       printf("[ortbad] 容器进程: 即将越界写 %p\n", (void *)BAD_ADDR);
       fflush(stdout);
