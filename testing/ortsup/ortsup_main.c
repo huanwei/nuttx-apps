@@ -216,29 +216,62 @@ static void app_enter_safe_state(void)
  * 故障通道
  ****************************************************************************/
 
-static volatile int g_fault_events;
-static volatile int g_fault_victim;
-static volatile int g_fault_faults;
+/* ★ 用**队列**而不是"记住最近一次"。
+ *
+ * 第一版把 victim 存在一个全局变量里，靠 `g_fault_events > g_handled`
+ * 逐条消费 —— 那在**并发故障**下是错的：多条事件到达时
+ * `g_fault_victim` 只剩最后一个，前面几条会被配上错误的 victim。
+ * 监督者据此决定重启谁就是错的。
+ *
+ * 现在每条事件独立入队，逐条取用，不共享任何"当前值"。
+ */
+
+#define MAX_EVENTS  16
+
+static volatile int g_ev_victim[MAX_EVENTS];
+static volatile int g_ev_addr[MAX_EVENTS];
+static volatile int g_ev_faults[MAX_EVENTS];
+static volatile int g_ev_count;    /* 已入队的事件数 */
+static volatile int g_ev_lost;     /* 内核侧累计丢弃数 */
+
+/* 排空内核队列。信号只作唤醒，可能合并，所以每次都要读干净。 */
+
+static void drain_faults(void)
+{
+  struct ort_faultrec_s rec;
+  int n;
+
+  while ((n = prctl(PR_GET_ORT_FAULT, &rec)) > 0)
+    {
+      if (g_ev_count < MAX_EVENTS)
+        {
+          g_ev_victim[g_ev_count] = rec.victim;
+          g_ev_addr[g_ev_count]   = (int)rec.addr;
+          g_ev_faults[g_ev_count] = (int)rec.faults;
+        }
+
+      g_ev_count++;
+      g_ev_lost = (int)rec.lost;
+
+      printf("[ortsup] ← 故障事件 #%u victim=%d pc=%p addr=%p faults=%u%s\n",
+             (unsigned)rec.seq, rec.victim, (void *)rec.pc, (void *)rec.addr,
+             (unsigned)rec.faults,
+             rec.lost ? "  ⚠️ 有事件丢失" : "");
+      fflush(stdout);
+    }
+}
 
 static void fault_sig_handler(int signo, FAR siginfo_t *info, FAR void *ctx)
 {
-  struct ort_faultrec_s rec;
+  (void)signo;
+  (void)info;
+  (void)ctx;
 
-  /* 信号只带 victim pid（唤醒用），详情从内核的单槽记录取回。
-   * 这是刻意的：信号载荷有限，而故障详情是结构化的。
+  /* ★ 不用信号载荷里的 pid —— 队列记录才是权威来源。
+   *   信号可能合并（载荷只反映最后一次），而且它没有故障详情。
    */
 
-  memset(&rec, 0, sizeof(rec));
-  prctl(PR_GET_ORT_FAULT, &rec);
-
-  g_fault_victim = info->si_value.sival_int;
-  g_fault_faults = (int)rec.faults;
-  g_fault_events++;
-
-  printf("[ortsup] ← 故障通知: victim=%d pc=%p addr=%p faults=%u\n",
-         g_fault_victim, (void *)rec.pc, (void *)rec.addr,
-         (unsigned)rec.faults);
-  fflush(stdout);
+  drain_faults();
 }
 
 /****************************************************************************
@@ -616,11 +649,13 @@ int main(int argc, FAR char *argv[])
           break;
         }
 
-      /* 排空已到达的故障事件 */
+      /* 排空内核队列，逐条投递给状态机（每条独立，不共享"当前值"） */
 
-      while (g_fault_events > g_handled)
+      drain_faults();
+
+      while (g_handled < g_ev_count)
         {
-          int victim = g_fault_victim;
+          int victim = g_ev_victim[g_handled];
 
           g_handled++;
 
@@ -704,7 +739,7 @@ int main(int argc, FAR char *argv[])
              g_cgs[i].faults, g_cgs[i].restarts);
     }
 
-  printf(" | events=%d\n", g_fault_events);
+  printf(" | events=%d lost=%d\n", g_ev_count, g_ev_lost);
 
   /* 最终态的断言：本原型跑完必须落在有效终态上 */
 

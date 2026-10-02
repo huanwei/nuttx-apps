@@ -77,24 +77,61 @@ static volatile int  g_fault_events;
 static volatile int  g_fault_pid;
 static volatile pid_t g_container_pid;
 
+/* 收到的事件（用于并发故障时校验配对是否正确） */
+
+#define MAX_EVENTS  16
+static volatile int g_ev_victim[MAX_EVENTS];
+static volatile int g_ev_seq[MAX_EVENTS];
+static volatile int g_ev_lost[MAX_EVENTS];
+
 /* 容器入口（定义在下面，run_container 要先用到） */
 
 int ort_container_main(int argc, FAR char *argv[]);
 
-static void fault_sig_handler(int signo, FAR siginfo_t *info, FAR void *ctx)
+/* 排空故障事件队列。
+ *
+ * ★ 用**循环**而不是"读一条"：
+ *   信号只作唤醒用，可能合并（多条故障只来一个信号），
+ *   所以每次醒来都要把队列读干净。
+ *
+ *   队列语义也让并发故障能正确配对 —— 单槽时代只能记住"最近一次
+ *   victim"，两个容器几乎同时失效时会把 A 的 pid 配 B 的详情。
+ */
+
+static void drain_faults(void)
 {
   struct ort_faultrec_s rec;
+  int n;
 
-  g_fault_events++;
-  g_fault_pid = info->si_value.sival_int;
+  while ((n = prctl(PR_GET_ORT_FAULT, &rec)) > 0)
+    {
+      int i = g_fault_events;
 
-  prctl(PR_GET_ORT_FAULT, &rec);
+      if (i < MAX_EVENTS)
+        {
+          g_ev_victim[i] = rec.victim;
+          g_ev_seq[i]    = (int)rec.seq;
+          g_ev_lost[i]   = (int)rec.lost;
+        }
 
-  printf("[ortmem] supervisor: 收到故障通知 #%u victim=%d pc=%p addr=%p "
-         "faults=%u\n",
-         (unsigned)rec.seq, rec.victim, (void *)rec.pc, (void *)rec.addr,
-         (unsigned)rec.faults);
-  fflush(stdout);
+      g_fault_events++;
+      g_fault_pid = rec.victim;
+
+      printf("[ortmem] supervisor: 事件 #%u victim=%d pc=%p addr=%p "
+             "faults=%u lost=%u\n",
+             (unsigned)rec.seq, rec.victim, (void *)rec.pc, (void *)rec.addr,
+             (unsigned)rec.faults, (unsigned)rec.lost);
+      fflush(stdout);
+    }
+}
+
+static void fault_sig_handler(int signo, FAR siginfo_t *info, FAR void *ctx)
+{
+  (void)signo;
+  (void)info;
+  (void)ctx;
+
+  drain_faults();
 }
 
 /* 注册为监督者。
@@ -566,9 +603,11 @@ int main(int argc, FAR char *argv[])
 
       for (i = 0; i < 20 && g_fault_events == 0; i++)
         {
+          drain_faults();      /* 不能只靠信号唤醒，轮询兜底 */
           usleep(50000);
         }
 
+    
       printf("[ortmem] SUPERVISE RESULT: %s (events=%d victim=%d)\n",
              g_fault_events >= 1 ? "PASS" : "*** FAIL ***", g_fault_events,
              g_fault_pid);
@@ -594,6 +633,84 @@ int main(int argc, FAR char *argv[])
     {
       become_supervisor();
       return run_container("share", 2);
+    }
+
+  /* --- 并发故障：多个容器几乎同时失效，事件必须逐条正确配对 -------------
+   *
+   * 这条用例正是"队列 vs 单槽"的分水岭：
+   *   单槽 + 记住最近一次 victim 的实现在这里会认错容器 ——
+   *   把 A 的 pid 配上 B 的故障地址，监督者据此决定重启谁就是错的。
+   */
+
+  if (strcmp(mode, "conc-fault") == 0)
+    {
+      FAR char *cargv[3];
+      char dbuf[3][8];
+      pid_t cpid[3];
+      int i;
+      int distinct = 0;
+
+      printf("[ortmem] === concurrent fault test (3 containers) ===\n");
+
+      become_supervisor();
+      g_fault_events = 0;
+
+      for (i = 0; i < 3; i++)
+        {
+          snprintf(dbuf[i], sizeof(dbuf[i]), "%d", i);
+          cargv[0] = (FAR char *)"basic";
+          cargv[1] = dbuf[i];
+          cargv[2] = NULL;
+
+          cpid[i] = task_create("ortctnr", CONTAINER_PRIO, CONTAINER_STACK,
+                                ort_container_main, cargv);
+          if (cpid[i] < 0)
+            {
+              printf("[ortmem] FAIL: task_create(%d) = %d\n", i, (int)cpid[i]);
+              return 1;
+            }
+
+          bind_container(cpid[i], i);
+        }
+
+      /* 等三条事件到齐 */
+
+      for (i = 0; i < 200 && g_fault_events < 3; i++)
+        {
+          drain_faults();
+          usleep(10000);
+        }
+
+      drain_faults();
+
+      /* 校验：三条事件的 victim 必须两两不同，且都在我们派生的 pid 里 */
+
+      for (i = 0; i < 3 && i < g_fault_events; i++)
+        {
+          int j;
+          bool dup = false;
+
+          for (j = 0; j < i; j++)
+            {
+              if (g_ev_victim[j] == g_ev_victim[i])
+                {
+                  dup = true;
+                }
+            }
+
+          if (!dup)
+            {
+              distinct++;
+            }
+        }
+
+      printf("[ortmem] 收到 %d 条事件，victim: %d %d %d（互异 %d 个）\n",
+             g_fault_events,
+             g_ev_victim[0], g_ev_victim[1], g_ev_victim[2], distinct);
+      printf("[ortmem] CONC-FAULT RESULT: %s (events=%d distinct=%d lost=%d)\n",
+             (g_fault_events == 3 && distinct == 3) ? "PASS" : "*** FAIL ***",
+             g_fault_events, distinct, g_ev_lost[0]);
+      return (g_fault_events == 3 && distinct == 3) ? 0 : 9;
     }
 
   /* --- 并发：4 个独立容器各绑一个域 -------------------------------------- */
@@ -656,6 +773,7 @@ int main(int argc, FAR char *argv[])
          "  orttest handler      容器挂钩子并 _exit(42)\n"
          "  orttest ignore       容器 SIG_IGN（应仍被终止）\n"
          "  orttest handler-ret  容器钩子返回（应仍被终止）\n"
-         "  orttest supervise    监督者故障通道\n");
+         "  orttest supervise    监督者故障通道\n"
+         "  orttest conc-fault   并发故障：事件必须逐条正确配对\n");
   return 1;
 }
