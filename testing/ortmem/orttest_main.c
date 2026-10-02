@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <signal.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <sys/prctl.h>
 
@@ -43,6 +45,40 @@ static int touch(volatile uint32_t *p, uint32_t val)
 #define CONC_ITERS  500
 
 static volatile int g_conc_err;
+
+/* --- 容器可否决终止？ ----------------------------------------------------
+ *
+ * POSIX 允许忽略 SIGSEGV（结果未定义），NuttX 亦然：sig_action.c 只对
+ * SIG_FLAG_NOCATCH 的信号返回 -EINVAL，而 SIGSEGV 没设这个标志。
+ *
+ * 所以「容器越界」必须由监督者保留终止权 —— 否则容器只要
+ *   sigaction(SIGSEGV, SIG_IGN)
+ * 就能把越界变成 no-op，异常返回后回到同一条指令再 fault，
+ * 无限循环卡死 CPU。
+ *
+ * `orttest ignore` 就是这个攻击：预期容器**仍然死掉**（升级到 SIGKILL）。
+ */
+
+static void segv_observer(int signo)
+{
+  printf("[ortmem] SIGSEGV handler fired (signo=%d) — 容器感知到了越界\n",
+         signo);
+  fflush(stdout);
+  _exit(42);
+}
+
+/* 危险版本：处理器打印一下就返回。
+ *
+ * 异常返回会**回到同一条故障指令**上再次 fault。若监督者不升级到
+ * SIGKILL，这就是个无限循环 —— 容器可以借此卡死 CPU。
+ */
+
+static void segv_return(int signo)
+{
+  printf("[ortmem] SIGSEGV handler returned (signo=%d) — 任务将回到故障指令\n",
+         signo);
+  fflush(stdout);
+}
 
 static FAR void *conc_worker(FAR void *arg)
 {
@@ -110,6 +146,83 @@ int main(int argc, FAR char *argv[])
       printf("[ortmem] T0 RESULT: *** FAIL-OPEN *** unbound task wrote block 0, "
              "value=%08x\n", ok);
       return 3;
+    }
+
+  /* --- 监督者终止权：容器忽略 SIGSEGV 也必须死 ------------------------- */
+
+  if (argc > 1 && strcmp(argv[1], "ignore") == 0)
+    {
+      struct sigaction sa;
+
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_handler = SIG_IGN;
+      sigaction(SIGSEGV, &sa, NULL);
+
+      printf("[ortmem] hostile: SIGSEGV set to SIG_IGN, binding domain 0\n");
+      prctl(PR_SET_ORT_DOMAIN, 0);
+
+      other = (volatile uint32_t *)(POOL_BASE + BLOCK_SIZE);
+
+      printf("[ortmem] writing other block %p (expect: 2nd fault -> SIGKILL)\n",
+             (void *)other);
+      fflush(stdout);
+
+      touch(other, 0xbadbadu);
+
+      /* 走到这里说明容器靠忽略 SIGSEGV 逃过了终止 —— 安全漏洞 */
+
+      printf("[ortmem] *** SURVIVED *** 容器逃过了终止，越界被当成 no-op\n");
+      return 5;
+    }
+
+  /* --- 容器可观测：注册处理器，自行决定退不退 --------------------------- */
+
+  if (argc > 1 && strcmp(argv[1], "handler") == 0)
+    {
+      struct sigaction sa;
+
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_handler = segv_observer;
+      sigaction(SIGSEGV, &sa, NULL);
+
+      printf("[ortmem] container installs SIGSEGV handler, binding domain 0\n");
+      prctl(PR_SET_ORT_DOMAIN, 0);
+
+      other = (volatile uint32_t *)(POOL_BASE + BLOCK_SIZE);
+
+      printf("[ortmem] writing other block %p (expect: handler -> _exit(42))\n",
+             (void *)other);
+      fflush(stdout);
+
+      touch(other, 0xbadbadu);
+
+      printf("[ortmem] *** handler returned *** 监督者应当升级到 SIGKILL\n");
+      return 6;
+    }
+
+  /* --- 危险路径：处理器返回 → 必须升级到 SIGKILL ------------------------ */
+
+  if (argc > 1 && strcmp(argv[1], "handler-ret") == 0)
+    {
+      struct sigaction sa;
+
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_handler = segv_return;
+      sigaction(SIGSEGV, &sa, NULL);
+
+      printf("[ortmem] container installs a RETURNING SIGSEGV handler\n");
+      prctl(PR_SET_ORT_DOMAIN, 0);
+
+      other = (volatile uint32_t *)(POOL_BASE + BLOCK_SIZE);
+
+      printf("[ortmem] writing other block %p (expect: 2nd fault -> SIGKILL)\n",
+             (void *)other);
+      fflush(stdout);
+
+      touch(other, 0xbadbadu);
+
+      printf("[ortmem] *** SURVIVED *** 处理器返回后没被升级，容器卡死循环\n");
+      return 7;
     }
 
   /* --- 并发测试：多个线程绑不同域，高频切换下验证各自只能碰自己的块 --- */
