@@ -110,6 +110,43 @@ int main(int argc, FAR char *argv[])
         {
           mode = "hchild";
         }
+      else if (argv[ai] != NULL && strcmp(argv[ai], "caps") == 0)
+        {
+          mode = "caps";
+        }
+    }
+
+  /* --- caps：查询本平台的 ORT 能力位 -----------------------------------
+   *
+   * 这条是给**准入检查**用的探针：容器的 manifest 里声明了
+   * "故障时我要自己处理"，监督者必须先问平台能不能兑现，
+   * 不能兑现就拒绝准入 —— 而不是等运行期默默降级成"直接杀掉"。
+   */
+
+  if (strcmp(mode, "caps") == 0)
+    {
+      int caps = prctl(PR_GET_ORT_CAPS);
+
+      if (caps < 0)
+        {
+          printf("[ortbad] CAPS: prctl 失败 ret=%d\n", caps);
+          return 1;
+        }
+
+      printf("[ortbad] CAPS: 0x%08x\n", (unsigned)caps);
+      printf("[ortbad] CAPS: FAULT_HANDLER = %s —— 容器自装的故障处理器%s\n",
+             (caps & ORT_CAP_FAULT_HANDLER) ? "有" : "无",
+             (caps & ORT_CAP_FAULT_HANDLER)
+               ? "会被调用（但容器仍须死）"
+               : "不会被执行，内核直接升级 SIGKILL");
+
+      /* 准入判定的实际写法：声明与能力对不上就拒绝，别默默降级 */
+
+      printf("[ortbad] CAPS: 准入检查 —— 声明'自行处理故障'的容器：%s\n",
+             (caps & ORT_CAP_FAULT_HANDLER) ? "接受" : "拒绝（平台不兑现）");
+
+      fflush(stdout);
+      return 0;
     }
 
   /* --- 监督者模式 ------------------------------------------------------ */
