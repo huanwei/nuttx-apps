@@ -27,11 +27,28 @@
  *     DEGRADED ──关键 CG 失效──► SAFE_STATE（锁存）               T8
  *     DEGRADED ──其余 CG 失效──► DEGRADED（状态不变）             T9
  *
- * ⚠️ 已知缺口（原型未实现）：
- *   启动期策略（《设计》§6 `startup.onContainerGroupFail`）与运行期策略
- *   是**两套语义**，本原型只实现了运行期那套。若容器在 BOOT 完成前就失效，
- *   事件会被排队到 NOMINAL 之后才处理 —— 这是简化，不是正确行为。
- *   见容器入口处关于 delay 参数的说明。
+ * ★ 启动期 vs 运行期的分界（H29 的答案）：
+ *
+ *   两套策略需要一个**判据**才能切换。本原型采用：
+ *
+ *     就绪判据 = 「已准入（监督者绑完域）且经过 STARTUP_WINDOW_MS 无故障」
+ *
+ *   窗口内失效 → 走 §6 startup.onContainerGroupFail（全系统一套策略）
+ *   窗口后失效 → 走 runtime.defaultOnFailure（可被单个 CG 覆盖）
+ *
+ *   为什么不是"BOOT 状态结束"作为分界：
+ *     BOOT 是**监督者**的状态，容器是异步的 —— 监督者宣布 BOOT 完成时，
+ *     容器可能还没初始化完。用"准入 + 时间窗"才是以**容器**为基准。
+ *
+ *   为什么窗口内失效要单独处理：
+ *     它意味着"这个容器根本起不来"，而运行期失效意味着"它跑了、
+ *     然后坏了"。前者是**部署问题**（该进安全态或拒绝启动），
+ *     后者是**运行时问题**（可以先重启）。两者的正确响应完全不同。
+ *
+ *   用 STARTUP_WINDOW_MS 而不是容器主动上报 ready：
+ *     主动上报更精确，但需要容器配合 —— 而公理 S1 要求不信任失效组件。
+ *     超时窗口是**监督者单方面可判定**的，不依赖容器善意。
+ *     正式实现可以两者结合：上报 ready 提前结束窗口，超时兜底。
  *
  * ★ 本原型要演示的两条性质：
  *
@@ -64,6 +81,16 @@
 
 #define CONTAINER_PRIO   110
 #define CONTAINER_STACK  2048
+
+/* 启动窗口：准入之后多少毫秒内仍算「启动期」。
+ * 对应《设计》§6 的 safetyPolicy.startup.startTimeoutMs。
+ */
+
+#define STARTUP_WINDOW_MS  1500
+
+/* 监督循环周期（也是下面 g_now_ms 的步长） */
+
+#define LOOP_MS  5
 
 /****************************************************************************
  * 状态定义（《设计》§2.1）
@@ -108,16 +135,23 @@ struct ort_cg_s
   int             restarts;
   int             faults;
   bool            failed;        /* 已失效且不再重启 */
+  int             admitted_ms;   /* 被准入的时刻（-1 = 尚未准入） */
 };
 
 static struct ort_cg_s g_cgs[] =
 {
   /* 非关键 CG：失效只降级，允许有限次重启 */
-  { "app_cg",    1, false, 2, -1, 0, 0, false },
+  { "app_cg",    1, false, 2, -1, 0, 0, false, -1 },
 
   /* 关键 CG：失效即进安全态，不重启（SAFE_STATIC 推荐 NEVER） */
-  { "safety_cg", 2, true,  0, -1, 0, 0, false },
+  { "safety_cg", 2, true,  0, -1, 0, 0, false, -1 },
 };
+
+/* 监督者时钟（毫秒）。用循环计数而不是 clock()：
+ * 周期是确定的（LOOP_MS），不必依赖系统时钟的精度与语义。
+ */
+
+static int g_now_ms;
 
 #define NCGS (sizeof(g_cgs) / sizeof(struct ort_cg_s))
 
@@ -347,20 +381,85 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay)
       return -1;
     }
 
-  cg->pid = pid;
+  cg->pid         = pid;
+  cg->admitted_ms = g_now_ms;    /* ★ 准入时刻 —— 启动窗口从这里开始算 */
   return 0;
 }
 
 /* 一个 CG 失效时的策略决策（《设计》§3.2 的转移规则） */
 
+/* 该 CG 是否仍处于启动期。
+ *
+ * ★ 判据是两部分的合取：
+ *     ① 系统还在 BOOT 阶段（g_state == ORT_BOOT）
+ *     ② 该 CG 尚未通过自己的启动窗口
+ *
+ * 为什么必须带上 ①：
+ *   第一版只判 ②，于是**每次重启都会重新进入启动窗口** ——
+ *   一个重启后 840ms 就崩的容器被判成"启动期失效"，直接跳 SAFE_STATE，
+ *   重启预算形同虚设。
+ *
+ *   §6 的 `startup` 策略讲的是**系统启动阶段**，不是"每个容器每次启动"。
+ *   进入 NOMINAL 之后，所有失效（包括重启后的立即失效）都是运行期问题，
+ *   正确的升级路径是**耗尽重启预算**（→ DEGRADED），而不是跳安全态。
+ */
+
+static bool in_startup(FAR struct ort_cg_s *cg)
+{
+  return g_state == ORT_BOOT &&
+         cg->admitted_ms >= 0 &&
+         (g_now_ms - cg->admitted_ms) < STARTUP_WINDOW_MS;
+}
+
+/* 是否全部 CG 都已通过启动窗口（= 系统可以进 NOMINAL 了） */
+
+static bool all_cgs_ready(void)
+{
+  int i;
+
+  for (i = 0; i < (int)NCGS; i++)
+    {
+      if (!g_cgs[i].failed && in_startup(&g_cgs[i]))
+        {
+          return false;
+        }
+    }
+
+  return true;
+}
+
 static void on_cg_failed(FAR struct ort_cg_s *cg)
 {
   cg->faults++;
 
+  /* ★ H29：先判启动期还是运行期 —— 两套策略语义完全不同。
+   *
+   * 启动期失效 = "这个容器根本起不来" → 部署问题 → 按 §6 startup 策略
+   * 运行期失效 = "它跑了、然后坏了"     → 运行时问题 → 可以先重启
+   */
+
+  if (in_startup(cg))
+    {
+      printf("[ortsup] %s 在启动窗口内失效（准入后 %d ms < %d ms）"
+             "→ 按 startup 策略\n",
+             cg->name, g_now_ms - cg->admitted_ms, STARTUP_WINDOW_MS);
+
+      /* 原型的 startup 策略取 SAFE_STATE：按 §6，
+       * startup.onContainerGroupFail 是**全系统一套**策略（不像运行期
+       * 那样可被单个 CG 覆盖）—— 因为"启动阶段就起不来"通常意味着
+       * 部署/配置有问题，继续跑没有意义。
+       */
+
+      cg->failed = true;
+      app_enter_safe_state();
+      state_to(ORT_SAFE_STATE);
+      return;
+    }
+
   printf("[ortsup] %s 失效（第 %d 次，restart %d/%d）\n",
          cg->name, cg->faults, cg->restarts, cg->max_restarts);
 
-  /* 关键 CG：无论重启预算如何，直接进安全态（T7 / T8） */
+  /* 以下为运行期策略。关键 CG：无论重启预算如何，直接进安全态（T7 / T8） */
 
   if (cg->critical)
     {
@@ -404,6 +503,7 @@ static void on_cg_failed(FAR struct ort_cg_s *cg)
 int main(int argc, FAR char *argv[])
 {
   struct sigaction sa;
+  bool boot_mode;
   bool settled;
   int i;
   int rounds = 0;
@@ -415,7 +515,12 @@ int main(int argc, FAR char *argv[])
 
   setvbuf(stdout, NULL, _IOLBF, 0);
 
+  boot_mode = (argc > 1 && strcmp(argv[1], "boot") == 0);
+
   printf("[ortsup] === ORT 监督者原型（降级状态机）===\n");
+  printf("[ortsup] 场景: %s（启动窗口 %d ms）\n",
+         boot_mode ? "boot —— 启动期失效" : "runtime —— 运行期失效",
+         STARTUP_WINDOW_MS);
   printf("[ortsup] 系统状态: BOOT\n");
 
   /* 注册监督者 + 挂故障通道。注意信号用 SIGUSR1：
@@ -428,6 +533,12 @@ int main(int argc, FAR char *argv[])
   sa.sa_flags     = SA_SIGINFO;
   sigaction(ORT_SIGFAULT, &sa, NULL);
 
+  /* 监督者槽位是钉住的 —— 连续跑多轮需要先复位。
+   * 那是仅原型可用的接口（CONFIG_ORT_SUPERVISOR_RESET）。
+   */
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
+
   if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
     {
       printf("[ortsup] FAIL: 注册监督者失败\n");
@@ -436,28 +547,41 @@ int main(int argc, FAR char *argv[])
 
   /* ── BOOT：按 startOrder 拉起全部 CG ──────────────────────────────── */
 
-  /* 延迟参数的取值不是随意的：
+  /* 两个演示场景：
    *
-   *   app_cg    1s —— 让 BOOT 先完成
-   *   safety_cg 8s —— 必须晚于 app_cg **耗尽重启预算**
+   *   默认      —— 容器**跑起来之后**才失效 → 运行期策略（重启 → 降级）
+   *   ortsup boot —— 容器**在启动窗口内**就失效 → 启动期策略（直接安全态）
    *
-   * app_cg 走 1s 故障 + 1s 故障 + 1s 故障，约 3s 后进 DEGRADED。
-   * safety_cg 留 5s 余量，才能演示到完整的
-   * NOMINAL → DEGRADED → SAFE_STATE 路径（T6 然后 T8）。
+   * 同样的故障、同样的容器，两套策略给出完全不同的响应 ——
+   * 这正是 H29 要回答的问题。
    *
-   * ⚠️ 这个顺序本质上依赖时序。演示场景可以靠余量保证，但**状态机本身
-   *    不能假设事件顺序** —— 真实系统里 safety_cg 完全可能先失效
-   *    （那就是 T7：直接 NOMINAL → SAFE_STATE，同样是正确的）。
+   * 默认场景的延迟取值：首次故障必须晚于 STARTUP_WINDOW_MS(1500ms)，
+   * 否则会被判成启动期失效。
+   *   app_cg    3s → 窗口外；走 3s/6s/9s 三次 → 预算耗尽 → DEGRADED
+   *   safety_cg 8s  → 留足余量，让 app_cg 先走完 3 轮
+   *
+   * ⚠️ 顺序本质上依赖时序。演示可以靠余量保证，但**状态机本身不能
+   *    假设事件顺序** —— 真实系统里 safety_cg 完全可能先失效
+   *    （那就是 T7：直接 NOMINAL → SAFE_STATE，同样正确）。
    */
 
-  if (start_cg(&g_cgs[0], "fault", 1) != 0 ||
-      start_cg(&g_cgs[1], "fault", 8) != 0)
+  if (start_cg(&g_cgs[0], "fault", boot_mode ? 0 : 3) != 0 ||
+      start_cg(&g_cgs[1], "fault", boot_mode ? 2 : 8) != 0)
     {
       state_to(ORT_BOOT_FAILED);
       return 1;
     }
 
-  state_to(ORT_NOMINAL);
+  /* ★ 不在这里进 NOMINAL。
+   *
+   * 「全部 CG 已创建」不等于「全部 CG 已就绪」—— 容器是异步的，
+   * 创建成功只说明 fork 成功，不代表它能跑起来。
+   * BOOT → NOMINAL 的条件必须是**全部 CG 通过启动窗口**，
+   * 由监督循环里的 all_cgs_ready() 判定。
+   *
+   * 这正是 H29 的核心：如果这里就宣布 NOMINAL，启动期失效会被记成
+   * "运行期失效"，走完全错误的那套策略。
+   */
 
   /* ── 监督循环 ──────────────────────────────────────────────────────
    *
@@ -511,6 +635,13 @@ int main(int argc, FAR char *argv[])
             }
         }
 
+      /* ★ BOOT → NOMINAL 由「全部 CG 通过启动窗口」驱动 */
+
+      if (g_state == ORT_BOOT && all_cgs_ready())
+        {
+          state_to(ORT_NOMINAL);
+        }
+
       /* 安全态是锁存终态 —— 到了就停 */
 
       if (g_state == ORT_SAFE_STATE)
@@ -535,7 +666,8 @@ int main(int argc, FAR char *argv[])
           break;
         }
 
-      usleep(5000);
+      usleep(LOOP_MS * 1000);
+      g_now_ms += LOOP_MS;      /* 监督者时钟 */
     }
 
   /* ── 收尾 ──────────────────────────────────────────────────────── */

@@ -97,8 +97,10 @@ static void fault_sig_handler(int signo, FAR siginfo_t *info, FAR void *ctx)
   fflush(stdout);
 }
 
-/* 注册为监督者。跨多次 orttest 调用时，上一个监督者可能已经退出 ——
- * 内核只在「下次故障通知失败」时才清槽，所以这里要允许接管。
+/* 注册为监督者。
+ *
+ * 槽位是**钉住**的：一旦注册，别的任务永远不能接管 ——
+ * 否则"谁能当监督者"就成了运行期竞争（见 ort_supervisor_set 的说明）。
  */
 
 static void become_supervisor(void)
@@ -110,6 +112,13 @@ static void become_supervisor(void)
   sa.sa_sigaction = fault_sig_handler;
   sa.sa_flags     = SA_SIGINFO;
   sigaction(ORT_SIGFAULT, &sa, NULL);
+
+  /* 监督者槽位是**钉住**的：一旦注册，别的任务永远不能接管。
+   * 连续跑多轮测试需要先复位 —— 那是仅原型可用的接口
+   * （CONFIG_ORT_SUPERVISOR_RESET，正式产品必须关闭）。
+   */
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
 
   ret = prctl(PR_SET_ORT_SUPERVISOR);
   if (ret != 0)
@@ -219,6 +228,25 @@ static void scene_basic(int domain)
 
   printf("value=%08x\n", ok);
   printf("[ortmem] T2 RESULT: *** FAIL *** (no fault, isolation broken)\n");
+}
+
+/* 场景 a2：容器尝试顶替监督者 —— 必须被 -EBUSY 拒绝。
+ *
+ * 监督者手里有两样东西：
+ *   ① 故障通知的收件人（顶掉它等于让真监督者瞎掉）
+ *   ② 容器的域分配权（PR_SET_ORT_DOMAIN）
+ * 让"谁能当监督者"变成运行期竞争，等于把安全动作交给被管理者决定。
+ */
+
+static void scene_hijack(int domain)
+{
+  int ret = prctl(PR_SET_ORT_SUPERVISOR);
+
+  (void)domain;
+
+  printf("[ortmem] HIJACK-SUPERVISOR RESULT: ret=%d (%s)\n", ret,
+         ret == -EBUSY ? "EBUSY —— 正确拒绝" : "*** 没拦住 ***");
+  fflush(stdout);
 }
 
 /* 场景 b：容器忽略 SIGSEGV —— 仍须被终止 */
@@ -425,6 +453,10 @@ int ort_container_main(int argc, FAR char *argv[])
     {
       scene_basic(domain);
     }
+  else if (strcmp(scenario, "hijack") == 0)
+    {
+      scene_hijack(domain);
+    }
   else if (strcmp(scenario, "ignore") == 0)
     {
       scene_ignore(domain);
@@ -473,6 +505,29 @@ int main(int argc, FAR char *argv[])
 
       printf("[ortmem] T0 RESULT: *** FAIL-OPEN *** 未绑定任务写成功了\n");
       return 3;
+    }
+
+  /* --- 容器不能顶替监督者 -----------------------------------------------
+   *
+   * 监督者槽位是钉住的：一旦注册，其它任务一律 -EBUSY，
+   * **无论原监督者是否还活着**。
+   *
+   * 为什么这条重要：监督者手里有两样东西 ——
+   *   ① 故障通知的收件人（顶掉它就等于让真监督者瞎掉）
+   *   ② 容器的域分配权（PR_SET_ORT_DOMAIN）
+   * 让"谁能当监督者"变成运行期竞争，等于把安全动作交给被管理者决定。
+   */
+
+  if (strcmp(mode, "selfsup") == 0)
+    {
+      /* ★ 必须先由本进程占住槽位，再让容器去抢。
+       *
+       * 否则测的是"空槽位下能不能注册"—— 那当然成功，
+       * 完全没有验证到「钉住」这条性质。（第一版就是这么写错的。）
+       */
+
+      become_supervisor();
+      return run_container("hijack", 0);
     }
 
   /* --- 容器不能自己申报域（非监督者调用应被拒）-------------------------- */
@@ -594,6 +649,7 @@ int main(int argc, FAR char *argv[])
   printf("用法:\n"
          "  orttest probe        未绑定任务写域块（负向对照，应 fault）\n"
          "  orttest selfbind     容器自己申报域（应被 -EPERM 拒绝）\n"
+         "  orttest selfsup      容器抢占监督者槽位（应被 -EBUSY 拒绝）\n"
          "  orttest <0|1|2|3>    绑域 N：T1 自有块应成功，T2 他域块应 fault\n"
          "  orttest conc         4 个容器并发跨域抢占\n"
          "  orttest share        同容器 2 线程共享一个域\n"
