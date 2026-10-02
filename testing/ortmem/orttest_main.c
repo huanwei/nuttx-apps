@@ -526,6 +526,21 @@ int main(int argc, FAR char *argv[])
 {
   FAR const char *mode = argc > 1 ? argv[1] : "";
 
+  /* --- 每次都先申报平台能力位 -------------------------------------------
+   *
+   * 让每一条 ortmem 输出前面都带着"这台机器到底能兑现什么"，
+   * 免得事后对着日志猜。两个 SKU 的差异见 <sys/prctl.h>。
+   */
+
+  {
+    int caps = prctl(PR_GET_ORT_CAPS);
+
+    printf("[ortmem] CAPS: 0x%08x  FAULT_HANDLER=%s\n",
+           (unsigned)(caps < 0 ? 0u : (unsigned)caps),
+           (caps >= 0 && (caps & ORT_CAP_FAULT_HANDLER)) ? "有" : "无");
+    fflush(stdout);
+  }
+
   /* --- 不需要域的用例：单进程直接跑 ------------------------------------- */
 
   if (strcmp(mode, "probe") == 0)
