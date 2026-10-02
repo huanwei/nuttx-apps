@@ -129,6 +129,16 @@ struct ort_cg_s
   bool            critical;      /* onFailure: 关键 → SAFE_STATE；否则 DEGRADE */
   int             max_restarts;  /* 0 = NEVER（SAFE_STATIC 推荐值） */
 
+  /* manifest 声明：故障时本 CG 要**自己处理**（而不是被内核直接终止）。
+   *
+   * ★ 这条声明能不能兑现**取决于平台** —— 见 ORT_CAP_FAULT_HANDLER。
+   *   兑现不了就必须在**准入阶段拒绝**，而不是等运行期默默降级成
+   *   "处理器不被调用、直接杀掉"。后者会让同一份 manifest 在两个 SKU 上
+   *   语义不同，而部署方没有任何地方能问出这件事。
+   */
+
+  bool            handles_fault;
+
   /* 运行时状态 */
 
   pid_t           pid;
@@ -141,11 +151,17 @@ struct ort_cg_s
 static struct ort_cg_s g_cgs[] =
 {
   /* 非关键 CG：失效只降级，允许有限次重启 */
-  { "app_cg",    1, false, 2, -1, 0, 0, false, -1 },
+  { "app_cg",    1, false, 2, false, -1, 0, 0, false, -1 },
 
   /* 关键 CG：失效即进安全态，不重启（SAFE_STATIC 推荐 NEVER） */
-  { "safety_cg", 2, true,  0, -1, 0, 0, false, -1 },
+  { "safety_cg", 2, true,  0, false, -1, 0, 0, false, -1 },
 };
+
+/* 平台能力位。读一次就够 —— 它是平台属性，不会变。
+ * 必须在 main 里 prctl 查询后填好（用户态拿不到 ort_caps() 本身）。
+ */
+
+static unsigned int g_caps;
 
 /* 监督者时钟（毫秒）。用循环计数而不是 clock()：
  * 周期是确定的（LOOP_MS），不必依赖系统时钟的精度与语义。
@@ -366,12 +382,55 @@ static int ort_container_main(int argc, FAR char *argv[])
  * 监督者
  ****************************************************************************/
 
+/****************************************************************************
+ * Name: admit_ok
+ *
+ * Description:
+ *   准入判定：这份 manifest 在当前平台上**能不能被兑现**？
+ *
+ *   ★ 这是整个能力位机制存在的理由。
+ *
+ *   以前（隐式差异）：容器声明"故障我自己处理"，ORT-M 上处理器会被调用，
+ *   ORT-A 上处理器被静默跳过、直接 SIGKILL。同一份 manifest、两套语义，
+ *   而部署方没有任何地方能问出这件事 —— 只能靠踩坑发现。
+ *
+ *   现在（显式准入）：兑现不了就**在准入阶段拒绝**。
+ *   拒绝是安全动作（fail-closed）：容器根本没被创建，
+ *   而不是"创建了、跑起来了、出事时才发现承诺没兑现"。
+ *
+ ****************************************************************************/
+
+static bool admit_ok(FAR const struct ort_cg_s *cg)
+{
+  return !cg->handles_fault ||
+         (g_caps & ORT_CAP_FAULT_HANDLER) != 0;
+}
+
 static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay)
 {
   FAR char *cargv[4];
   char dbuf[8];
   char lbuf[8];
   pid_t pid;
+
+  /* ── 准入门禁 ──────────────────────────────────────────────────────
+   *
+   * ★ 必须在 task_create() **之前**判，不能创建了再杀。
+   *   "拒绝准入"和"启动了再终止"是两回事：后者容器已经持有资源、
+   *   可能已经碰过共享状态、而且会白白消耗一次重启预算。
+   */
+
+  if (!admit_ok(cg))
+    {
+      printf("[ortsup] *** 拒绝准入 %s: manifest 声明 handles_fault=1，"
+             "但本平台不提供 ORT_CAP_FAULT_HANDLER ***\n", cg->name);
+      printf("[ortsup]     兑现不了的声明不能默默降级 —— "
+             "容器未被创建（fail-closed）\n");
+      fflush(stdout);
+
+      cg->failed = true;
+      return -1;
+    }
 
   snprintf(dbuf, sizeof(dbuf), "%d", cg->domain);
   snprintf(lbuf, sizeof(lbuf), "%d", delay);
@@ -537,6 +596,7 @@ int main(int argc, FAR char *argv[])
 {
   struct sigaction sa;
   bool boot_mode;
+  bool admit_mode;
   bool settled;
   int i;
   int rounds = 0;
@@ -548,13 +608,58 @@ int main(int argc, FAR char *argv[])
 
   setvbuf(stdout, NULL, _IOLBF, 0);
 
-  boot_mode = (argc > 1 && strcmp(argv[1], "boot") == 0);
+  boot_mode  = (argc > 1 && strcmp(argv[1], "boot") == 0);
+  admit_mode = (argc > 1 && strcmp(argv[1], "admit") == 0);
 
   printf("[ortsup] === ORT 监督者原型（降级状态机）===\n");
   printf("[ortsup] 场景: %s（启动窗口 %d ms）\n",
          boot_mode ? "boot —— 启动期失效" : "runtime —— 运行期失效",
          STARTUP_WINDOW_MS);
   printf("[ortsup] 系统状态: BOOT\n");
+
+  /* ── 平台能力位 ──────────────────────────────────────────────────────
+   *
+   * 读一次就够 —— 它是平台属性，运行期不会变。
+   * 用户态拿不到 ort_caps() 本身，只能走 prctl。
+   */
+
+  g_caps = (unsigned int)prctl(PR_GET_ORT_CAPS);
+
+  printf("[ortsup] 平台能力位: 0x%08x（FAULT_HANDLER=%s）\n",
+         g_caps, (g_caps & ORT_CAP_FAULT_HANDLER) ? "有" : "无");
+  fflush(stdout);
+
+  /* ── 准入演练（ortsup admit）────────────────────────────────────────
+   *
+   * 同一份 manifest（两个 CG 都声明 handles_fault=1），在两个 SKU 上
+   * 得到**不同**的准入结论 —— 而且结论是被显式打印出来的。
+   *
+   * 这就是"隐式差异"和"显式准入"的区别：
+   *   以前：跑起来、出事、发现承诺没兑现 —— 靠踩坑才知道平台不支持。
+   *   现在：准入阶段就拒绝，容器根本没被创建。
+   */
+
+  if (admit_mode)
+    {
+      int k;
+
+      printf("[ortsup] === 准入演练：manifest 声明 handles_fault=1 ===\n");
+
+      for (k = 0; k < (int)NCGS; k++)
+        {
+          g_cgs[k].handles_fault = true;
+
+          printf("[ortsup]   %-10s → %s\n", g_cgs[k].name,
+                 admit_ok(&g_cgs[k]) ? "准入通过"
+                                     : "*** 拒绝（平台不兑现）***");
+          printf("[ortsup]      %s\n", admit_ok(&g_cgs[k])
+                 ? "故障处理器会被调用（处理器是通知，容器仍须死）"
+                 : "故障处理器不会被调用，内核直接升级 SIGKILL");
+        }
+
+      fflush(stdout);
+      return 0;
+    }
 
   /* 注册监督者 + 挂故障通道。注意信号用 SIGUSR1：
    * CONFIG_SIG_SIGUSR1_ACTION 默认为 n，内核不配默认动作，
