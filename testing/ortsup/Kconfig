@@ -1,0 +1,25 @@
+config TESTING_ORTSUP
+	tristate "[ORT] ORT supervisor prototype (degradation state machine)"
+	default n
+	depends on TESTING_ORTMEM
+	---help---
+		[ORT] ORT 监督者（ort_safety）原型：实现降级状态机的核心闭环。
+
+		它做三件事：
+		  1. 以监督者身份启动容器（创建 + 绑域）
+		  2. 接收内核的故障通知（独立通道，不依赖容器自己注册的处理器）
+		  3. 按 onFailure / restartPolicy 决策，并保证状态迁移单调
+
+		依赖 TESTING_ORTMEM：容器与故障注入都基于 ortmem 的域池。
+
+if TESTING_ORTSUP
+
+config TESTING_ORTSUP_PRIORITY
+	int "ortsup task priority"
+	default 100
+
+config TESTING_ORTSUP_STACKSIZE
+	int "ortsup stack size"
+	default 4096
+
+endif # TESTING_ORTSUP

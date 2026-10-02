@@ -1,0 +1,10 @@
+include $(APPDIR)/Make.defs
+
+PROGNAME  = ortsup
+PRIORITY  = $(CONFIG_TESTING_ORTSUP_PRIORITY)
+STACKSIZE = $(CONFIG_TESTING_ORTSUP_STACKSIZE)
+MODULE    = $(CONFIG_TESTING_ORTSUP)
+
+MAINSRC = ortsup_main.c
+
+include $(APPDIR)/Application.mk
