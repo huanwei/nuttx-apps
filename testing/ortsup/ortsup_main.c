@@ -108,6 +108,20 @@
 #define CONTAINER_PRIO   110
 #define CONTAINER_STACK  2048
 
+/* ⚠️ **仅原型测试**：故障注入者的优先级。
+ *
+ * ★ 它必须**低于**监督者 —— 这条不是调优，是判据成立的前提。
+ *
+ *   注入者是"第二个生产者"，用来撞开 R1/R4（队列计数器的写-写竞争）。
+ *   判据要求**两个生产者同时在临界区里**。如果注入者与监督者同优先级，
+ *   它这个不吃亏的紧循环会把监督者饿住 —— 那时它就不是第二个生产者，
+ *   而是**唯一**那个。而"只有一个人在产"和"两个人在产但没撞上"
+ *   在结果上完全一样：都是 0 异常。
+ *
+ *   上一轮两次尝试就是这么失败的（见 §三·补三十二·四补）。 */
+
+#define INJECT_PRIO      130
+
 /* 启动窗口：准入之后多少毫秒内仍算「启动期」。
  * 对应《设计》§6 的 safetyPolicy.startup.startTimeoutMs。
  */
@@ -250,8 +264,24 @@ static int g_now_ms;
 /* 事件序审计（§三·补三十一 的验收装置） */
 
 static uint32_t g_audit_last;    /* 上一条读到的事件号 */
+static uint32_t g_audit_lost;    /* 上一条记录的 lost（累计丢弃数） */
+static bool     g_audit_primed;  /* 第一条只做基准，不判 —— 见 drain_faults */
 static int      g_audit_gap;     /* 累计缺口（丢了但账对得上） */
-static int      g_audit_bad;     /* 累计异常（倒退/重复/账对不上） */
+static int      g_audit_bad;     /* 累计异常（倒退/重复） */
+static int      g_audit_acct;    /* 累计记账错（Δlost ≠ 缺口）—— R4 的判据 */
+static uint32_t g_drained;       /* 排出的事件总数（只用于给打印限流） */
+
+/* 一次 drain_faults() 最多排空多少条。
+ *
+ * ★ 必须有界。原版是 `while (prctl(...) > 0)` —— 它的终止条件是
+ *   "队列空了"，而这在**环饱和**时永远不成立：消费者每取走一条，
+ *   生产者在同一时间至少又产一条，`pending` 始终 > 0。于是这个循环
+ *   不会返回，`drainloop` 的"每秒一次"、"每周期一次"全都不会发生 ——
+ *   表现为整台机器卡死在一个看起来正常的函数里。
+ *
+ *   有界不丢事件（下一轮继续取），只是把"取干净"换成"每轮取一批"。 */
+
+#define DRAIN_MAX  65536
 
 /* 上一次 reload 失败的原因。用于把重复的同一错误折叠成一条。 */
 
@@ -924,8 +954,9 @@ static void drain_faults(void)
 {
   struct ort_faultrec_s rec;
   int n;
+  int budget = DRAIN_MAX;
 
-  while ((n = prctl(PR_GET_ORT_FAULT, &rec)) > 0)
+  while (budget-- > 0 && (n = prctl(PR_GET_ORT_FAULT, &rec)) > 0)
     {
       if (g_ev_count < MAX_EVENTS)
         {
@@ -939,14 +970,33 @@ static void drain_faults(void)
        * 内核那边 seq 是**全局单调**的事件号。所以监督者这一侧能独立
        * 判断三件事，不需要相信内核：
        *
-       *   seq 严格递增、缺口恰好等于 lost  → 事件流是好的
-       *   seq 有缺口但没有报 lost          → **丢了却没记账**（R1/R4）
-       *   seq 不增反退 / 重复              → **两条事件认领了同一个槽**（R1）
+       *   seq 严格递增、缺口恰好等于 Δlost  → 事件流是好的
+       *   seq 不增反退 / 重复               → **两条事件认领了同一个槽**（R1）
+       *   缺口 ≠ Δlost                      → **记账错**（R4）
        *
        * 这是"监督者单方面可判定"的判据 —— 与 ort_caps()、
-       * audit_protocol() 同一个思路。 */
+       * audit_protocol() 同一个思路。
+       *
+       * ★ 「缺口 == Δlost」这一条取代了原来那个 `lost == 0` 的写法。
+       *   原来那个**永远不会触发**：环一旦饱和，lost 就是个大数、
+       *   不是 0 —— 于是 R4（g_faultq_dropped++ 丢更新）从来没被判过，
+       *   而"没触发"看起来和"通过"一模一样。
+       *
+       *   正确的判据是**增量相等**，理由是可数的：
+       *   每个事件要么占一格、要么顶掉最旧的一格。顶掉时内核同时
+       *   `read++` 和 `dropped++` —— 前者让监督者的游标跳过那一号，
+       *   后者记进 lost。所以**跳过几个号，lost 就必须涨几**。
+       *   两者不等 = 有一边的加法丢了更新 = R4。
+       *
+       * ★ 第一条只做基准、不判：监督者可能**中途**才接上（首条 seq
+       *   已经是几千、lost 也已经是几千），拿它跟初始的 0 比会造出
+       *   一个假异常。必须先对齐再开始判 —— 否则判据本身是错的。 */
 
-      if (rec.seq <= g_audit_last)
+      if (!g_audit_primed)
+        {
+          g_audit_primed = true;
+        }
+      else if (rec.seq <= g_audit_last)
         {
           g_audit_bad++;
           printf("[ortsup] *** 事件序异常: seq=%u 未递增"
@@ -955,29 +1005,42 @@ static void drain_faults(void)
         }
       else if (rec.seq > g_audit_last + 1)
         {
-          uint32_t gap = rec.seq - g_audit_last - 1;
+          uint32_t gap   = rec.seq - g_audit_last - 1;
+          uint32_t dlost = rec.lost - g_audit_lost;
 
           g_audit_gap += gap;
 
-          if (rec.lost == 0 && g_audit_last != 0)
+          if (dlost != gap)
             {
-              /* 有缺口，但记录里说"一条都没丢" —— 账对不上 */
-              g_audit_bad++;
-              printf("[ortsup] *** 事件序异常: 缺口 %u 条，"
-                     "但记录里 lost=0（账对不上）***\n", (unsigned)gap);
+              g_audit_acct++;
+              printf("[ortsup] *** 记账错: 跳过 %u 号，lost 只涨了 %u"
+                     "（Δlost ≠ 缺口）—— g_faultq_dropped 丢了更新 ***\n",
+                     (unsigned)gap, (unsigned)dlost);
             }
         }
 
       g_audit_last = rec.seq;
+      g_audit_lost = rec.lost;
 
       g_ev_count++;
       g_ev_lost = (int)rec.lost;
 
-      printf("[ortsup] ← 故障事件 #%u victim=%d pc=%p addr=%p faults=%u%s\n",
-             (unsigned)rec.seq, rec.victim, (void *)rec.pc, (void *)rec.addr,
-             (unsigned)rec.faults,
-             rec.lost ? "  ⚠️ 有事件丢失" : "");
-      fflush(stdout);
+      /* ★ 逐条打印会淹没其它一切输出 —— 上一轮 R1/R4 的两次尝试
+       *   就是这么失败的（注入者的刷屏把监督者的启动日志整个冲掉，
+       *   结果连容器都没起来）。这里只对**打印**限流，
+       *   上面的审计与计数一条都不少：限流只能影响可读性，不能影响判据。 */
+
+      if (g_drained < 8 || (g_drained % 20000u) == 0)
+        {
+          printf("[ortsup] ← 故障事件 #%u victim=%d pc=%p addr=%p "
+                 "faults=%u%s\n",
+                 (unsigned)rec.seq, rec.victim, (void *)rec.pc,
+                 (void *)rec.addr, (unsigned)rec.faults,
+                 rec.lost ? "  ⚠️ 有事件丢失" : "");
+          fflush(stdout);
+        }
+
+      g_drained++;
     }
 }
 
@@ -2641,14 +2704,48 @@ int main(int argc, FAR char *argv[])
 
   if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "injectloop") == 0)
     {
-      int per = (argc > 2 && argv[2] != NULL) ? atoi(argv[2]) : 1;
+      int per    = (argc > 2 && argv[2] != NULL) ? atoi(argv[2]) : 1;
+      int rounds = (argc > 3 && argv[3] != NULL) ? atoi(argv[3]) : 0;
+      int delay  = (argc > 4 && argv[4] != NULL) ? atoi(argv[4]) : 0;
       unsigned long total = 0;
+      int r;
 
-      printf("[ortsup] === 注入循环（另一个上下文，不注册监督者）===\n");
-      printf("[ortsup] 每轮注入 %d 条\n", per);
-      fflush(stdout);
+      /* ── 自己申报调度优先级 ────────────────────────────────────────
+       *
+       * ★ **必须比监督者低**，否则它就不是"第二个生产者"，
+       *   而是"把第一个生产者挤掉的那个"。
+       *
+       *   上一轮两次尝试都栽在这里：注入者与监督者同为 100，而它是
+       *   个不吃亏的紧循环 —— 结果监督者被饿住、压根没跑到启动容器
+       *   那一步，日志里真故障 0 次。而"只有我一个在产"和
+       *   "两个人都在产但没撞上"在结果上看起来一模一样。
+       *
+       *   验收 R1/R4 要的是**两个生产者同时待在临界区里**，
+       *   不是其中一个把另一个饿死。 */
 
-      for (;;)
+      {
+        struct sched_param sched;
+
+        sched.sched_priority = INJECT_PRIO;
+        sched_setparam(0, &sched);
+        sched_getparam(0, &sched);
+
+        printf("[ortsup] === 注入循环（另一个上下文，不注册监督者）===\n");
+        printf("[ortsup] 每轮 %d 条；轮数 %s；优先级 %d（必须低于监督者 %d）\n",
+               per, rounds > 0 ? "有界" : "无限", (int)sched.sched_priority,
+               SUPERVISOR_PRIO);
+        fflush(stdout);
+      }
+
+      /* 等监督者把队伍拉起来再开产 —— 否则它可能还没注册（注册会把
+       * 事件队列清零），先产的那些会被清掉，算术恒等式就对不上了。 */
+
+      if (delay > 0)
+        {
+          usleep(delay * 1000);
+        }
+
+      for (r = 0; rounds <= 0 || r < rounds; r++)
         {
           int n = (int)prctl(PR_ORT_TEST_FAULT, per);
 
@@ -2656,12 +2753,40 @@ int main(int argc, FAR char *argv[])
             {
               total += (unsigned long)n;
             }
+        }
 
-          if ((total % 100000ul) < (unsigned long)per)
-            {
-              printf("[ortsup] 注入累计 %lu 条\n", total);
-              fflush(stdout);
-            }
+      /* ★ 自报产量 —— 这是 R1 判据的一半。
+       *
+       *   R1（g_faultq_total++ 丢更新）最干净的判据是一条**算术恒等式**：
+       *
+       *       监督者读到的末序 T  ==  各生产者自报产量之和
+       *
+       *   生产者数的是"我请求产了多少"（注入接口每次返回 count，
+       *   是承诺值），监督者数的是内核那一侧的 g_faultq_total。
+       *   两边**互相独立** —— 对不上就是内核那次加法丢了更新。
+       *
+       * ★ 为什么不能只看"seq 有没有异常"：
+       *   纯丢更新（两个生产者同时读到同一个 total）在环里表现为
+       *   **两条记录认领同一格、后写的覆盖先写的、序号仍然连续** ——
+       *   监督者那一侧**根本看不到异常**。只看着"没异常"会把它漏掉，
+       *   而"没看见"和"没发生"是两回事。
+       *
+       *   所以恒等式必须存在：它是唯一能看见"静默丢失"的装置。 */
+
+      printf("[ortsup] 注入累计 %lu 条（本生产者自报产量）\n", total);
+      fflush(stdout);
+
+      /* 有界模式：报完就退出。
+       * 无限模式：继续空转（保持"另一个上下文"活着，供并发观察）。 */
+
+      if (rounds > 0)
+        {
+          return 0;
+        }
+
+      for (;;)
+        {
+          sleep(1);
         }
     }
 
@@ -2765,8 +2890,68 @@ int main(int argc, FAR char *argv[])
 
       drain_faults();
 
-      printf("[ortsup] 审计: 读到 %d 条 / 缺口 %d / 异常 %d / 末条 lost=%d\n",
-             g_ev_count, g_audit_gap, g_audit_bad, g_ev_lost);
+      printf("[ortsup] 审计: 读到 %d 条 / 缺口 %d / 异常 %d / 记账错 %d / "
+             "末序 %u / 末条 lost=%d\n",
+             g_ev_count, g_audit_gap, g_audit_bad, g_audit_acct,
+             (unsigned)g_audit_last, g_ev_lost);
+      fflush(stdout);
+      return 0;
+    }
+
+  /* ── 纯消费者（⚠️ 仅原型测试）──────────────────────────────────────
+   *
+   *   ortsup drainloop [秒数]
+   *
+   * ★ 它只做两件事：注册监督者、不停地排空故障队列。**不读 manifest、
+   *   不起容器、不跑状态机** —— 目的就是把"队列的消费者"从整套部署
+   *   里单独摘出来。
+   *
+   *   为什么必须摘：验收 R1/R4 要的是**两个并发生产者**。前两次尝试
+   *   把它们挂在那套"manifest + 起容器 + 等准入 + 崩溃重启"的装置上，
+   *   装置本身先垮了（注入者把监督者饿住 → 容器根本没起来 → 真故障 0 次），
+   *   于是"没凑成两个生产者"和"竞争不存在"又混在一起。
+   *
+   *   生产者改用两个 `injectloop`（见那里的优先级说明），消费者就是这里。
+   *   三方都不依赖 manifest —— 装置越小，失败时越难赖错地方。
+   *
+   * ★ 必须**先于生产者**注册：注册会把事件队列清零（见 ort_supervisor_set），
+   *   先产的那些会被清掉，算术恒等式就永远对不上。所以生产者有启动延迟。 */
+
+  if (argc > 1 && strcmp(argv[1], "drainloop") == 0)
+    {
+      int secs = (argc > 2 && argv[2] != NULL) ? atoi(argv[2]) : 20;
+      int i;
+
+      printf("[ortsup] === 纯消费者：排空 %d 秒 ===\n", secs);
+      fflush(stdout);
+
+      for (i = 0; i < secs; i++)
+        {
+          sleep(1);
+          drain_faults();
+
+          printf("[ortsup] 审计: 读到 %u 条 / 缺口 %d / 异常 %d / 记账错 %d / "
+                 "末序 %u / 末条 lost=%u\n",
+                 (unsigned)g_drained, g_audit_gap, g_audit_bad, g_audit_acct,
+                 (unsigned)g_audit_last, (unsigned)g_audit_lost);
+          fflush(stdout);
+        }
+
+      /* ★ 末序 = 内核那一侧的 g_faultq_total。
+       *
+       *   算术恒等式（R1 的判据）：
+       *
+       *       末序  ==  各生产者自报产量之和
+       *
+       *   两者互相独立：生产者数的是"我请求产了多少"，这里数的是
+       *   内核真的加了多少次。对不上 = g_faultq_total++ 丢了更新。
+       *
+       * ⚠️ 读数必须等**生产完全停止**之后 —— 还在产的时候末序当然
+       *    小于累计产量，那不是异常。所以生产者是**有界**的。 */
+
+      printf("[ortsup] 消费者收尾: 末序=%u 已排空=%u\n",
+             (unsigned)g_audit_last, (unsigned)g_drained);
+      printf("[ortsup] 判据: 把各注入者的「注入累计」相加，应等于上面这个末序\n");
       fflush(stdout);
       return 0;
     }
@@ -3146,8 +3331,9 @@ int main(int argc, FAR char *argv[])
              g_cgs[i].faults, g_cgs[i].restarts);
     }
 
-  printf(" | events=%d lost=%d | 审计: 缺口=%d 异常=%d\n",
-         g_ev_count, g_ev_lost, g_audit_gap, g_audit_bad);
+  printf(" | events=%d lost=%d | 审计: 缺口=%d 异常=%d 记账错=%d 末序=%u\n",
+         g_ev_count, g_ev_lost, g_audit_gap, g_audit_bad, g_audit_acct,
+         (unsigned)g_audit_last);
 
   /* 最终态的断言：本原型跑完必须落在有效终态上 */
 
