@@ -1204,6 +1204,7 @@ static int ort_container_main(int argc, FAR char *argv[])
   int standby = 0;               /* 出生时带 standby 标记（有前任可接） */
   int nopub = 0;                 /* 测试装置：不发布状态 */
   int nosignal = 0;              /* 测试装置：忽略 SIGTERM */
+  int hammer = 0;                /* 测试装置：紧循环读写快照（撞撕裂窗口） */
   int delay = 0;
   int domain = 0;
   int version = 0;
@@ -1263,6 +1264,20 @@ static int ort_container_main(int argc, FAR char *argv[])
            *   用来造一个"兑现不了 SIGTERM 有界退出"的容器。 */
 
           nosignal = 1;
+        }
+      else if (strcmp(argv[i], "hammer") == 0)
+        {
+          /* ★ 测试装置：**紧循环**发布/校验 64 字节快照。
+           *
+           *   用途：把"两个核同时读写同一个状态槽"的碰撞窗口放大到
+           *   能观测的程度。单核下 put/get 不可能交错（§三·补二十四），
+           *   但 up_irq_save() 在 SMP 下**只关本核中断** ——
+           *   这条路径存在的意义就是让那个窗口真的被撞上。
+           *
+           *   见 §三·补二十九·再补：4 核"跑通了、结果逐字相同"，
+           *   但那不是保护生效，是时序运气。 */
+
+          hammer = 1;
         }
     }
 
@@ -1443,6 +1458,77 @@ static int ort_container_main(int argc, FAR char *argv[])
 
     fflush(stdout);
   }
+
+  /* ── 压力模式：把状态槽的并发窗口放大（测试装置）──────────────────
+   *
+   * 现任：每轮写 64 字节，**16 个字全部相等**；
+   * 接替者：紧循环读回，检查 16 个字是否仍然全相等。
+   *
+   * 判据为什么是这个形状：只要 memcpy 不是原子的，读端就会看到
+   * "一半是旧值、一半是新值" —— 而"全字相等"让任何长度的撕裂
+   * 都必然暴露，不需要事先知道哪几个字节会先落地。
+   *
+   * ⚠️ 这是**测试装置**，产品路径不会带 hammer 标记。
+   */
+
+  if (hammer)
+    {
+      static uint32_t snap[16];
+      uint32_t seq = 0;
+      unsigned long reads = 0;
+      int torn = 0;
+      int k;
+
+      printf("[ortsup] 容器(domain %d): **压力模式** —— %s\n", domain,
+             standby ? "接替者（紧循环读+校验 64 字节）"
+                     : "现任（紧循环写 64 字节）");
+      fflush(stdout);
+
+      for (;;)
+        {
+          if (standby)
+            {
+              if (prctl(PR_ORT_STATE_GET, snap, sizeof(snap))
+                  == (int)sizeof(snap))
+                {
+                  uint32_t v = snap[0];
+
+                  reads++;
+
+                  for (k = 1; k < 16; k++)
+                    {
+                      if (snap[k] != v)
+                        {
+                          torn++;
+
+                          if (torn <= 5)
+                            {
+                              printf("[ortsup] *** 撕裂快照 *** domain=%d "
+                                     "第 %d 次（读过 %lu 次）: "
+                                     "w0=%08lx w%d=%08lx\n",
+                                     domain, torn, reads,
+                                     (unsigned long)v, k,
+                                     (unsigned long)snap[k]);
+                              fflush(stdout);
+                            }
+                          break;
+                        }
+                    }
+                }
+            }
+          else
+            {
+              uint32_t v = ++seq;
+
+              for (k = 0; k < 16; k++)
+                {
+                  snap[k] = v;
+                }
+
+              prctl(PR_ORT_STATE_PUT, snap, sizeof(snap));
+            }
+        }
+    }
 
   if (strcmp(mode, "ok") == 0)
     {
@@ -2178,6 +2264,10 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
       {
         cargv[n++] = (FAR char *)"nosignal";
       }
+    else if (strncmp(cg->name, "hammer_", 7) == 0)
+      {
+        cargv[n++] = (FAR char *)"hammer";
+      }
 
     cargv[n] = NULL;
   }
@@ -2643,12 +2733,35 @@ int main(int argc, FAR char *argv[])
    *    （那就是 T7：直接 NOMINAL → SAFE_STATE，同样正确）。
    */
 
-  if (start_cg(&g_cgs[0], "fault", boot_mode ? 0 : 3, false) != 0 ||
-      start_cg(&g_cgs[1], "fault", boot_mode ? 2 : 8, false) != 0)
-    {
-      state_to(ORT_BOOT_FAILED);
-      return 1;
-    }
+  /* ★ 按 manifest 里**实际的** CG 数量拉起 —— 这里原来写死了两个下标
+   *   （`&g_cgs[0]` 和 `&g_cgs[1]`）。
+   *
+   *   一份只有 1 个 CG 的 manifest 会让第二次 start_cg 去读
+   *   `g_cgs[1].name` —— 而那一格是零初始化的 static，于是
+   *   `printf("%s", NULL)` 直接把**监督者自己**打挂在启动路径上。
+   *
+   *   实测（SMP 撕裂实验的副产物）：监督者启动容器之后立刻
+   *   `USER FAULT pid=<监督者> pc=... addr=00000000`。
+   *   一直没暴露是因为此前每份 manifest 恰好都是 2 个 CG ——
+   *   又是一个"只在一种输入下验证过"的坑（H31 那一族）。
+   *
+   *   延迟取值保留原来的演示语义：runtime 3s/8s，boot 0s/2s。 */
+
+  {
+    int i;
+
+    for (i = 0; i < (int)NCGS; i++)
+      {
+        int delay = boot_mode ? ((i == 0) ? 0 : 2)
+                              : ((i == 0) ? 3 : 8);
+
+        if (start_cg(&g_cgs[i], "fault", delay, false) != 0)
+          {
+            state_to(ORT_BOOT_FAILED);
+            return 1;
+          }
+      }
+  }
 
   /* ★ 不在这里进 NOMINAL。
    *
