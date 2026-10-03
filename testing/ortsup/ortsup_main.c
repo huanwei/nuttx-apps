@@ -2790,6 +2790,32 @@ int main(int argc, FAR char *argv[])
         }
     }
 
+  /* ── 对照组旋钮（⚠️ 仅原型测试）────────────────────────────────────
+   *
+   *   ortsup nosig <0|1>
+   *
+   * ★ 压队列的装置会让内核 assert（`irq/irq_csection.c:205`）。
+   *   但那个装置同时压了三样：队列计数器/环、每条事件一次
+   *   `nxsig_queue`（百万级）、百万级 prctl 往返。
+   *
+   *   这个旋钮把第二样**单独**摘掉 —— 关掉之后队列逻辑一字不改
+   *   （照常入队、计数、丢最旧），只不再叫醒监督者。
+   *   于是"是队列压垮了内核"和"是信号投递压垮了内核"可以分开。
+   *
+   * ★ 它是**运行期**旋钮：对照的两臂跑同一个二进制。
+   *   换编译再跑，就分不清是变量变了还是编译变了。 */
+
+  if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "nosig") == 0)
+    {
+      int want = atoi(argv[2]);
+      int got  = (int)prctl(PR_ORT_TEST_SIGNOFF, want);
+
+      printf("[ortsup] 故障通知信号: 请求 %s → 实际 %s\n",
+             want ? "开" : "关", got ? "开" : "关");
+      fflush(stdout);
+      return (got == (want ? 1 : 0)) ? 0 : 1;
+    }
+
   bool boot_mode;
   bool admit_mode;
   bool settled;
