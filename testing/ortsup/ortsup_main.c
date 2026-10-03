@@ -162,6 +162,14 @@ struct ort_cg_s
 
   bool            handles_fault;
 
+  /* 容器**自己的**版本号（来自 manifest）。
+   *
+   * ★ 它决定状态快照能不能跨实例交接 —— 见容器里 state_blob 的说明。
+   *   放在 manifest 而不是编译进容器，是因为"这次部署的是哪个版本"
+   *   本来就是部署的属性，不是二进制的属性。 */
+
+  int             version;
+
   /* 运行时状态 */
 
   pid_t           pid;
@@ -353,7 +361,9 @@ static bool mf_bool(FAR const char *v, FAR bool *out)
 #define SEEN_CRITICAL (1u << 1)
 #define SEEN_RESTARTS (1u << 2)
 #define SEEN_HANDLES  (1u << 3)
-#define SEEN_ALL      (SEEN_DOMAIN | SEEN_CRITICAL | SEEN_RESTARTS | SEEN_HANDLES)
+#define SEEN_VERSION  (1u << 4)
+#define SEEN_ALL      (SEEN_DOMAIN | SEEN_CRITICAL | SEEN_RESTARTS | \
+                       SEEN_HANDLES | SEEN_VERSION)
 
 /* 两份规格是否**等价**（只看声明，不看运行时状态）。
  *
@@ -366,7 +376,8 @@ static bool cg_spec_equal(FAR const struct ort_cg_s *a,
   return a->domain        == b->domain &&
          a->critical      == b->critical &&
          a->max_restarts  == b->max_restarts &&
-         a->handles_fault == b->handles_fault;
+         a->handles_fault == b->handles_fault &&
+         a->version       == b->version;   /* ★ 版本变了 = 要换实例 */
 }
 
 /****************************************************************************
@@ -602,6 +613,27 @@ static int manifest_load(FAR const char *path,
 
           seen[n - 1] |= SEEN_HANDLES;
         }
+      else if (strcmp(key, "revision") == 0)
+        {
+          /* ★ 刻意**不叫 version**：全局段的 version 是 **manifest 格式**
+           *   的版本，这里是**容器**的版本。同名会让人（和脚本）改错 ——
+           *   实测我自己就用一句 sed 把全局的那个也改了，
+           *   而报错信息是"manifest 格式不支持"，跟容器半毛钱关系没有。 */
+
+          if (!mf_int(val, &cg->version) || cg->version > 1000000)
+            {
+              mf_err(lineno, "revision 必须是十进制非负整数");
+              goto fail;
+            }
+
+          if (seen[n - 1] & SEEN_VERSION)
+            {
+              mf_err(lineno, "revision 重复");
+              goto fail;
+            }
+
+          seen[n - 1] |= SEEN_VERSION;
+        }
       else
         {
           /* ★ 不认识的键是**错误**，不是"忽略"。
@@ -810,11 +842,45 @@ static void fault_sig_handler(int signo, FAR siginfo_t *info, FAR void *ctx)
 /* 停止请求标志。SIGTERM 处理器只置位，不做别的事 ——
  * 处理器里能做的事越少越好（不可重入、不可阻塞、不可分配）。 */
 
+/* 状态快照的**自描述头**。
+ *
+ * ★ 为什么格式的定义权在容器手里而不是内核：
+ *   内核存的是不透明字节；"这堆字节是什么意思、能不能被新版本解释"
+ *   是**格式拥有者**该回答的问题 —— 所有正经的序列化格式
+ *   都是 magic + version 开头，理由相同。内核只负责存取和访问控制。
+ *
+ * ★ 为什么要 magic：快照可能来自一个**完全不同的**容器
+ *   （比如监督者分配域时复用了同一个域号）。magic 不符就说明
+ *   "这不是我这类快照"，必须冷启动，而不是硬按自己的结构去解。
+ */
+
+#define STATE_MAGIC  0x4f525453u   /* 'ORTS' */
+
+struct state_blob_s
+{
+  uint32_t magic;
+  uint32_t version;
+  uint32_t tick;
+};
+
 static volatile int g_stop;
 
 /* 状态计数器：真实容器这里是控制环的状态。见 ort_container_main 里的说明。 */
 
 static uint32_t g_tick;
+
+/* 打包装箱后发布 —— 让"发布什么"只有一处定义 */
+
+static void publish_tick(uint32_t version)
+{
+  struct state_blob_s blob;
+
+  blob.magic   = STATE_MAGIC;
+  blob.version = version;
+  blob.tick    = g_tick;
+
+  prctl(PR_ORT_STATE_PUT, &blob, sizeof(blob));
+}
 
 static void stop_sig_handler(int signo)
 {
@@ -829,6 +895,7 @@ static int ort_container_main(int argc, FAR char *argv[])
   volatile uint32_t *other;
   int delay = 0;
   int domain = 0;
+  int version = 0;
   int k;
 
   /* ★ 按**标记**找参数，不按下标数。
@@ -848,15 +915,16 @@ static int ort_container_main(int argc, FAR char *argv[])
         }
     }
 
-  if (k + 3 >= argc)
+  if (k + 4 >= argc)
     {
       printf("[ortsup] 容器: 参数不足 (argc=%d, marker=%d)\n", argc, k);
       return 1;
     }
 
-  mode   = argv[k + 1];
-  domain = atoi(argv[k + 2]);
-  delay  = atoi(argv[k + 3]);
+  mode    = argv[k + 1];
+  domain  = atoi(argv[k + 2]);
+  delay   = atoi(argv[k + 3]);
+  version = atoi(argv[k + 4]);
 
   /* ── 状态接续 ────────────────────────────────────────────────────────
    *
@@ -869,19 +937,35 @@ static int ort_container_main(int argc, FAR char *argv[])
    */
 
   {
-    uint32_t prev = 0;
+    struct state_blob_s prev;
     int n = prctl(PR_ORT_STATE_GET, &prev, sizeof(prev));
 
-    if (n == (int)sizeof(prev))
-      {
-        g_tick = prev;
-        printf("[ortsup] 容器(domain %d): **接续旧状态** tick=%u（不是冷启动）\n",
-               domain, (unsigned)g_tick);
-      }
-    else
+    if (n != (int)sizeof(prev))
       {
         printf("[ortsup] 容器(domain %d): 无旧状态可接续 (ret=%d)，从 0 开始\n",
                domain, n);
+      }
+    else if (prev.magic != STATE_MAGIC)
+      {
+        printf("[ortsup] 容器(domain %d): 快照标识不符 (0x%08x) → 冷启动\n",
+               domain, (unsigned)prev.magic);
+      }
+    else if (prev.version != (unsigned)version)
+      {
+        /* ★ 这条是滚动更新最容易踩的坑：
+         *   字节是**良构的**，但按新版本的结构去解释就是错的 ——
+         *   比读到垃圾更危险，因为它不会崩，只会静默算错。
+         *   所以**跨版本一律不交接**（fail-closed）。 */
+
+        printf("[ortsup] 容器(domain %d): 快照版本不符（旧 v%u ≠ 本实例 v%d）"
+               " → **不交接**，冷启动\n",
+               domain, (unsigned)prev.version, version);
+      }
+    else
+      {
+        g_tick = prev.tick;
+        printf("[ortsup] 容器(domain %d): **接续旧状态** tick=%u（v%d，不是冷启动）\n",
+               domain, (unsigned)g_tick, version);
       }
 
     fflush(stdout);
@@ -955,7 +1039,7 @@ static int ort_container_main(int argc, FAR char *argv[])
            * 否则接替者读到的是过期快照。 */
 
           g_tick++;
-          prctl(PR_ORT_STATE_PUT, &g_tick, sizeof(g_tick));
+          publish_tick((uint32_t)version);
           usleep(PUBLISH_PERIOD_US);
         }
 
@@ -980,7 +1064,7 @@ static int ort_container_main(int argc, FAR char *argv[])
         for (i = 0; i < delay * 10 && !g_stop; i++)
           {
             g_tick++;
-            prctl(PR_ORT_STATE_PUT, &g_tick, sizeof(g_tick));
+            publish_tick((uint32_t)version);
             usleep(PUBLISH_PERIOD_US);
           }
       }
@@ -1374,7 +1458,8 @@ static bool admit_ok(FAR const struct ort_cg_s *cg)
 
 static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay)
 {
-  FAR char *cargv[5];
+  FAR char *cargv[6];
+  char vbuf[12];
   char dbuf[8];
   char lbuf[8];
   pid_t pid;
@@ -1400,6 +1485,7 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay)
 
   snprintf(dbuf, sizeof(dbuf), "%d", cg->domain);
   snprintf(lbuf, sizeof(lbuf), "%d", delay);
+  snprintf(vbuf, sizeof(vbuf), "%d", cg->version);
 
   /* ── 拉起容器：两条路，取决于构建模式 ──────────────────────────────
    *
@@ -1423,7 +1509,8 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay)
   cargv[1] = (FAR char *)mode;
   cargv[2] = dbuf;
   cargv[3] = lbuf;
-  cargv[4] = NULL;
+  cargv[4] = vbuf;
+  cargv[5] = NULL;
 
 #if defined(CONFIG_BUILD_KERNEL)
 
