@@ -899,24 +899,116 @@ struct state_blob_s
   uint32_t tick;
 };
 
-static volatile int g_stop;
-
-/* 本实例是不是"对外负责"的那个。
+/* ── 实例私有状态 ──────────────────────────────────────────────────────
  *
- * ★ 重叠期里新旧两个实例都在跑，但**只有现任有权写状态**。
- *   接替者在新手期只**读**（跟踪现任），被监督者点名之后才接管。
+ * ★★ 为什么**不能**用 static（见手册 §三·补二十五）：
  *
- *   为什么不能两边都写：槽是单槽，两边都写会来回翻，
- *   下一个接替者读到的可能来自任意一个 —— 那不是状态，是噪声。
+ *   两个 SKU 的地址空间模型不同：
+ *
+ *     ORT-A（BUILD_KERNEL）   每个进程独立地址空间 → static 天然私有
+ *     ORT-M（BUILD_PROTECTED）**所有容器共用同一个用户地址空间**
+ *                             → static 是**共享的**
+ *
+ *   在 ORT-M 上实测到的症状（改一处、两处都动）：
+ *     - app_cg(domain 1) 与 safety_cg(domain 2) 报出**同一个** tick=49
+ *       —— 两个任务读写的是同一个 g_tick；
+ *     - 给 pid=6 发 SIGTERM 撤下旧实例，pid=7（接替者）和 pid=8
+ *       （另一个 CG 的重启实例）**一起**退出了 —— g_stop 也是共享的。
+ *
+ *   这个 bug 在 ORT-A 上**根本不会出现** —— 正是"只在一个 SKU 上验证过"
+ *   会漏掉的那一类（与 H31、§三·补十四 同族）。
+ *
+ *   ★ 但**域块也不是安全的落点** —— 第一步的修法就踩了这个坑：
+ *     ORT-M 上接替者被绑到**和现任同一个域**（重叠替换就是这么设计的），
+ *     于是两个实例**共用同一块域内存**。实测：
+ *       - 接替者启动时写了它自己的标志，把现任的"我还是 active"关掉了
+ *         → 现任在整个 1.5 s 窗口里**一格都没走**（接续 24 → 接管 24，
+ *         而 ORT-A 上同一段是 24 → 41）；
+ *       - 重启实例报出 tick=30，与它自己刚打印的"从 0 开始"自相矛盾。
+ *     两块都"看起来正常"，正是 H31 那一族。
+ *
+ *   落点因此分两类：
+ *
+ *     计数器等**只被主循环读写**的量 → **栈上的局部变量**。
+ *       每个任务有自己的栈，ORT-M / ORT-A 两边都天然私有。
+ *
+ *     信号处理器要写的量 → 只能落在实例的内存里（处理器拿不到局部变量），
+ *       并且**用 pid 打标**：`flags[PRIV_ACTIVE] == getpid()` 才算数。
+ *       于是两个实例写同一个字也不会互相误解 —— 各认各的 pid。
+ *
+ * ★★ 为什么"在任"和"该退下"必须是**两个字**（踩了两次才定下来）：
+ *
+ *   第一版想省一个字，用 ACTIVE 同时表达两件事：
+ *     "在任者不是我" 既可能是**新手期**（正常），也可能是**被顶掉**（该退）。
+ *     靠一个"我当过在任者没有"的局部变量去区分 —— ORT-M 上能跑，
+ *     ORT-A 上**接替者一出生就退出**：那边 ACTIVE 是**私有**的，
+ *     新手期读到的是 0，"无人在任"被当成了"我被撤下了"。
+ *
+ *   也就是说：**同一个判据在两个 SKU 上语义不同**（共享 vs 私有），
+ *   这种"省一个字"的设计不管怎么调都会在另一边翻车。
+ *   拆成两个字之后，"谁在任"和"谁被要求停"各问各的，两边同构。
+ *
+ *     在任      ACTIVE == getpid()
+ *     该退下    STOP   == getpid()
+ *   两个问句都不依赖"这块内存是不是共享的"。
  */
 
-static volatile int g_active;
-static int g_domain;
+#define PRIV_ACTIVE  1    /* 值 = 现任的 pid；0 = 无人在任 */
+#define PRIV_STOP    2    /* 值 = 被要求停止的那个 pid；0 = 没有 */
+#define PRIV_WORDS   4
 
-/* 状态计数器：真实容器这里是控制环的状态。见 ort_container_main 里的说明。 */
+/* 实例内存里私有字的起始偏移 —— 避开 own[0]（隔离演示用）。 */
 
-static uint32_t g_tick;
-static int g_was_active;
+#define PRIV_OFFSET  4
+
+/* ORT-A 上的载体：独立地址空间，这份 static 就是私有的。
+ * ORT-M 上只是"还没绑域"时的兜底，正常路径走域块。 */
+
+static uint32_t g_priv_static[PRIV_WORDS];
+
+/* 取本实例的私有状态块。信号处理器也要用。
+ *
+ * ★ 为什么一定要"现问内核"：处理器拿不到主循环的局部变量，
+ *   而 static 在 ORT-M 上是**共享**的 —— 用它就会拿到**别的实例**的块。
+ *   域号由监督者绑定、容器改不了，所以这个推导伪造不了。 */
+
+static uint32_t *priv_self(void)
+{
+#if defined(CONFIG_BUILD_KERNEL)
+
+  /* ORT-A：独立地址空间，static 就是私有的。
+   * （不能去算 POOL_BASE —— 那组地址在 MMU 侧根本没有映射。） */
+
+  return g_priv_static;
+
+#else
+
+  {
+    int d = (int)prctl(PR_GET_ORT_DOMAIN);
+
+    if (d >= 0 && d < NBLOCKS)
+      {
+        return (uint32_t *)(POOL_BASE + (uint32_t)d * BLOCK_SIZE)
+               + PRIV_OFFSET;
+      }
+  }
+
+  return g_priv_static;   /* 还没绑域 —— 只有启动早期会走到 */
+
+#endif
+}
+
+/* 三个问句，各自只看自己那一个字 —— 两个 SKU 上语义相同。 */
+
+static bool am_owner(void)
+{
+  return priv_self()[PRIV_ACTIVE] == (uint32_t)getpid();
+}
+
+static bool stop_requested(void)
+{
+  return priv_self()[PRIV_STOP] == (uint32_t)getpid();
+}
 
 /* 打包装箱后发布 —— 让"发布什么"只有一处定义 */
 
@@ -934,24 +1026,44 @@ static int g_was_active;
  *   这不是实现细节，是"无扰切换"的前提。
  */
 
-static void publish_tick(uint32_t version);
+static void publish_tick(uint32_t tick, uint32_t version);
 
-static void step_state(uint32_t version)
+/* 计数器 `tick` 由**调用者持有**（栈上），不落任何共享存储 —— 见 PRIV_* 说明。
+ * `announced` 同理：只有主循环读写它。 */
+
+static void step_state(uint32_t *tick, int *announced, int standby,
+                       int domain, uint32_t version)
 {
   struct state_blob_s snap;
 
-  if (g_active)
+  if (am_owner())
     {
-      if (!g_was_active)
+      if (!*announced)
         {
-          g_was_active = 1;
-          printf("[ortsup] 容器(domain %d): **接管**（tick=%u，"
-                 "已持续跟踪到此刻）\n", g_domain, (unsigned)g_tick);
+          *announced = 1;
+
+          /* ★ 区分「接了前任的班」和「开机第一个实例」。
+           *
+           *   两者都是"在任"，但语义完全不同：前者是**冗余切换**，
+           *   后者只是启动。原来两种情况都打印"接管（tick=0）" ——
+           *   开机时凭空多出一行"接管"，看起来像发生过一次切换。 */
+
+          if (standby)
+            {
+              printf("[ortsup] 容器(domain %d): **接管**（tick=%u，"
+                     "已持续跟踪到此刻）\n", domain, (unsigned)*tick);
+            }
+          else
+            {
+              printf("[ortsup] 容器(domain %d): **首次启动**（无前任，"
+                     "tick=%u）\n", domain, (unsigned)*tick);
+            }
+
           fflush(stdout);
         }
 
-      g_tick++;
-      publish_tick(version);
+      (*tick)++;
+      publish_tick(*tick, version);
       return;
     }
 
@@ -959,19 +1071,19 @@ static void step_state(uint32_t version)
 
   if (prctl(PR_ORT_STATE_GET, &snap, sizeof(snap)) == (int)sizeof(snap) &&
       snap.magic == STATE_MAGIC && snap.version == version &&
-      snap.tick > g_tick)
+      snap.tick > *tick)
     {
-      g_tick = snap.tick;
+      *tick = snap.tick;
     }
 }
 
-static void publish_tick(uint32_t version)
+static void publish_tick(uint32_t tick, uint32_t version)
 {
   struct state_blob_s blob;
 
   blob.magic   = STATE_MAGIC;
   blob.version = version;
-  blob.tick    = g_tick;
+  blob.tick    = tick;
 
   prctl(PR_ORT_STATE_PUT, &blob, sizeof(blob));
 }
@@ -980,11 +1092,18 @@ static void stop_sig_handler(int signo)
 {
   (void)signo;
 
-  /* 被要求停止 = 不再是对外负责的那个实例。
-   * 立刻停止发布，否则提交之后槽里还会混进旧实例的写入。 */
+  /* 只写"是我被要求停"这一个字。
+   *
+   * ★ 不碰 ACTIVE —— 这是踩过的坑：写成"清 ACTIVE"的时候，
+   *   重叠期两代实例共用这一个字，旧实例收到 SIGTERM 顺手把
+   *   ACTIVE 清了，**已经接任的接替者**一看"无人在任"就安静地
+   *   "干净退出"了。日志上是一行普通的"干净退出"，
+   *   而系统里那个关键 CG 已经没人服务 —— 它甚至让整轮跑不到
+   *   SAFE_STATE（关键 CG 不再故障，状态机停在 DEGRADED）。
+   *
+   *   带上 pid 之后，只有被点名的那一个会退下。 */
 
-  g_active = 0;
-  g_stop   = 1;
+  priv_self()[PRIV_STOP] = (uint32_t)getpid();
 }
 
 /* 监督者在**提交点**发来：从现在起你负责。 */
@@ -992,7 +1111,7 @@ static void stop_sig_handler(int signo)
 static void active_sig_handler(int signo)
 {
   (void)signo;
-  g_active = 1;
+  priv_self()[PRIV_ACTIVE] = (uint32_t)getpid();
 }
 
 static int ort_container_main(int argc, FAR char *argv[])
@@ -1000,6 +1119,9 @@ static int ort_container_main(int argc, FAR char *argv[])
   FAR const char *mode = NULL;
   volatile uint32_t *own;
   volatile uint32_t *other;
+  uint32_t tick = 0;             /* 私有计数器：放栈上，两边 SKU 都天然私有 */
+  int announced = 0;             /* 已经报过一次"接管 / 首次启动" */
+  int standby = 0;               /* 出生时带 standby 标记（有前任可接） */
   int delay = 0;
   int domain = 0;
   int version = 0;
@@ -1038,6 +1160,7 @@ static int ort_container_main(int argc, FAR char *argv[])
         {
           /* 新手期：只跟踪，不发布（见 step_state 的说明） */
 
+          standby = 1;
           break;
         }
     }
@@ -1047,67 +1170,20 @@ static int ort_container_main(int argc, FAR char *argv[])
   delay   = atoi(argv[k + 3]);
   version = atoi(argv[k + 4]);
 
-  /* ── 状态接续 ────────────────────────────────────────────────────────
+  /* ── 准入等待：先等监督者绑域 ────────────────────────────────────────
    *
-   * 真实容器在这里是控制环的积分器 / 滤波器 / 上次输出。
-   * 原型用一个**单调计数器**，因为它一眼可判：
-   *   替换后从 0 重新开始 = 状态没接上；从 N 继续 = 接上了。
+   * ★★ 顺序很要紧：**状态接续必须排在准入之后**。
    *
-   * ★ 这一步是行业冗余链在单板上的对应物（见假设审计 H32）：
-   *   没有它，"先起后杀"只是让进程不缺席，功能仍然被打断。
+   *   状态槽是**按域**索引的（见 arm_ortcommon.c 的 ort_state_slot()），
+   *   没绑域就取不到自己的那一格。原来这一步写在准入之前 ——
+   *   ORT-A 上没暴露，因为 posix_spawn 出来的进程要做动态装载，
+   *   慢到监督者早就绑完了；ORT-M 上 task_create 立刻激活，
+   *   子任务抢在监督者绑域之前就跑到了这里 → 永远读到 -EPERM。
+   *
+   *   也就是说：**原来那条"接续成功"的路径是抢赢得来的**，
+   *   换个调度顺序就会静默退化成冷启动 —— 而且它看起来一模一样。
+   *   （§三·补二十五 实测：ORT-M 上 100% 复现。）
    */
-
-  {
-    struct state_blob_s prev;
-    int n = prctl(PR_ORT_STATE_GET, &prev, sizeof(prev));
-
-    if (n != (int)sizeof(prev))
-      {
-        printf("[ortsup] 容器(domain %d): 无旧状态可接续 (ret=%d)，从 0 开始\n",
-               domain, n);
-      }
-    else if (prev.magic != STATE_MAGIC)
-      {
-        printf("[ortsup] 容器(domain %d): 快照标识不符 (0x%08x) → 冷启动\n",
-               domain, (unsigned)prev.magic);
-      }
-    else if (prev.version != (unsigned)version)
-      {
-        /* ★ 这条是滚动更新最容易踩的坑：
-         *   字节是**良构的**，但按新版本的结构去解释就是错的 ——
-         *   比读到垃圾更危险，因为它不会崩，只会静默算错。
-         *   所以**跨版本一律不交接**（fail-closed）。 */
-
-        printf("[ortsup] 容器(domain %d): 快照版本不符（旧 v%u ≠ 本实例 v%d）"
-               " → **不交接**，冷启动\n",
-               domain, (unsigned)prev.version, version);
-      }
-    else
-      {
-        g_tick = prev.tick;
-        printf("[ortsup] 容器(domain %d): **接续旧状态** tick=%u（v%d，"
-               "之后持续跟踪直到被点名）\n",
-               domain, (unsigned)g_tick, version);
-      }
-
-    fflush(stdout);
-  }
-
-  /* 停得下来，才谈得上"被替换"。
-   *
-   * 没有这个处理器，监督者只能 SIGKILL —— 容器没有机会把正在做的事
-   * 收尾（写回、释放、报告）。有界退出是滚动更新的前提条件。 */
-
-  signal(SIGTERM, stop_sig_handler);
-  signal(SIGUSR2, active_sig_handler);   /* 监督者在提交点点名 */
-  g_domain = domain;
-
-  /* 不是 standby 就是现任：开机启动的实例立刻负责，
-   * 不需要任何人点名（它也没有前任）。 */
-
-  g_active = (i >= argc);
-
-  /* 准入等待：容器创建与监督者绑域之间有窗口（见 ortmem 的说明） */
 
   {
     int waited = 0;
@@ -1157,9 +1233,106 @@ static int ort_container_main(int argc, FAR char *argv[])
 
 #endif
 
+  /* ── 本实例的"现任"标志（信号处理器要写，只能落在实例内存里）──────
+   *
+   * ⚠️ **只写自己该写的那一个值**，不要"顺手清零"：
+   *   重叠期里接替者和现任共用这一个字，接替者清一次零
+   *   就把现任的在任状态抹掉了（实测：现任整整 1.5 s 一格没走）。
+   *   standby 启动时**什么都不写**，让现任继续当它的现任。
+   */
+
+  {
+    uint32_t *flags;
+
+#if defined(CONFIG_BUILD_KERNEL)
+
+    flags = g_priv_static;   /* ORT-A：独立地址空间，这份 static 就是私有的 */
+
+#else
+
+    flags = (uint32_t *)own + PRIV_OFFSET;   /* ORT-M：域块里，按域隔离 */
+
+#endif
+
+    if (!standby)                      /* 不是 standby：出生即在任 */
+      {
+        flags[PRIV_ACTIVE] = (uint32_t)getpid();
+        flags[PRIV_STOP]   = 0;        /* 清掉上次开机留在域块里的陈旧值 */
+      }
+
+    /* ★ standby 两格都**不写**：它没有前任可取代、也不该动现任的字。 */
+  }
+
+  /* 停得下来，才谈得上"被替换"。
+   *
+   * 没有这个处理器，监督者只能 SIGKILL —— 容器没有机会把正在做的事
+   * 收尾（写回、释放、报告）。有界退出是滚动更新的前提条件。
+   *
+   * ⚠️ 处理器**不读静态变量**：在 ORT-M 上静态变量是共享的，
+   *    它会把标志写到**别的实例**的块里。改为 priv_self() 现问内核。 */
+
+  signal(SIGTERM, stop_sig_handler);
+  signal(SIGUSR2, active_sig_handler);   /* 监督者在提交点点名 */
+
+  /* ── 状态接续 ────────────────────────────────────────────────────────
+   *
+   * 真实容器在这里是控制环的积分器 / 滤波器 / 上次输出。
+   * 原型用一个**单调计数器**，因为它一眼可判：
+   *   替换后从 0 重新开始 = 状态没接上；从 N 继续 = 接上了。
+   *
+   * ★ 这一步是行业冗余链在单板上的对应物（见假设审计 H32）：
+   *   没有它，"先起后杀"只是让进程不缺席，功能仍然被打断。
+   *
+   * ★ 必须排在**绑域之后**（见上面准入等待的说明）。
+   */
+
+  {
+    struct state_blob_s prev;
+    int n = prctl(PR_ORT_STATE_GET, &prev, sizeof(prev));
+    int e = (n == -1) ? errno : -n;
+
+    /* ★ 归一化 errno：两个 SKU 的 prctl 返回形式不同 ——
+     *   ORT-A 直接返回负 errno（实测 -2），
+     *   ORT-M 走 syscall 包装，返回 -1 并把原因放进 errno。
+     *   直接打印 ret 会让**同一份代码**在两台机器上输出不同，
+     *   而"逐字相同"正是我们用来证明"两边跑的是同一个状态机"的判据
+     *   （§三·补十九）。诊断输出上的差异同样会掩盖真实差异。 */
+
+    if (n != (int)sizeof(prev))
+      {
+        printf("[ortsup] 容器(domain %d): 无旧状态可接续 (errno=%d)，从 0 开始\n",
+               domain, e);
+      }
+    else if (prev.magic != STATE_MAGIC)
+      {
+        printf("[ortsup] 容器(domain %d): 快照标识不符 (0x%08x) → 冷启动\n",
+               domain, (unsigned)prev.magic);
+      }
+    else if (prev.version != (unsigned)version)
+      {
+        /* ★ 这条是滚动更新最容易踩的坑：
+         *   字节是**良构的**，但按新版本的结构去解释就是错的 ——
+         *   比读到垃圾更危险，因为它不会崩，只会静默算错。
+         *   所以**跨版本一律不交接**（fail-closed）。 */
+
+        printf("[ortsup] 容器(domain %d): 快照版本不符（旧 v%u ≠ 本实例 v%d）"
+               " → **不交接**，冷启动\n",
+               domain, (unsigned)prev.version, version);
+      }
+    else
+      {
+        tick = prev.tick;
+        printf("[ortsup] 容器(domain %d): **接续旧状态** tick=%u（v%d，"
+               "之后持续跟踪直到被点名）\n",
+               domain, (unsigned)tick, version);
+      }
+
+    fflush(stdout);
+  }
+
   if (strcmp(mode, "ok") == 0)
     {
-      while (!g_stop)
+      while (!stop_requested())
         {
           *own = 0xa5a5a5a5u;
 
@@ -1167,12 +1340,12 @@ static int ort_container_main(int argc, FAR char *argv[])
            * 发布周期必须**明显短于**重启预算与启动窗口，
            * 否则接替者读到的是过期快照。 */
 
-          step_state((uint32_t)version);
+          step_state(&tick, &announced, standby, domain, (uint32_t)version);
           usleep(PUBLISH_PERIOD_US);
         }
 
       printf("[ortsup] 容器(domain %d): 收到停止请求，干净退出（tick=%u）\n",
-             domain, (unsigned)g_tick);
+             domain, (unsigned)tick);
       fflush(stdout);
       return 0;
     }
@@ -1189,18 +1362,18 @@ static int ort_container_main(int argc, FAR char *argv[])
       {
         int j;
 
-        for (j = 0; j < delay * 10 && !g_stop; j++)
+        for (j = 0; j < delay * 10 && !stop_requested(); j++)
           {
-            step_state((uint32_t)version);
+            step_state(&tick, &announced, standby, domain, (uint32_t)version);
             usleep(PUBLISH_PERIOD_US);
           }
       }
 
-      if (g_stop)
+      if (stop_requested())
         {
           printf("[ortsup] 容器(domain %d): 故障注入前收到停止请求，"
                  "干净退出（tick=%u，已发布）\n",
-                 domain, (unsigned)g_tick);
+                 domain, (unsigned)tick);
           fflush(stdout);
           return 0;
         }
