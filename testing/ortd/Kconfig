@@ -1,0 +1,39 @@
+config TESTING_ORTD
+	tristate "[ORT] ORT deploy/O&M agent prototype"
+	default n
+	depends on TESTING_ORTSUP
+	---help---
+		[ORT] 部署 / O&M 代理原型。
+
+		★ 它存在的理由是把**配置递送**从实时控制环里切出去：
+
+		  在此之前，监督者每 2 秒自己 fopen manifest 并逐行解析 ——
+		  也就是实时控制环里做文件 I/O。硬实时关心的是最坏耗时，
+		  而 hostfs / flash 的最坏延迟都不可控。
+
+		  切分后：本代理（非实时约束）负责读文件、把原样字节放进
+		  内核配置槽；监督者每周期只读一个标量，变了才取回并自己校验。
+
+		这与 Wind River 是同一个形状：VxWorks 653 是 Module OS 在 init 期
+		装载配置 + mode manager 分区请求变更；VxWorks 7 是目标上另跑一个
+		kubelet（不参与实时调度）；Studio OTA 是设备侧独立的 eSync agent。
+
+		设计见 proposals/《序驰 OrdinRT (ORT) 部署与 O&M 组件设计.md》。
+
+		依赖 TESTING_ORTSUP：本原型目前只服务于 ortsup 的配置递送。
+
+if TESTING_ORTD
+
+config TESTING_ORTD_PRIORITY
+	int "ortd task priority"
+	default 120
+
+config TESTING_ORTD_STACKSIZE
+	int "ortd stack size"
+	default 4096
+
+config TESTING_ORTD_PATH
+	string "ortd default manifest path"
+	default "/system/etc/ort.cfg"
+
+endif # TESTING_ORTD

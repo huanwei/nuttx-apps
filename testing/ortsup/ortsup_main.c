@@ -110,10 +110,6 @@ static int g_startup_window_ms = STARTUP_WINDOW_MS;
 
 #define LOOP_MS  5
 
-/* manifest 轮询周期 */
-
-#define RELOAD_POLL_MS  2000
-
 /****************************************************************************
  * 状态定义（《设计》§2.1）
  ****************************************************************************/
@@ -240,11 +236,21 @@ static unsigned int g_caps;
  */
 
 static int g_now_ms;
-static int g_last_reload_ms;
 
 /* 上一次 reload 失败的原因。用于把重复的同一错误折叠成一条。 */
 
 static char g_reload_lasterr[160];
+
+/* ── 配置通道的运行期状态 ──────────────────────────────────────────────
+ *
+ * 控制循环每周期只做两件**有界**的事：读一个代数、读一个心跳。
+ * 两者都是标量，不阻塞、不分配、不做 I/O。
+ */
+
+static int  g_last_cfg_seq;      /* 上次处理过的配置代数 */
+static int  g_last_cfg_tick;     /* 上次看到的代理心跳 */
+static int  g_cfg_tick_ms;       /* 心跳最后一次变化的时刻（监督者时钟） */
+static bool g_cfg_lost;          /* 已报告过"代理失联" */
 
 #define NCGS (g_ncgs)
 
@@ -280,8 +286,29 @@ static char g_reload_lasterr[160];
  *     对安全系统来说，"拒绝启动"永远优于"按我以为的配置启动"。
  ****************************************************************************/
 
-#define MANIFEST_PATH      "/system/etc/ort.cfg"
 #define MANIFEST_MAXLINE   256   /* 注释里有 UTF-8 中文，一字符 3 字节，别卡太紧 */
+
+/* ── 部署/O&M 代理这条通道的三个常量 ─────────────────────────────────── */
+
+#define CFG_FETCH_MAX   4096     /* 与内核的 ORT_CFG_MAX 一致 */
+#define DEPLOY_WAIT_MS  5000     /* 等第一份配置的上限（Q2：有界等待） */
+#define DEPLOY_LOST_MS  3000     /* 心跳停滞多久算失联（Q1：报告，不降级） */
+
+static char g_cfg_buf[CFG_FETCH_MAX];
+
+/* 从内核配置槽取回一份快照。
+ *
+ * ★ 这是控制循环**唯一**碰配置的地方，而且它是一次**有界 memcpy**：
+ *   大小固定、不阻塞、无文件 I/O。这正是拆分的目的 ——
+ *   "解析慢一点"是可分析的，"读文件最坏多久"不是。
+ *
+ * 返回字节数；<=0 表示代理还没送来过（-ENOENT）或接口出错。
+ */
+
+static int cfg_fetch(FAR char *buf, size_t cap)
+{
+  return (int)prctl(PR_ORT_CFG_GET, buf, (int)cap);
+}
 
 /* ★ 解析阶段的 startup_timeout_ms 落在这里，**不直接写 g_startup_window_ms**。
  *   否则一份校验失败的 manifest 也已经改掉了运行时配置 ——
@@ -417,7 +444,7 @@ static bool cg_spec_equal(FAR const struct ort_cg_s *a,
 }
 
 /****************************************************************************
- * Name: manifest_load
+ * Name: manifest_parse
  *
  * Description:
  *   解析并**校验** manifest。任何可疑之处一律拒绝整份配置。
@@ -427,15 +454,15 @@ static bool cg_spec_equal(FAR const struct ort_cg_s *a,
  *
  ****************************************************************************/
 
-static int manifest_load(FAR const char *path,
-                         FAR struct ort_cg_s *cgs, int maxcgs,
-                         FAR int *ncgs)
+static int manifest_parse(FAR const char *text, size_t len,
+                          FAR struct ort_cg_s *cgs, int maxcgs,
+                          FAR int *ncgs)
 {
   FAR struct ort_cg_s *cg = NULL;
   char line[MANIFEST_MAXLINE];
   char names[MAX_CGS][16];        /* 每个 CG 的名字存这儿 —— 解析缓冲区每行复用 */
   unsigned int seen[MAX_CGS];     /* 每个 CG 已出现过的键 */
-  FILE *fp;
+  size_t pos = 0;
   int lineno = 0;
   bool have_version = false;
   int n = 0;
@@ -444,26 +471,56 @@ static int manifest_load(FAR const char *path,
   *ncgs = 0;
   g_mf_err = NULL;
 
-  fp = fopen(path, "r");
-  if (fp == NULL)
-    {
-      mf_err(lineno, "打不开 manifest 文件");
-      return -ENOENT;
-    }
+  /* ★ 解析的是**内存里的字节**，不是文件。
+   *
+   *   这一行是本轮拆分的落点：配置由部署/O&M 代理读进来放进内核配置槽，
+   *   监督者只管解析。控制循环里因此不再有任何文件 I/O —— 而它的最坏
+   *   耗时才是硬实时真正在意的（hostfs / flash 的最坏延迟不可控）。
+   *
+   *   解析本身仍然是**有界**的：缓冲区大小固定、无 syscall、无动态分配。
+   *   这跟"读文件最坏耗时不可控"是两回事 —— 前者可以被 WCET 分析覆盖。
+   *
+   *   ⚠️ 文本未必以 '\0' 结尾（它来自一个有长度的槽），所以全程靠
+   *      `pos < len` 界定，**不依赖字符串终止符**。
+   */
 
-  while (fgets(line, sizeof(line), fp) != NULL)
+  while (pos < len)
     {
       FAR char *p;
       FAR char *eq;
       FAR char *key;
       FAR char *val;
+      size_t nl = 0;
+      bool overlong = false;
 
+      /* 取一行到 line[]，去掉行尾 '\n' */
+
+      while (pos < len && text[pos] != '\n')
+        {
+          if (nl >= sizeof(line) - 1)
+            {
+              overlong = true;
+            }
+          else
+            {
+              line[nl++] = text[pos];
+            }
+
+          pos++;
+        }
+
+      if (pos < len)
+        {
+          pos++;                    /* 吃掉 '\n' */
+        }
+
+      line[nl] = '\0';
       lineno++;
 
       /* 行太长会被截断成两行，第二行多半语法不合法 —— 但**可能**恰好合法，
        * 那就成了静默错配。所以宁可在这里就拒。 */
 
-      if (strchr(line, '\n') == NULL && !feof(fp))
+      if (overlong)
         {
           mf_err(lineno, "行超长（疑似被截断）");
           goto fail;
@@ -696,9 +753,6 @@ static int manifest_load(FAR const char *path,
         }
     }
 
-  fclose(fp);
-  fp = NULL;
-
   /* ── 整体校验 ──────────────────────────────────────────────────────── */
 
   if (!have_version)
@@ -743,11 +797,6 @@ static int manifest_load(FAR const char *path,
   return OK;
 
 fail:
-  if (fp != NULL)
-    {
-      fclose(fp);
-    }
-
   n = 0;
   return -EINVAL;
 }
@@ -1789,19 +1838,36 @@ static int manifest_reload(void)
   int j;
   int applied = 0;
 
-  if (manifest_load(MANIFEST_PATH, scratch, MAX_CGS, &n) != OK)
+  /* ★ 从**内核配置槽**取回新配置 —— 这里没有 fopen，也不该有。
+   *   代理负责搬，监督者负责校验与采纳。 */
+
+  {
+    int got = cfg_fetch(g_cfg_buf, sizeof(g_cfg_buf));
+
+    if (got <= 0)
+      {
+        /* 槽里没有东西。正常情况下取不到就不会被调用（代数没变），
+         * 所以走到这里说明代理把槽清空了或接口出错 —— 不作结论。 */
+
+        return -ENOENT;
+      }
+
+    n = got;
+  }
+
+  if (manifest_parse(g_cfg_buf, (size_t)n, scratch, MAX_CGS, &n) != OK)
     {
       /* ★ 只在错误**变了**的时候打印。
        *
-       *   轮询是每 2 秒一次，不折叠的话一份坏配置会把日志刷满 ——
-       *   而运维真正需要的是"什么时候开始坏的、坏在哪"，
-       *   不是"它重复了多少次"。实测：不折叠时 13 秒刷了 6 遍同一条。
+       *   不折叠的话一份坏配置会把日志刷满 —— 而运维真正需要的是
+       *   "什么时候开始坏的、坏在哪"，不是"它重复了多少次"。
+       *   实测：不折叠时 13 秒刷了 6 遍同一条。
        */
 
       if (strcmp(g_mf_err ? g_mf_err : "?", g_reload_lasterr) != 0)
         {
           printf("[ortsup] *** 拒绝新配置（当前配置原样继续运行）***\n");
-          printf("[ortsup] %s: %s\n", MANIFEST_PATH,
+          printf("[ortsup] 配置槽: %s\n",
                  g_mf_err ? g_mf_err : "未知原因");
           fflush(stdout);
 
@@ -2327,25 +2393,88 @@ int main(int argc, FAR char *argv[])
 
   printf("[ortsup] === ORT 监督者原型（降级状态机）===\n");
 
-  /* ── 加载 manifest ───────────────────────────────────────────────────
+  /* ── 先注册监督者 ────────────────────────────────────────────────────
    *
-   * ★ fail-closed：manifest 有任何问题就**拒绝启动**。
+   * ★ 顺序变了：以前"先读 manifest、再注册"，现在反过来。
+   *   原因：配置槽的读接口**只对监督者开放**（容器一律 -EPERM），
+   *   没注册就取不到配置。
    *
-   *   不"用默认值兜底继续跑" —— 那等于用一套运维没写过的配置运行系统，
-   *   而且没人知道。安全系统里，"拒绝启动 + 说清哪里错" 永远优于
-   *   "按我以为的配置启动"。
+   * 信号用 SIGUSR1：CONFIG_SIG_SIGUSR1_ACTION 默认为 n，
+   * 内核不配默认动作，只有主动挂钩子的任务会收到。
+   */
+
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = fault_sig_handler;
+  sa.sa_flags     = SA_SIGINFO;
+  sigaction(ORT_SIGFAULT, &sa, NULL);
+
+  /* 监督者槽位是钉住的 —— 连续跑多轮需要先复位。
+   * 那是仅原型可用的接口（CONFIG_ORT_SUPERVISOR_RESET）。
+   */
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
+
+  if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
+    {
+      printf("[ortsup] FAIL: 注册监督者失败\n");
+      return 1;
+    }
+
+  /* ── 从部署/O&M 代理取配置 ───────────────────────────────────────────
    *
-   *   注意这里连 ENOMEM 之类的错误一视同仁：解析器不做动态分配，
-   *   所以失败只可能是配置本身的问题。
+   * ★★ 监督者**不再读文件**。配置由代理读进来放进内核配置槽，
+   *    监督者只取回并解析。这是《部署与 O&M 组件设计》的落地：
+   *    实时控制环里不再有不可控最坏耗时的操作。
+   *
+   * ★ Q2（已拍板）：等第一份配置**有界**，超时 → BOOT_FAILED。
+   *   不等下去 —— 与既有 fail-closed 语义一致，"没有配置就运行"
+   *   是明确的错误。不立刻失败 —— 代理是**另一个进程**，启动有先后。
+   *
+   * ★ 快照取回后仍然**由监督者自己校验**。代理是非实时、可重启、
+   *   可能被降级的组件，按公理 S1 它的输出只能当**输入**看；
+   *   校验逻辑只有这一份，不会出现"代理的规则和监督者的不一致"。
    */
 
   {
-    int ret = manifest_load(MANIFEST_PATH, g_cgs, MAX_CGS, &g_ncgs);
+    int waited = 0;
+    int n      = -1;
 
-    if (ret != OK)
+    while (waited < DEPLOY_WAIT_MS)
+      {
+        n = cfg_fetch(g_cfg_buf, sizeof(g_cfg_buf));
+
+        if (n > 0)
+          {
+            break;
+          }
+
+        usleep(LOOP_MS * 1000);
+        waited += LOOP_MS;
+      }
+
+    if (n <= 0)
+      {
+        printf("[ortsup] *** 拒绝启动: 等不到部署代理送来的配置（%d ms）***\n",
+               DEPLOY_WAIT_MS);
+        printf("[ortsup]     配置由部署/O&M 代理经内核配置槽递送 —— "
+               "监督者不做文件 I/O。\n");
+        printf("[ortsup] 系统状态: BOOT_FAILED（锁存）\n");
+        fflush(stdout);
+        return 2;
+      }
+
+    /* ★ fail-closed：manifest 有任何问题就**拒绝启动**。
+     *
+     *   不"用默认值兜底继续跑" —— 那等于用一套运维没写过的配置运行系统，
+     *   而且没人知道。安全系统里，"拒绝启动 + 说清哪里错" 永远优于
+     *   "按我以为的配置启动"。
+     */
+
+    if (manifest_parse(g_cfg_buf, (size_t)n, g_cgs, MAX_CGS, &g_ncgs)
+        != OK)
       {
         printf("[ortsup] *** 拒绝启动: manifest 校验失败 ***\n");
-        printf("[ortsup] %s: %s\n", MANIFEST_PATH,
+        printf("[ortsup] 配置槽（%d 字节）: %s\n", n,
                g_mf_err ? g_mf_err : "未知原因");
         printf("[ortsup] 系统状态: BOOT_FAILED（锁存）\n");
         fflush(stdout);
@@ -2355,10 +2484,13 @@ int main(int argc, FAR char *argv[])
     /* 解析成功才提交（见 g_mf_startup_ms 的说明） */
 
     g_startup_window_ms = g_mf_startup_ms;
+    g_last_cfg_seq      = (int)prctl(PR_GET_ORT_CFG_SEQ);
+    g_last_cfg_tick     = (int)prctl(PR_GET_ORT_CFG_TICK);
+    g_cfg_tick_ms       = g_now_ms;
   }
 
-  printf("[ortsup] manifest: %s（%d 个 CG，启动窗口 %d ms）\n",
-         MANIFEST_PATH, (int)NCGS, g_startup_window_ms);
+  printf("[ortsup] manifest: 由部署代理经配置槽递送"
+         "（%d 个 CG，启动窗口 %d ms）\n", (int)NCGS, g_startup_window_ms);
 
   {
     int k;
@@ -2420,28 +2552,6 @@ int main(int argc, FAR char *argv[])
 
       fflush(stdout);
       return 0;
-    }
-
-  /* 注册监督者 + 挂故障通道。注意信号用 SIGUSR1：
-   * CONFIG_SIG_SIGUSR1_ACTION 默认为 n，内核不配默认动作，
-   * 只有主动挂钩子的任务会收到。
-   */
-
-  memset(&sa, 0, sizeof(sa));
-  sa.sa_sigaction = fault_sig_handler;
-  sa.sa_flags     = SA_SIGINFO;
-  sigaction(ORT_SIGFAULT, &sa, NULL);
-
-  /* 监督者槽位是钉住的 —— 连续跑多轮需要先复位。
-   * 那是仅原型可用的接口（CONFIG_ORT_SUPERVISOR_RESET）。
-   */
-
-  prctl(PR_ORT_SUPERVISOR_RESET);
-
-  if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
-    {
-      printf("[ortsup] FAIL: 注册监督者失败\n");
-      return 1;
     }
 
   /* ── BOOT：按 startOrder 拉起全部 CG ──────────────────────────────── */
@@ -2515,22 +2625,57 @@ int main(int argc, FAR char *argv[])
           break;
         }
 
-      /* ── manifest 轮询 ─────────────────────────────────────────────
+      /* ── 配置通道：读一个代数、读一个心跳 ───────────────────────────
        *
-       * 每 RELOAD_POLL_MS 重读一次。用轮询而不是 inotify/SIGHUP：
-       * hostfs 下没有 inotify，而 SIGHUP 需要一个能发信号的助手 ——
-       * 两者都会把"演示能不能跑"绑到别的东西上。
+       * ★★ 控制循环在这里**不再碰文件**。
        *
-       * 原型里轮询是可接受的：文件小、间隔长、解析不分配内存。
-       * 正式实现应当换成变更通知，并把解析移到**优先级更低**的
-       * 上下文 —— 现在它跑在监督循环里，会占掉这段时间。
+       *   以前是每 2 秒一次 fopen + 逐行解析 + fclose ——
+       *   也就是实时控制环里做文件 I/O，而 hostfs / flash 的最坏延迟
+       *   不可控。现在两件事都是**标量读**：
+       *
+       *     代数（seq）  —— 变了才去取快照并解析（有界 memcpy + 有界解析）
+       *     心跳（tick） —— 代理每跑一圈就加，与内容变没变无关
+       *
+       *   ★ 心跳是必需的，不是锦上添花：
+       *     代理死了的症状是"配置再也不会变" —— 而它与
+       *     "配置本来就不需要变"**看起来一模一样**。
+       *     没有心跳，这两件事无法区分（H31 那一族）。
        */
 
-      if (g_now_ms - g_last_reload_ms >= RELOAD_POLL_MS)
-        {
-          g_last_reload_ms = g_now_ms;
-          manifest_reload();
-        }
+      {
+        int seq  = (int)prctl(PR_GET_ORT_CFG_SEQ);
+        int tick = (int)prctl(PR_GET_ORT_CFG_TICK);
+
+        if (seq >= 0 && seq != g_last_cfg_seq)
+          {
+            g_last_cfg_seq = seq;
+            manifest_reload();
+          }
+
+        if (tick >= 0 && tick != g_last_cfg_tick)
+          {
+            g_last_cfg_tick = tick;
+            g_cfg_tick_ms   = g_now_ms;
+            g_cfg_lost      = false;
+          }
+        else if (!g_cfg_lost &&
+                 (g_now_ms - g_cfg_tick_ms) >= DEPLOY_LOST_MS)
+          {
+            /* ★ Q1（已拍板）：失联 = **报告 + 保持当前配置**。
+             *
+             *   不自动降级、不重启代理 —— 代理是非实时组件，
+             *   它的可用性不该绑住监督者的状态机。
+             *   但**必须说出来**：沉默的失联正是 H31 那一族。 */
+
+            g_cfg_lost = true;
+
+            printf("[ortsup] *** 部署/O&M 代理失联"
+                   "（心跳停滞 %d ms）***\n", DEPLOY_LOST_MS);
+            printf("[ortsup]     当前配置保持原样继续运行。"
+                   "配置不会再更新，直到代理恢复。\n");
+            fflush(stdout);
+          }
+      }
 
       /* 反向验证 protocol 声明（见 audit_protocol）。放在故障排空之前：
        * 它读的是"这个 CG 现在是什么状态"，与被处理的事件无关。 */

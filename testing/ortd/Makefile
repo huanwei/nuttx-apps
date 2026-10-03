@@ -1,0 +1,10 @@
+include $(APPDIR)/Make.defs
+
+PROGNAME  = ortd
+PRIORITY  = $(CONFIG_TESTING_ORTD_PRIORITY)
+STACKSIZE = $(CONFIG_TESTING_ORTD_STACKSIZE)
+MODULE    = $(CONFIG_TESTING_ORTD)
+
+MAINSRC = ortd_main.c
+
+include $(APPDIR)/Application.mk
