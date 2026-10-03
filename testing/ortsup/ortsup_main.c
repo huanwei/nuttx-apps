@@ -73,7 +73,18 @@
 #include <errno.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
+#include <spawn.h>
 #include <nuttx/sched.h>
+
+/* 容器用的就是**本 ELF 自己**（`ortsup container ...`）。
+ *
+ * 为什么不做一个独立的 ortctnr 程序：
+ *   容器入口 ort_container_main 和状态机就在同一个文件里，
+ *   拆出去要么复制一份、要么造一个只有几行的壳。
+ *   自 spawn 的代价只是多认一个 "container" 标记 —— 见 main 开头。
+ */
+
+#define CONTAINER_PATH  "/system/bin/ortsup"
 
 #define POOL_BASE   0x60840000u
 #define BLOCK_SIZE  (16 * 1024u)
@@ -311,24 +322,39 @@ static void fault_sig_handler(int signo, FAR siginfo_t *info, FAR void *ctx)
 
 static int ort_container_main(int argc, FAR char *argv[])
 {
-  FAR const char *mode;
+  FAR const char *mode = NULL;
   volatile uint32_t *own;
   volatile uint32_t *other;
   int delay = 0;
-  int domain;
+  int domain = 0;
+  int k;
 
-  if (argc < 3)
+  /* ★ 按**标记**找参数，不按下标数。
+   *
+   *   两条创建路径的 argv 差一个位置：
+   *     task_create()  （ORT-M / PROTECTED）—— 内核把程序名插到 argv[0]
+   *     posix_spawn()  （ORT-A / KERNEL）  —— 实测原样传递，不插
+   *   数下标在一条路上必然错位，而且错位后表现为"域号读成垃圾"，
+   *   很难看出来。（ortbad 已经因为同一件事踩过一次，见手册 坑 3。）
+   */
+
+  for (k = 0; k < argc; k++)
     {
+      if (argv[k] != NULL && strcmp(argv[k], "container") == 0)
+        {
+          break;
+        }
+    }
+
+  if (k + 3 >= argc)
+    {
+      printf("[ortsup] 容器: 参数不足 (argc=%d, marker=%d)\n", argc, k);
       return 1;
     }
 
-  mode   = argv[1];        /* 父进程 cargv[0] → 子进程 argv[1] */
-  domain = atoi(argv[2]);  /* 父进程 cargv[1] → 子进程 argv[2] */
-
-  if (argc > 3)
-    {
-      delay = atoi(argv[3]);
-    }
+  mode   = argv[k + 1];
+  domain = atoi(argv[k + 2]);
+  delay  = atoi(argv[k + 3]);
 
   /* 准入等待：容器创建与监督者绑域之间有窗口（见 ortmem 的说明） */
 
@@ -347,9 +373,38 @@ static int ort_container_main(int argc, FAR char *argv[])
       }
   }
 
+#if defined(CONFIG_BUILD_KERNEL)
+
+  /* ── ORT-A（MMU）：没有"内存域"这个维度 ─────────────────────────────
+   *
+   * 隔离由**独立地址空间**天然给出 —— 越界访问必然落到未映射地址上，
+   * 不需要（也没有）一个"别人的块"可供比对。
+   *
+   *   own   = 本进程自己的静态变量（当然可写；只作成功对照）
+   *   other = 一个必定未映射的地址
+   *
+   * 0xdeadbe00 的选法与 ortbad 一致：低地址、不在任何映射区、
+   * 也不在栈附近 —— 免得测出来的是"栈溢出"而不是"越界"。
+   *
+   * ⚠️ 注意 POOL_BASE 那一组地址是 **MPU 侧**的内存池，在 ORT-A 上
+   *    根本没有映射 —— 照搬过来会在第一次写就 fault，
+   *    看起来像"隔离立即生效"，其实是地址压根不存在。
+   */
+
+  {
+    static volatile uint32_t s_own;
+
+    own   = &s_own;
+    other = (volatile uint32_t *)0xdeadbe00u;
+  }
+
+#else
+
   own   = (volatile uint32_t *)(POOL_BASE + (uint32_t)domain * BLOCK_SIZE);
   other = (volatile uint32_t *)
             (POOL_BASE + ((uint32_t)domain + 1) % NBLOCKS * BLOCK_SIZE);
+
+#endif
 
   if (strcmp(mode, "ok") == 0)
     {
@@ -408,7 +463,7 @@ static bool admit_ok(FAR const struct ort_cg_s *cg)
 
 static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay)
 {
-  FAR char *cargv[4];
+  FAR char *cargv[5];
   char dbuf[8];
   char lbuf[8];
   pid_t pid;
@@ -434,14 +489,49 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay)
 
   snprintf(dbuf, sizeof(dbuf), "%d", cg->domain);
   snprintf(lbuf, sizeof(lbuf), "%d", delay);
-  cargv[0] = (FAR char *)mode;
-  cargv[1] = dbuf;
-  cargv[2] = lbuf;
-  cargv[3] = NULL;
 
-  /* 注意参数顺序：NuttX 会把任务名插到 argv[0]，所以容器里看到的是
-   * {name, mode, domain}。上面 ort_container_main 按这个布局读。
+  /* ── 拉起容器：两条路，取决于构建模式 ──────────────────────────────
+   *
+   * ★ 这里原来只有 task_create() 一条路，在 ORT-A 上**直接链接失败**：
+   *
+   *     undefined reference to `task_create'
+   *
+   *   不是缺 include —— syscall/syscall.csv 明确用
+   *   !defined(CONFIG_BUILD_KERNEL) 把它排除了：
+   *   KERNEL 构建下用户态任务**只能**通过 posix_spawn()/task_spawn()
+   *   加载一个 ELF，没有"直接创建任务"这回事。
+   *
+   *   这也是 §三·补十七 那个硬发现的正面修法：监督者不该假设自己能
+   *   凭空造任务 —— 那是 PROTECTED 才有的能力。
+   *
+   *   代价是容器必须是一个可执行的 ELF。这里让它 spawn **自己**
+   *   （`ortsup container ...`），省掉一个只有几行的壳程序。
    */
+
+  cargv[0] = (FAR char *)"container";   /* 标记位，两条路的唯一锚点 */
+  cargv[1] = (FAR char *)mode;
+  cargv[2] = dbuf;
+  cargv[3] = lbuf;
+  cargv[4] = NULL;
+
+#if defined(CONFIG_BUILD_KERNEL)
+
+  /* ORT-A：独立地址空间，容器是独立 ELF */
+
+  {
+    int ret = posix_spawn(&pid, CONTAINER_PATH, NULL, NULL, cargv, NULL);
+
+    if (ret != 0)
+      {
+        printf("[ortsup] 启动 %s 失败: posix_spawn ret=%d\n",
+               cg->name, ret);
+        return -ret;
+      }
+  }
+
+#else
+
+  /* ORT-M：PROTECTED，可以直接创建一个任务，入口就是本文件里的函数 */
 
   pid = task_create(cg->name, CONTAINER_PRIO, CONTAINER_STACK,
                     ort_container_main, cargv);
@@ -450,6 +540,8 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay)
       printf("[ortsup] 启动 %s 失败: %d\n", cg->name, (int)pid);
       return (int)pid;
     }
+
+#endif
 
   /* 在这里打印而不是回到 main 里统一打印：
    * 此刻容器已创建但还卡在准入等待（域未绑），不会抢先输出 ——
@@ -595,6 +687,28 @@ static void on_cg_failed(FAR struct ort_cg_s *cg)
 int main(int argc, FAR char *argv[])
 {
   struct sigaction sa;
+
+  /* ── 容器入口 ────────────────────────────────────────────────────────
+   *
+   * 本 ELF 也可以被自己 spawn 出来当**容器**跑（ORT-A 走这条路）。
+   *
+   * ★ 必须在做任何监督者初始化**之前**判：容器不该注册监督者、
+   *   更不该去复位监督者槽位 —— 那会把真监督者顶掉。
+   *   位置比判断本身更容易出错。
+   */
+
+  {
+    int k;
+
+    for (k = 0; k < argc; k++)
+      {
+        if (argv[k] != NULL && strcmp(argv[k], "container") == 0)
+          {
+            return ort_container_main(argc, argv);
+          }
+      }
+  }
+
   bool boot_mode;
   bool admit_mode;
   bool settled;
