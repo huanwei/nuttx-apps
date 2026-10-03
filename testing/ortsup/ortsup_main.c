@@ -188,6 +188,22 @@ struct ort_cg_s
 
   int             protocol;
 
+  /* 运行期**实测**到的兑现情况：1 = 声明被证伪。
+   *
+   * ★ 为什么必须有这个字段：protocol 是 manifest 作者的**声明**，
+   *   不是容器的事实。声明只保护一个方向 ——
+   *     声明 0 而实际支持 v1  → 走保守路径（冷替换），无害；
+   *     声明 1 而实际没实现    → **危险方向**：监督者会按热替换办，
+   *                              而容器既不响应 SIGTERM 也不发布状态，
+   *                              于是"事务性替换 + 状态延续"两条承诺
+   *                              同时落空，日志上却看不出任何异常。
+   *
+   *   所以监督者必须能**反向证伪**它（公理 S1：不信任失效组件）。
+   *   判据见 audit_protocol()。
+   */
+
+  int             protocol_falsified;
+
   /* 运行时状态 */
 
   pid_t           pid;
@@ -1031,7 +1047,7 @@ static void publish_tick(uint32_t tick, uint32_t version);
 /* 计数器 `tick` 由**调用者持有**（栈上），不落任何共享存储 —— 见 PRIV_* 说明。
  * `announced` 同理：只有主循环读写它。 */
 
-static void step_state(uint32_t *tick, int *announced, int standby,
+static void step_state(uint32_t *tick, int *announced, int standby, int nopub,
                        int domain, uint32_t version)
 {
   struct state_blob_s snap;
@@ -1063,7 +1079,12 @@ static void step_state(uint32_t *tick, int *announced, int standby,
         }
 
       (*tick)++;
-      publish_tick(*tick, version);
+
+      if (!nopub)          /* 测试装置：装作"没实现发布"的容器 */
+        {
+          publish_tick(*tick, version);
+        }
+
       return;
     }
 
@@ -1122,6 +1143,8 @@ static int ort_container_main(int argc, FAR char *argv[])
   uint32_t tick = 0;             /* 私有计数器：放栈上，两边 SKU 都天然私有 */
   int announced = 0;             /* 已经报过一次"接管 / 首次启动" */
   int standby = 0;               /* 出生时带 standby 标记（有前任可接） */
+  int nopub = 0;                 /* 测试装置：不发布状态 */
+  int nosignal = 0;              /* 测试装置：忽略 SIGTERM */
   int delay = 0;
   int domain = 0;
   int version = 0;
@@ -1156,12 +1179,31 @@ static int ort_container_main(int argc, FAR char *argv[])
 
   for (i = 0; i < argc; i++)
     {
-      if (argv[i] != NULL && strcmp(argv[i], "standby") == 0)
+      if (argv[i] == NULL)
+        {
+          continue;
+        }
+
+      if (strcmp(argv[i], "standby") == 0)
         {
           /* 新手期：只跟踪，不发布（见 step_state 的说明） */
 
           standby = 1;
-          break;
+        }
+      else if (strcmp(argv[i], "nopub") == 0)
+        {
+          /* ★ 测试装置：故意不发布状态。
+           *   用来造一个"声明了 protocol=1 但没实现"的容器 ——
+           *   见 start_cg 里那段说明。产品路径不会带这个标记。 */
+
+          nopub = 1;
+        }
+      else if (strcmp(argv[i], "nosignal") == 0)
+        {
+          /* ★ 测试装置：忽略 SIGTERM 且不注入故障。
+           *   用来造一个"兑现不了 SIGTERM 有界退出"的容器。 */
+
+          nosignal = 1;
         }
     }
 
@@ -1169,6 +1211,19 @@ static int ort_container_main(int argc, FAR char *argv[])
   domain  = atoi(argv[k + 2]);
   delay   = atoi(argv[k + 3]);
   version = atoi(argv[k + 4]);
+
+  if (nosignal)
+    {
+      /* 一直跑到被杀 —— 否则它会在 delay 到点时自己 fault 掉，
+       * 那 SIGTERM 兜底那条判据就永远验不到。
+       *
+       * ⚠️ 必须排在 `mode = argv[k+1]` **之后**：第一版写在前面，
+       *    被那行赋值原地覆盖，"忽略 SIGTERM"的容器照样按 mode=fault
+       *    跑，8 秒后自己崩掉 —— 于是宽限期那条判据**永远验不到**，
+       *    而日志上一切正常（它"确实"跑起来了）。又是一次同族错误。 */
+
+      mode = "ok";
+    }
 
   /* ── 准入等待：先等监督者绑域 ────────────────────────────────────────
    *
@@ -1271,7 +1326,7 @@ static int ort_container_main(int argc, FAR char *argv[])
    * ⚠️ 处理器**不读静态变量**：在 ORT-M 上静态变量是共享的，
    *    它会把标志写到**别的实例**的块里。改为 priv_self() 现问内核。 */
 
-  signal(SIGTERM, stop_sig_handler);
+  signal(SIGTERM, nosignal ? SIG_IGN : stop_sig_handler);
   signal(SIGUSR2, active_sig_handler);   /* 监督者在提交点点名 */
 
   /* ── 状态接续 ────────────────────────────────────────────────────────
@@ -1340,7 +1395,8 @@ static int ort_container_main(int argc, FAR char *argv[])
            * 发布周期必须**明显短于**重启预算与启动窗口，
            * 否则接替者读到的是过期快照。 */
 
-          step_state(&tick, &announced, standby, domain, (uint32_t)version);
+          step_state(&tick, &announced, standby, nopub, domain,
+                     (uint32_t)version);
           usleep(PUBLISH_PERIOD_US);
         }
 
@@ -1364,7 +1420,8 @@ static int ort_container_main(int argc, FAR char *argv[])
 
         for (j = 0; j < delay * 10 && !stop_requested(); j++)
           {
-            step_state(&tick, &announced, standby, domain, (uint32_t)version);
+            step_state(&tick, &announced, standby, nopub, domain,
+                     (uint32_t)version);
             usleep(PUBLISH_PERIOD_US);
           }
       }
@@ -1424,6 +1481,8 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
  *
  ****************************************************************************/
 
+static void protocol_falsify(FAR struct ort_cg_s *cg, FAR const char *why);
+
 static bool stop_cg(FAR struct ort_cg_s *cg)
 {
   int waited = 0;
@@ -1435,7 +1494,8 @@ static bool stop_cg(FAR struct ort_cg_s *cg)
 
   if (kill(cg->pid, SIGTERM) != 0)
     {
-      /* 投不出去通常就是已经没了 */
+      /* 投不出去通常就是已经没了 —— 拿不到"响应了没有"的证据，
+       * 所以**不作结论**（见 audit_protocol 的"证据"一节）。 */
 
       cg->pid = -1;
       return true;
@@ -1457,9 +1517,116 @@ static bool stop_cg(FAR struct ort_cg_s *cg)
 
   printf("[ortsup]   ⚠ %s pid=%d 未在 %d ms 内响应 SIGTERM → SIGKILL 兜底\n",
          cg->name, (int)cg->pid, STOP_GRACE_MS);
+
+  /* ★ 这是**证伪 protocol 声明的第二条判据**（第一条见 audit_protocol）。
+   *
+   *   声明里那条"实现了 SIGTERM 有界退出"是可以用这个观测直接推翻的：
+   *   SIGTERM 投出去了、宽限期内它没走 —— 无论它是没装处理器、
+   *   还是处理器里睡过了头，都说明**它兑现不了"停得下来"**。
+   *
+   *   注意这与"kill 投不出去"不同：那种情况容器已经没了，
+   *   说明不了任何事，不能算证据。 */
+
+  protocol_falsify(cg, "撤下时未在宽限期内响应 SIGTERM（SIGKILL 兜底）");
+
   kill(cg->pid, SIGKILL);
   cg->pid = -1;
   return false;
+}
+
+/****************************************************************************
+ * Name: protocol_falsify
+ *
+ * Description:
+ *   把某个 CG 的 protocol 声明标记为**不可信**，并明示后果。
+ *
+ *   标记是**锁存**的：一份被证伪的声明不会因为换了个实例就恢复可信 ——
+ *   证据是关于**这个容器**的，不是关于这一次运行的。
+ *
+ ****************************************************************************/
+
+static void protocol_falsify(FAR struct ort_cg_s *cg, FAR const char *why)
+{
+  if (cg->protocol_falsified)
+    {
+      return;                     /* 只报一次 */
+    }
+
+
+  cg->protocol_falsified = 1;
+
+  printf("[ortsup] *** protocol 声明被证伪: %s（声明 protocol=%d）***\n",
+         cg->name, cg->protocol);
+  printf("[ortsup]     证据: %s\n", why);
+  printf("[ortsup]     后果: 该 CG 后续替换**降级为冷替换**"
+         "（先停后起，中间有一段服务空档）\n");
+  printf("[ortsup]     声明是部署方写的，容器没有任何办法反驳它 —— "
+         "所以只能由监督者实测推翻。\n");
+  fflush(stdout);
+}
+
+/****************************************************************************
+ * Name: audit_protocol
+ *
+ * Description:
+ *   反向验证 protocol 声明。声明 protocol=1 意味着两件事，
+ *   两件**监督者都能从外部观测**，不需要相信容器：
+ *
+ *     ① 撤下它时是否走了 SIGKILL 兜底   → 证伪「停得下来」
+ *        （在 stop_cg 里记录，见那里的说明）
+ *     ② 健康运行超过启动窗口之后，它自己域的状态槽是否仍为空
+ *        → 证伪「在发布」（这里）
+ *
+ * ★ 为什么 ② 的判据落在**启动窗口之后**：
+ *   窗口内可能确实还没开始发布（容器还在初始化）。窗口本来就是
+ *   监督者单方面可判定的"应该已经就绪"的时刻 —— 复用它，
+ *   不引入第二个时间常量，也就不会出现两个常量互相矛盾。
+ *
+ * ★ 为什么只看"写没写过"，不看"写得对不对"：
+ *   槽里是不透明字节，格式的定义权在容器手里（见容器的 state_blob）。
+ *   监督者能独立判断的事实只有一个 —— **那个域被写过没有** ——
+ *   而它足以证伪"完全没实现"。
+ *
+ * ★ 什么时候查不到：容器刚故障被重启时，槽会被内核作废，
+ *   而 admitted_ms 会随新实例重置 —— 两者同步，不会误伤。
+ */
+
+static void audit_protocol(void)
+{
+  int i;
+
+  for (i = 0; i < (int)NCGS; i++)
+    {
+      FAR struct ort_cg_s *cg = &g_cgs[i];
+      int seq;
+
+      if (cg->protocol == 0 || cg->protocol_falsified || cg->failed)
+        {
+          continue;
+        }
+
+      if (cg->pid <= 0 || cg->admitted_ms < 0)
+        {
+          continue;
+        }
+
+      if ((g_now_ms - cg->admitted_ms) < g_startup_window_ms)
+        {
+          continue;
+        }
+
+      /* 权限在内核侧：只有监督者能调这个接口（见 <sys/prctl.h>）。
+       * 返回 0 = 该域从未发布过；负值 = 接口本身出错，不作结论。 */
+
+      seq = (int)prctl(PR_GET_ORT_STATE_SEQ, cg->domain);
+
+      if (seq == 0)
+        {
+          protocol_falsify(cg,
+                           "健康运行超过启动窗口，该域**从来没发布过**"
+                           "（累计发布次数为 0）");
+        }
+    }
 }
 
 
@@ -1505,10 +1672,18 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
    *   那正是 H31/H32 那类错误。
    */
 
-  if (spec->protocol == 0)
+  if (spec->protocol == 0 || spec->protocol_falsified)
     {
-      printf("[ortsup]   该 CG 声明 protocol=0（未实现生命周期协议）"
-             " → **冷替换**：先停后起，中间有一段服务空档\n");
+      if (spec->protocol_falsified)
+        {
+          printf("[ortsup]   该 CG 的 protocol 声明**已被证伪**"
+                 " → **冷替换**：先停后起，中间有一段服务空档\n");
+        }
+      else
+        {
+          printf("[ortsup]   该 CG 声明 protocol=0（未实现生命周期协议）"
+                 " → **冷替换**：先停后起，中间有一段服务空档\n");
+        }
 
       stop_cg(live);
       spec->pid = -1;
@@ -1693,6 +1868,16 @@ static int manifest_reload(void)
           printf("[ortsup] 配置变更: %s 的声明变了（pid=%d）\n",
                  scratch[k].namebuf, (int)live->pid);
 
+          /* ★ 证伪结论**先搬过来再换**。
+           *
+           *   它是运行期实测出来的，不是 manifest 里的声明 ——
+           *   解析器刚 memset 出来的这一份里它是 0。
+           *   不搬的话，replace_cg() 看到的是一份"声明可信"的新规格，
+           *   于是又按热替换办 —— 而打印出来的"后果"那一行
+           *   早就承诺了要降级。**承诺了却没做**比不做更糟。 */
+
+          scratch[k].protocol_falsified = live->protocol_falsified;
+
           /* ★ 先起新的、证明活着、再停旧的 —— 见 replace_cg()。
            *   失败则回滚：scratch[k] 不被采纳，下面拷贝时
            *   让 live 的原规格继续生效。 */
@@ -1725,6 +1910,15 @@ static int manifest_reload(void)
               scratch[k].restarts    = live->restarts;
               scratch[k].faults      = live->faults;
               scratch[k].failed      = live->failed;
+
+              /* ★ 证伪结论必须跟着走。
+               *   它是**运行期实测**出来的，不是 manifest 里的声明 ——
+               *   解析器刚 memset 出来的那一份里它是 0，不显式搬过来的话
+               *   每 2 秒一次的轮询就会把证伪结论"洗掉"，
+               *   下一次替换又按热替换办。而这条路径恰恰是
+               *   §三·补二十二 那个"回滚只写一半"的同一族。 */
+
+              scratch[k].protocol_falsified = live->protocol_falsified;
             }
         }
       else
@@ -1737,6 +1931,32 @@ static int manifest_reload(void)
           scratch[k].restarts    = live->restarts;
           scratch[k].faults      = live->faults;
           scratch[k].failed      = live->failed;
+          scratch[k].protocol_falsified = live->protocol_falsified;
+        }
+    }
+
+  /* ★ 最后再兜一次证伪结论 —— 这一次是**锁存**语义。
+   *
+   *   replace_cg() 自己也会造出新的证伪结论（stop_cg 里的 SIGKILL 兜底
+   *   写在 live 上，而 live 就是 g_cgs[k]）。下面那句 memcpy 用 scratch
+   *   整体覆盖 g_cgs，就会把它盖掉。
+   *
+   *   实测：stuck_cg 在变更 #1 里被判据①证伪，变更 #2 却**又走了热替换** ——
+   *   打印出来的那句"后续替换降级为冷替换"当场变成空头支票。
+   *   承诺了却没做，比不做更糟。
+   *
+   *   放在 memcpy 之前、循环之外：此时 g_cgs 里装的还是旧状态
+   *   （含本轮 replace 期间新产生的结论），scratch 里是要提交的新规格。 */
+
+  for (k = 0; k < n; k++)
+    {
+      for (j = 0; j < n_prev; j++)
+        {
+          if (strcmp(scratch[k].namebuf, g_cgs[j].name) == 0 &&
+              g_cgs[j].protocol_falsified)
+            {
+              scratch[k].protocol_falsified = 1;
+            }
         }
     }
 
@@ -1794,7 +2014,7 @@ static bool admit_ok(FAR const struct ort_cg_s *cg)
 static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
                     bool standby)
 {
-  FAR char *cargv[7];
+  FAR char *cargv[9];
   char vbuf[12];
   char dbuf[8];
   char lbuf[8];
@@ -1841,13 +2061,50 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
    *   （`ortsup container ...`），省掉一个只有几行的壳程序。
    */
 
-  cargv[0] = (FAR char *)"container";   /* 标记位，两条路的唯一锚点 */
-  cargv[1] = (FAR char *)mode;
-  cargv[2] = dbuf;
-  cargv[3] = lbuf;
-  cargv[4] = vbuf;
-  cargv[5] = standby ? (FAR char *)"standby" : NULL;
-  cargv[6] = NULL;
+  /* ── 测试装置：造一个"声明了 protocol 但没实现"的容器 ─────────────
+   *
+   * ★ 为什么必须有这么个开关：
+   *   原型里**所有容器都是 ortsup 自己**，而 ortsup 是真实现了
+   *   protocol v1 的。没有这个开关，"证伪"那条路**永远走不到** ——
+   *   而没被走到的那条路，看起来和走对了没有区别
+   *   （H31 / §三·补十四 的 grep / §三·补二十二 的回滚分支，同一族）。
+   *
+   *   正式实现不需要它：manifest 会指定镜像，第三方镜像天然就是
+   *   "声明了但没实现"的来源。这里只是给那个场景一个替身。
+   *
+   *   触发方式是段名前缀，因为**段名是 manifest 唯一能自由表达的东西**：
+   *     raw_*    给容器加 "nopub"    → 照常跑、照常响应 SIGTERM，但不发布状态
+   *     stuck_*  给容器加 "nosignal" → 忽略 SIGTERM，且不注入故障（跑到被杀）
+   *
+   *   两个缺陷分开造，是因为它们对应**两条独立的证伪判据** ——
+   *   合在一个容器上就分不清是哪条判据起的作用了（对照组的道理）。
+   */
+
+  {
+    int n = 0;
+
+    cargv[n++] = (FAR char *)"container";   /* 标记位，两条路的唯一锚点 */
+    cargv[n++] = (FAR char *)mode;
+    cargv[n++] = dbuf;
+    cargv[n++] = lbuf;
+    cargv[n++] = vbuf;
+
+    if (standby)
+      {
+        cargv[n++] = (FAR char *)"standby";
+      }
+
+    if (strncmp(cg->name, "raw_", 4) == 0)
+      {
+        cargv[n++] = (FAR char *)"nopub";
+      }
+    else if (strncmp(cg->name, "stuck_", 6) == 0)
+      {
+        cargv[n++] = (FAR char *)"nosignal";
+      }
+
+    cargv[n] = NULL;
+  }
 
   /* ★ 角色用 argv 传，不用信号。
    *
@@ -2274,6 +2531,11 @@ int main(int argc, FAR char *argv[])
           g_last_reload_ms = g_now_ms;
           manifest_reload();
         }
+
+      /* 反向验证 protocol 声明（见 audit_protocol）。放在故障排空之前：
+       * 它读的是"这个 CG 现在是什么状态"，与被处理的事件无关。 */
+
+      audit_protocol();
 
       /* 排空内核队列，逐条投递给状态机（每条独立，不共享"当前值"） */
 
