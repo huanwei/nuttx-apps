@@ -170,6 +170,24 @@ struct ort_cg_s
 
   int             version;
 
+  /* 本 CG 实现了 ORT 的哪一版**生命周期协议**（来自 manifest）。
+   *
+   *   0 = 什么都没实现（第三方二进制、或没配合改造过的容器）
+   *   1 = 实现了 v1：SIGTERM 有界退出 + 状态发布/跟踪/接管
+   *
+   * ★ 这是**容器维度**的能力，与 ort_caps() 那个**平台维度**的能力
+   *   是两件正交的事。准入要同时看两边：
+   *
+   *     平台兑现不了 handles_fault  → 做不了  → **拒绝准入**
+   *     容器没实现生命周期协议      → 做得差  → **降级替换方式并明示**
+   *
+   *   这两种后果不能混：前者是"这台机器给不了"，后者是"这个容器
+   *   给不了"。混在一起会让人以为 protocol=0 的容器不能部署 ——
+   *   它能部署，只是不能热替换。
+   */
+
+  int             protocol;
+
   /* 运行时状态 */
 
   pid_t           pid;
@@ -362,8 +380,9 @@ static bool mf_bool(FAR const char *v, FAR bool *out)
 #define SEEN_RESTARTS (1u << 2)
 #define SEEN_HANDLES  (1u << 3)
 #define SEEN_VERSION  (1u << 4)
+#define SEEN_PROTOCOL (1u << 5)
 #define SEEN_ALL      (SEEN_DOMAIN | SEEN_CRITICAL | SEEN_RESTARTS | \
-                       SEEN_HANDLES | SEEN_VERSION)
+                       SEEN_HANDLES | SEEN_VERSION | SEEN_PROTOCOL)
 
 /* 两份规格是否**等价**（只看声明，不看运行时状态）。
  *
@@ -377,7 +396,8 @@ static bool cg_spec_equal(FAR const struct ort_cg_s *a,
          a->critical      == b->critical &&
          a->max_restarts  == b->max_restarts &&
          a->handles_fault == b->handles_fault &&
-         a->version       == b->version;   /* ★ 版本变了 = 要换实例 */
+         a->version       == b->version &&   /* ★ 版本变了 = 要换实例 */
+         a->protocol      == b->protocol;    /* ★ 协议变了 = 换法也变了 */
 }
 
 /****************************************************************************
@@ -612,6 +632,22 @@ static int manifest_load(FAR const char *path,
             }
 
           seen[n - 1] |= SEEN_HANDLES;
+        }
+      else if (strcmp(key, "protocol") == 0)
+        {
+          if (!mf_int(val, &cg->protocol) || cg->protocol > 1000)
+            {
+              mf_err(lineno, "protocol 必须是十进制非负整数");
+              goto fail;
+            }
+
+          if (seen[n - 1] & SEEN_PROTOCOL)
+            {
+              mf_err(lineno, "protocol 重复");
+              goto fail;
+            }
+
+          seen[n - 1] |= SEEN_PROTOCOL;
         }
       else if (strcmp(key, "revision") == 0)
         {
@@ -1287,6 +1323,32 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
   bool healthy = true;
 
   spec->pid = -1;
+
+  /* ── 没声明生命周期协议 → 只能冷替换 ──────────────────────────────
+   *
+   * ★ 这里**必须明说**，不能悄悄按同一套流程走。装作能热替换的话：
+   *   容器不理会 SIGTERM（默认动作把它杀掉，没有收尾），
+   *   接替者读到的是过期快照 —— 而日志上看起来一切正常。
+   *   那正是 H31/H32 那类错误。
+   */
+
+  if (spec->protocol == 0)
+    {
+      printf("[ortsup]   该 CG 声明 protocol=0（未实现生命周期协议）"
+             " → **冷替换**：先停后起，中间有一段服务空档\n");
+
+      stop_cg(live);
+      spec->pid = -1;
+
+      if (start_cg(spec, "fault", spec->critical ? 8 : 3, false) != 0)
+        {
+          printf("[ortsup]   ✗ 冷替换也起不来 —— 该 CG 现在无人服务\n");
+          spec->failed = true;
+          return true;   /* 变更已采纳，只是这个 CG 没起来 */
+        }
+
+      return true;
+    }
 
   if (start_cg(spec, "fault", spec->critical ? 8 : 3, true) != 0)
     {
