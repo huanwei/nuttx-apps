@@ -2630,6 +2630,41 @@ int main(int argc, FAR char *argv[])
       }
   }
 
+  /* ── 注入循环（⚠️ 仅原型测试）────────────────────────────────────────
+   *
+   * ★ 必须排在**注册监督者之前**：这个进程**不注册**监督者 ——
+   *   它的存在意义就是当"另一个上下文"，与真正在排空的监督者
+   *   并发地压同一个故障队列（见 ort_fault_inject 的权限说明）。
+   *
+   *   放在这里还有一个原因：它不该被后面的注册失败挡住。
+   */
+
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "injectloop") == 0)
+    {
+      int per = (argc > 2 && argv[2] != NULL) ? atoi(argv[2]) : 1;
+      unsigned long total = 0;
+
+      printf("[ortsup] === 注入循环（另一个上下文，不注册监督者）===\n");
+      printf("[ortsup] 每轮注入 %d 条\n", per);
+      fflush(stdout);
+
+      for (;;)
+        {
+          int n = (int)prctl(PR_ORT_TEST_FAULT, per);
+
+          if (n > 0)
+            {
+              total += (unsigned long)n;
+            }
+
+          if ((total % 100000ul) < (unsigned long)per)
+            {
+              printf("[ortsup] 注入累计 %lu 条\n", total);
+              fflush(stdout);
+            }
+        }
+    }
+
   bool boot_mode;
   bool admit_mode;
   bool settled;
