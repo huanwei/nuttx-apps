@@ -2707,6 +2707,35 @@ int main(int argc, FAR char *argv[])
       return 1;
     }
 
+  /* ── 故障队列压力（⚠️ 仅原型测试）──────────────────────────────────
+   *
+   * 绕过容器重启、直接注入 N 条事件。**顺序很要紧**：必须在注册监督者
+   * 之后 —— 注入接口只对监督者开放。
+   *
+   * 为什么需要它：见 <sys/prctl.h> 里 PR_ORT_TEST_FAULT 的说明 ——
+   * 缺的是**速率**，不是"把环改小"。消费者比生产者快 300 倍时，
+   * 竞争碰不到，而碰不到和不存在看起来一样。
+   */
+
+  if (argc > 1 && strcmp(argv[1], "inject") == 0)
+    {
+      int count = (argc > 2 && argv[2] != NULL) ? atoi(argv[2]) : 100;
+      int injected;
+
+      printf("[ortsup] === 故障队列压力：注入 %d 条（绕过容器重启）===\n",
+             count);
+
+      injected = (int)prctl(PR_ORT_TEST_FAULT, count);
+      printf("[ortsup] 注入返回 %d\n", injected);
+
+      drain_faults();
+
+      printf("[ortsup] 审计: 读到 %d 条 / 缺口 %d / 异常 %d / 末条 lost=%d\n",
+             g_ev_count, g_audit_gap, g_audit_bad, g_ev_lost);
+      fflush(stdout);
+      return 0;
+    }
+
   /* ── 从部署/O&M 代理取配置 ───────────────────────────────────────────
    *
    * ★★ 监督者**不再读文件**。配置由代理读进来放进内核配置槽，
