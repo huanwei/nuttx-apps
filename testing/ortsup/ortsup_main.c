@@ -1381,6 +1381,7 @@ static int ort_container_main(int argc, FAR char *argv[])
   int nosignal = 0;              /* 测试装置：忽略 SIGTERM */
   int hammer = 0;                /* 测试装置：紧循环读写快照（撞撕裂窗口） */
   int burst = 0;                 /* 测试装置：不等延迟立即故障（撞事件队列） */
+  int badptr = 0;                /* 测试装置：用非法用户指针调 ORT 接口 */
   int delay = 0;
   int domain = 0;
   int version = 0;
@@ -1425,6 +1426,10 @@ static int ort_container_main(int argc, FAR char *argv[])
           /* 新手期：只跟踪，不发布（见 step_state 的说明） */
 
           standby = 1;
+        }
+      else if (strcmp(argv[i], "badptr") == 0)
+        {
+          badptr = 1;
         }
       else if (strcmp(argv[i], "nopub") == 0)
         {
@@ -1515,6 +1520,42 @@ static int ort_container_main(int argc, FAR char *argv[])
         usleep(1000);
       }
   }
+
+  /* ── 测试装置：用**非法用户指针**调 ORT 接口 ───────────────────────
+   *
+   * ★ 验的是各接口里那笔"⚠️ 未校验用户指针"的债。
+   *
+   *   内核在 BUILD_KERNEL 下是**带着调用者的地址空间**去写这个指针的，
+   *   所以一个未映射的地址会让**内核自己**取数据异常 ——
+   *   那不是"容器崩了"，是**整机**崩了。
+   *
+   *   判据很清楚：内核活着回来 → 校验生效（或者这条路根本不需要校验）；
+   *   内核没了 → 债是真的，而且**任何容器**都能触发。
+   *
+   *   放在准入之后：要先用域才走得到那一步。
+   *
+   * ★★ 第一版这里用的是 PR_ORT_STATE_GET，**没验到东西，还打印了
+   *    一句假的结论**（"这条路上有校验"）。因为 GET 在槽为空时
+   *    **提前 return -ENOENT**，压根没走到 memcpy —— 而这个 CG
+   *    protocol=0，槽本来就是空的。
+   *    换成 PUT：它无条件 `memcpy(槽, buf, len)`，**读**用户指针，
+   *    一步就到达被测的那行。又一次"先证明被测的路真的被走到了"。
+   */
+
+  if (badptr)
+    {
+      uintptr_t bad = 0xdeadbe00u;
+
+      printf("[ortsup] 容器 %d: 用未映射指针 %p 调 PR_ORT_STATE_PUT…\n",
+             domain, (void *)bad);
+      fflush(stdout);
+
+      (void)prctl(PR_ORT_STATE_PUT, bad, 64);
+
+      printf("[ortsup] 容器 %d: *** 内核活着回来了 *** —— 这条路上有校验\n",
+             domain);
+      fflush(stdout);
+    }
 
 #if defined(CONFIG_BUILD_KERNEL)
 
@@ -2502,6 +2543,10 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
     else if (strncmp(cg->name, "burst_", 6) == 0)
       {
         cargv[n++] = (FAR char *)"burst";
+      }
+    else if (strncmp(cg->name, "badptr_", 7) == 0)
+      {
+        cargv[n++] = (FAR char *)"badptr";
       }
 
     cargv[n] = NULL;
