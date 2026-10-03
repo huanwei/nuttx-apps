@@ -97,7 +97,9 @@
  * 对应《设计》§6 的 safetyPolicy.startup.startTimeoutMs。
  */
 
-#define STARTUP_WINDOW_MS  1500
+#define STARTUP_WINDOW_MS  1500     /* manifest 里的 startup_timeout_ms 覆盖它 */
+
+static int g_startup_window_ms = STARTUP_WINDOW_MS;
 
 /* 监督循环周期（也是下面 g_now_ms 的步长） */
 
@@ -159,14 +161,21 @@ struct ort_cg_s
   int             admitted_ms;   /* 被准入的时刻（-1 = 尚未准入） */
 };
 
-static struct ort_cg_s g_cgs[] =
-{
-  /* 非关键 CG：失效只降级，允许有限次重启 */
-  { "app_cg",    1, false, 2, false, -1, 0, 0, false, -1 },
+/* CG 表**由 manifest 填**，不再写死在源码里。
+ *
+ * 为什么这是"编排框架"和"演示程序"的分界线：
+ *   写死在源码里意味着"改部署要重新编译固件" —— 那不是编排，
+ *   那是把配置烧进二进制。而 ORT 的卖点恰恰是同一份固件能承载
+ *   不同的容器组合。
+ *
+ * 上限用静态数组而不是动态分配：配置解析发生在**启动路径**上，
+ * 而《设计》要求启动路径不得依赖动态分配能否成功。
+ */
 
-  /* 关键 CG：失效即进安全态，不重启（SAFE_STATIC 推荐 NEVER） */
-  { "safety_cg", 2, true,  0, false, -1, 0, 0, false, -1 },
-};
+#define MAX_CGS  8
+
+static struct ort_cg_s g_cgs[MAX_CGS];
+static int g_ncgs;
 
 /* 平台能力位。读一次就够 —— 它是平台属性，不会变。
  * 必须在 main 里 prctl 查询后填好（用户态拿不到 ort_caps() 本身）。
@@ -180,7 +189,449 @@ static unsigned int g_caps;
 
 static int g_now_ms;
 
-#define NCGS (sizeof(g_cgs) / sizeof(struct ort_cg_s))
+#define NCGS (g_ncgs)
+
+/****************************************************************************
+ * Manifest：配置的加载与校验
+ *
+ * 格式（行式，无嵌套，无引号，无转义 —— 刻意如此）：
+ *
+ *     version = 1
+ *     startup_timeout_ms = 1500
+ *
+ *     [app_cg]
+ *     domain = 1
+ *     critical = false
+ *     max_restarts = 2
+ *     handles_fault = false
+ *
+ * ★ 为什么不用 YAML/JSON：
+ *   启动路径上跑的解析器必须满足三条 —— 不动态分配、执行时间有界、
+ *   行为可穷举。YAML 三条都不满足（隐式类型转换、锚点、可嵌套到任意深度）。
+ *   INI 风格的子集足够表达 CG 表，而且**能被人在五分钟内完整理解** ——
+ *   这在功能安全语境下不是简陋，是要求。
+ *
+ * ★ 校验原则：**fail-closed，不是 fail-open**
+ *
+ *   任何一条不认识的键、格式不对的行、缺字段、重复名 ——
+ *   一律**拒绝整份 manifest**，并指出行号。
+ *
+ *   为什么不"忽略不认识的东西继续跑"：
+ *     那正是配置错误的经典传播方式。运维以为改了一个参数，
+ *     实际那行被静默丢掉了，系统按**另一套**配置运行 ——
+ *     而且没有任何地方会报错。
+ *     对安全系统来说，"拒绝启动"永远优于"按我以为的配置启动"。
+ ****************************************************************************/
+
+#define MANIFEST_PATH      "/system/etc/ort.cfg"
+#define MANIFEST_MAXLINE   256   /* 注释里有 UTF-8 中文，一字符 3 字节，别卡太紧 */
+
+static char g_mf_buf[160];
+static FAR const char *g_mf_err;   /* 校验失败说明（指向 g_mf_buf，不分配） */
+
+/* 记录失败原因。lineno == 0 表示"整份配置"层面的问题（不是某一行的错），
+ * 那种情况不该硬安一个行号上去。 */
+
+static void mf_err(int lineno, FAR const char *msg)
+{
+  if (lineno > 0)
+    {
+      snprintf(g_mf_buf, sizeof(g_mf_buf), "第 %d 行: %s", lineno, msg);
+    }
+  else
+    {
+      snprintf(g_mf_buf, sizeof(g_mf_buf), "manifest: %s", msg);
+    }
+
+  g_mf_err = g_mf_buf;
+}
+
+/* 去掉首尾空白，原地修改。
+ *
+ * ★ 行尾的 \r\n 也必须去掉 —— 它们也是空白，但上一版漏了，
+ *   后果很隐蔽：空行变成"\n"（非空，于是掉进"不是 key = value"分支），
+ *   而 "version = 1\n" 的值会带上换行符。实测第一版把一份**合法**
+ *   manifest 拒在了第 5 行（就是那个空行）。
+ *   把 \r \n 归进空白集，两处一起解决。
+ */
+
+static FAR char *mf_trim(FAR char *s)
+{
+  FAR char *end;
+
+  while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+    {
+      s++;
+    }
+
+  end = s + strlen(s);
+  while (end > s && (end[-1] == ' ' || end[-1] == '\t' ||
+                     end[-1] == '\r' || end[-1] == '\n'))
+    {
+      end--;
+    }
+
+  *end = '\0';
+  return s;
+}
+
+/* 严格整数：整串都必须是数字。
+ *
+ * 为什么不用 atoi()：atoi("abc") == 0，atoi("1x") == 1 ——
+ * 把拼写错误静默变成一个合法值，正是我们要拒绝的那类错误。 */
+
+static bool mf_int(FAR const char *v, FAR int *out)
+{
+  int acc = 0;
+
+  if (*v == '\0')
+    {
+      return false;
+    }
+
+  for (; *v != '\0'; v++)
+    {
+      if (*v < '0' || *v > '9')
+        {
+          return false;
+        }
+
+      acc = acc * 10 + (*v - '0');
+      if (acc > 1000000)
+        {
+          return false;    /* 荒谬值直接拒，不溢出 */
+        }
+    }
+
+  *out = acc;
+  return true;
+}
+
+/* 严格布尔：只认 true / false。不认 1/0/yes/on/TRUE ——
+ * 多一种写法就多一种歧义，而歧义在安全配置里是纯负债。 */
+
+static bool mf_bool(FAR const char *v, FAR bool *out)
+{
+  if (strcmp(v, "true") == 0)
+    {
+      *out = true;
+      return true;
+    }
+
+  if (strcmp(v, "false") == 0)
+    {
+      *out = false;
+      return true;
+    }
+
+  return false;
+}
+
+/* CG 名要存下来 —— 解析缓冲区每行复用，不能留指针进去 */
+
+static char g_cg_names[MAX_CGS][16];
+static unsigned int g_cg_seen[MAX_CGS];
+
+#define SEEN_DOMAIN   (1u << 0)
+#define SEEN_CRITICAL (1u << 1)
+#define SEEN_RESTARTS (1u << 2)
+#define SEEN_HANDLES  (1u << 3)
+#define SEEN_ALL      (SEEN_DOMAIN | SEEN_CRITICAL | SEEN_RESTARTS | SEEN_HANDLES)
+
+/****************************************************************************
+ * Name: manifest_load
+ *
+ * Description:
+ *   解析并**校验** manifest。任何可疑之处一律拒绝整份配置。
+ *
+ * Returned Value:
+ *   OK 成功；负 errno 失败，失败原因在 g_mf_err 里（含行号）。
+ *
+ ****************************************************************************/
+
+static int manifest_load(FAR const char *path)
+{
+  FAR struct ort_cg_s *cg = NULL;
+  char line[MANIFEST_MAXLINE];
+  FILE *fp;
+  int lineno = 0;
+  bool have_version = false;
+  int k;
+
+  g_ncgs = 0;
+  g_mf_err = NULL;
+
+  fp = fopen(path, "r");
+  if (fp == NULL)
+    {
+      mf_err(lineno, "打不开 manifest 文件");
+      return -ENOENT;
+    }
+
+  while (fgets(line, sizeof(line), fp) != NULL)
+    {
+      FAR char *p;
+      FAR char *eq;
+      FAR char *key;
+      FAR char *val;
+
+      lineno++;
+
+      /* 行太长会被截断成两行，第二行多半语法不合法 —— 但**可能**恰好合法，
+       * 那就成了静默错配。所以宁可在这里就拒。 */
+
+      if (strchr(line, '\n') == NULL && !feof(fp))
+        {
+          mf_err(lineno, "行超长（疑似被截断）");
+          goto fail;
+        }
+
+      p = mf_trim(line);
+      if (*p == '\0' || *p == '#')
+        {
+          continue;
+        }
+
+      /* ── 段头 [name] ─────────────────────────────────────────────── */
+
+      if (*p == '[')
+        {
+          FAR char *end = strchr(p, ']');
+          FAR char *name;
+
+          if (end == NULL || *mf_trim(end + 1) != '\0')
+            {
+              mf_err(lineno, "段头格式不对（应为 [name] 且其后无其它内容）");
+              goto fail;
+            }
+
+          *end = '\0';
+          name = mf_trim(p + 1);
+
+          if (*name == '\0')
+            {
+              mf_err(lineno, "段名为空");
+              goto fail;
+            }
+
+          if (strlen(name) >= sizeof(g_cg_names[0]))
+            {
+              mf_err(lineno, "段名过长");
+              goto fail;
+            }
+
+          if (g_ncgs >= MAX_CGS)
+            {
+              mf_err(lineno, "CG 数量超过 MAX_CGS");
+              goto fail;
+            }
+
+          for (k = 0; k < g_ncgs; k++)
+            {
+              if (strcmp(g_cg_names[k], name) == 0)
+                {
+                  mf_err(lineno, "CG 重名（同一容器组只能出现一次）");
+                  goto fail;
+                }
+            }
+
+          strcpy(g_cg_names[g_ncgs], name);
+
+          cg = &g_cgs[g_ncgs];
+          memset(cg, 0, sizeof(*cg));
+          cg->name        = g_cg_names[g_ncgs];
+          cg->domain      = -1;      /* -1 = 未声明，后面校验会拦 */
+          cg->pid         = -1;
+          cg->admitted_ms = -1;
+
+          g_cg_seen[g_ncgs] = 0;
+          g_ncgs++;
+          continue;
+        }
+
+      /* ── key = value ─────────────────────────────────────────────── */
+
+      eq = strchr(p, '=');
+      if (eq == NULL)
+        {
+          mf_err(lineno, "不是 key = value，也不是段头");
+          goto fail;
+        }
+
+      *eq  = '\0';
+      key  = mf_trim(p);
+      val  = mf_trim(eq + 1);
+
+      if (*key == '\0')
+        {
+          mf_err(lineno, "键名为空");
+          goto fail;
+        }
+
+      if (cg == NULL)
+        {
+          /* 全局段 */
+
+          if (strcmp(key, "version") == 0)
+            {
+              int v;
+
+              if (!mf_int(val, &v) || v != 1)
+                {
+                  mf_err(lineno, "version 只支持 1");
+                  goto fail;
+                }
+
+              have_version = true;
+            }
+          else if (strcmp(key, "startup_timeout_ms") == 0)
+            {
+              if (!mf_int(val, &g_startup_window_ms))
+                {
+                  mf_err(lineno, "startup_timeout_ms 必须是十进制非负整数");
+                  goto fail;
+                }
+            }
+          else
+            {
+              mf_err(lineno, "全局段不认识的键");
+              goto fail;
+            }
+
+          continue;
+        }
+
+      /* CG 段 */
+
+      if (strcmp(key, "domain") == 0)
+        {
+          if (!mf_int(val, &cg->domain) || cg->domain > 254)
+            {
+              mf_err(lineno, "domain 必须是 0..254 的整数");
+              goto fail;
+            }
+
+          if (g_cg_seen[g_ncgs - 1] & SEEN_DOMAIN)
+            {
+              mf_err(lineno, "domain 重复");
+              goto fail;
+            }
+
+          g_cg_seen[g_ncgs - 1] |= SEEN_DOMAIN;
+        }
+      else if (strcmp(key, "critical") == 0)
+        {
+          if (!mf_bool(val, &cg->critical))
+            {
+              mf_err(lineno, "critical 只接受 true / false");
+              goto fail;
+            }
+
+          if (g_cg_seen[g_ncgs - 1] & SEEN_CRITICAL)
+            {
+              mf_err(lineno, "critical 重复");
+              goto fail;
+            }
+
+          g_cg_seen[g_ncgs - 1] |= SEEN_CRITICAL;
+        }
+      else if (strcmp(key, "max_restarts") == 0)
+        {
+          if (!mf_int(val, &cg->max_restarts) || cg->max_restarts > 1000)
+            {
+              mf_err(lineno, "max_restarts 必须是 0..1000 的整数");
+              goto fail;
+            }
+
+          if (g_cg_seen[g_ncgs - 1] & SEEN_RESTARTS)
+            {
+              mf_err(lineno, "max_restarts 重复");
+              goto fail;
+            }
+
+          g_cg_seen[g_ncgs - 1] |= SEEN_RESTARTS;
+        }
+      else if (strcmp(key, "handles_fault") == 0)
+        {
+          if (!mf_bool(val, &cg->handles_fault))
+            {
+              mf_err(lineno, "handles_fault 只接受 true / false");
+              goto fail;
+            }
+
+          if (g_cg_seen[g_ncgs - 1] & SEEN_HANDLES)
+            {
+              mf_err(lineno, "handles_fault 重复");
+              goto fail;
+            }
+
+          g_cg_seen[g_ncgs - 1] |= SEEN_HANDLES;
+        }
+      else
+        {
+          /* ★ 不认识的键是**错误**，不是"忽略"。
+           *   忽略它，运维就永远不知道那行没生效。 */
+
+          mf_err(lineno, "CG 段不认识的键");
+          goto fail;
+        }
+    }
+
+  fclose(fp);
+  fp = NULL;
+
+  /* ── 整体校验 ──────────────────────────────────────────────────────── */
+
+  if (!have_version)
+    {
+      mf_err(0, "缺少 version（无法确认格式版本，拒绝按猜的解析）");
+      goto fail;
+    }
+
+  if (g_ncgs < 1)
+    {
+      mf_err(0, "至少要有一个 CG（空配置等于没有可编排的对象）");
+      goto fail;
+    }
+
+  for (k = 0; k < g_ncgs; k++)
+    {
+      if (g_cg_seen[k] != SEEN_ALL)
+        {
+          mf_err(0, "CG 段字段不全（domain/critical/max_restarts/"
+                    "handles_fault 四项都必须显式给出）");
+          goto fail;
+        }
+
+      /* 域号必须互不相同 —— 两个容器组共用一个域，
+       * 等于它们的内存不隔离。这是配置错误，不是运行时才发现的。 */
+
+      {
+        int j;
+
+        for (j = 0; j < k; j++)
+          {
+            if (g_cgs[j].domain == g_cgs[k].domain)
+              {
+                mf_err(0, "两个 CG 用了同一个 domain（等于它们不隔离）");
+                goto fail;
+              }
+          }
+      }
+    }
+
+  return OK;
+
+fail:
+  if (fp != NULL)
+    {
+      fclose(fp);
+    }
+
+  g_ncgs = 0;
+  return -EINVAL;
+}
+
 
 /****************************************************************************
  * 系统状态与单调迁移
@@ -592,7 +1043,7 @@ static bool in_startup(FAR struct ort_cg_s *cg)
 {
   return g_state == ORT_BOOT &&
          cg->admitted_ms >= 0 &&
-         (g_now_ms - cg->admitted_ms) < STARTUP_WINDOW_MS;
+         (g_now_ms - cg->admitted_ms) < g_startup_window_ms;
 }
 
 /* 是否全部 CG 都已通过启动窗口（= 系统可以进 NOMINAL 了） */
@@ -626,7 +1077,7 @@ static void on_cg_failed(FAR struct ort_cg_s *cg)
     {
       printf("[ortsup] %s 在启动窗口内失效（准入后 %d ms < %d ms）"
              "→ 按 startup 策略\n",
-             cg->name, g_now_ms - cg->admitted_ms, STARTUP_WINDOW_MS);
+             cg->name, g_now_ms - cg->admitted_ms, g_startup_window_ms);
 
       /* 原型的 startup 策略取 SAFE_STATE：按 §6，
        * startup.onContainerGroupFail 是**全系统一套**策略（不像运行期
@@ -726,9 +1177,52 @@ int main(int argc, FAR char *argv[])
   admit_mode = (argc > 1 && strcmp(argv[1], "admit") == 0);
 
   printf("[ortsup] === ORT 监督者原型（降级状态机）===\n");
-  printf("[ortsup] 场景: %s（启动窗口 %d ms）\n",
-         boot_mode ? "boot —— 启动期失效" : "runtime —— 运行期失效",
-         STARTUP_WINDOW_MS);
+
+  /* ── 加载 manifest ───────────────────────────────────────────────────
+   *
+   * ★ fail-closed：manifest 有任何问题就**拒绝启动**。
+   *
+   *   不"用默认值兜底继续跑" —— 那等于用一套运维没写过的配置运行系统，
+   *   而且没人知道。安全系统里，"拒绝启动 + 说清哪里错" 永远优于
+   *   "按我以为的配置启动"。
+   *
+   *   注意这里连 ENOMEM 之类的错误一视同仁：解析器不做动态分配，
+   *   所以失败只可能是配置本身的问题。
+   */
+
+  {
+    int ret = manifest_load(MANIFEST_PATH);
+
+    if (ret != OK)
+      {
+        printf("[ortsup] *** 拒绝启动: manifest 校验失败 ***\n");
+        printf("[ortsup] %s: %s\n", MANIFEST_PATH,
+               g_mf_err ? g_mf_err : "未知原因");
+        printf("[ortsup] 系统状态: BOOT_FAILED（锁存）\n");
+        fflush(stdout);
+        return 2;
+      }
+  }
+
+  printf("[ortsup] manifest: %s（%d 个 CG，启动窗口 %d ms）\n",
+         MANIFEST_PATH, (int)NCGS, g_startup_window_ms);
+
+  {
+    int k;
+
+    for (k = 0; k < (int)NCGS; k++)
+      {
+        printf("[ortsup]   CG %-10s domain=%d %s maxRestarts=%d "
+               "handles_fault=%s\n",
+               g_cgs[k].name, g_cgs[k].domain,
+               g_cgs[k].critical ? "关键" : "非关键",
+               g_cgs[k].max_restarts,
+               g_cgs[k].handles_fault ? "true" : "false");
+      }
+  }
+
+  printf("[ortsup] 场景: %s\n",
+         boot_mode ? "boot —— 启动期失效" : "runtime —— 运行期失效");
   printf("[ortsup] 系统状态: BOOT\n");
 
   /* ── 平台能力位 ──────────────────────────────────────────────────────
