@@ -271,6 +271,34 @@ static int      g_audit_bad;     /* 累计异常（倒退/重复） */
 static int      g_audit_acct;    /* 累计记账错（Δlost ≠ 缺口）—— R4 的判据 */
 static uint32_t g_drained;       /* 排出的事件总数（只用于给打印限流） */
 
+/* ── 记录**内部一致性**审计（R2/R5 的判据）───────────────────────────
+ *
+ * ★ 在此之前，R2/R5（消费者抄到**写了一半**的记录）从来没有被测过。
+ *
+ *   之前那句"R2/R3/R5 并发实测 0 异常"数的是**序号异常** ——
+ *   而撕裂记录的特征是"序号看着完全正常，字段却是两条记录的混合"。
+ *   序号判据**看不见**它。所以那句话对 R2/R5 没有任何信息量。
+ *
+ * ★ 判据的妙处：注入载荷**自带校验**。
+ *   `ort_fault_inject` 写的是
+ *       pc = 0xdead0000 + i,  addr = 0xbeef0000 + i,  faults = i + 1
+ *   —— 三个字段被同一个 i 绑死。所以消费者拿到任何一条记录，
+ *   都能**单方面**验证它是不是自洽的：
+ *       i = faults - 1
+ *       pc  必须 == 0xdead0000 + i
+ *       addr 必须 == 0xbeef0000 + i
+ *   对不上 = 这条记录是**两条写叠加**的产物。
+ *
+ *   这不需要任何额外接口 —— 校验和是载荷自己长出来的。
+ *
+ * ★ 与序号无关：撕裂时序号往往是"合法"的那一个（很可能正是新值），
+ *   所以它必须**单独计数**，不能被归进"事件序异常"。 */
+
+#define INJECT_PC_BASE    0xdead0000u
+#define INJECT_ADDR_BASE  0xbeef0000u
+
+static int g_audit_torn;         /* 累计抄到不自洽的记录数（R2/R5） */
+
 /* 一次 drain_faults() 最多排空多少条。
  *
  * ★ 必须有界。原版是 `while (prctl(...) > 0)` —— 它的终止条件是
@@ -991,6 +1019,27 @@ static void drain_faults(void)
        * ★ 第一条只做基准、不判：监督者可能**中途**才接上（首条 seq
        *   已经是几千、lost 也已经是几千），拿它跟初始的 0 比会造出
        *   一个假异常。必须先对齐再开始判 —— 否则判据本身是错的。 */
+
+      /* ── 记录内部一致性（R2/R5 的唯一判据）──────────────────────
+       *
+       * 只对**注入**产生的记录做（victim == 0）—— 真实容器故障的
+       * pc/addr 没有这种可预测关系。 */
+
+      if (rec.victim == 0)
+        {
+          uint32_t i = rec.faults - 1u;
+
+          if (rec.faults == 0 ||
+              (uint32_t)rec.pc   != INJECT_PC_BASE   + i ||
+              (uint32_t)rec.addr != INJECT_ADDR_BASE + i)
+            {
+              g_audit_torn++;
+              printf("[ortsup] *** 撕裂记录: seq=%u pc=%p addr=%p faults=%u"
+                     " —— 三个字段不是同一个 i ***\n",
+                     (unsigned)rec.seq, (void *)rec.pc, (void *)rec.addr,
+                     (unsigned)rec.faults);
+            }
+        }
 
       if (!g_audit_primed)
         {
@@ -2957,9 +3006,10 @@ int main(int argc, FAR char *argv[])
           drain_faults();
 
           printf("[ortsup] 审计: 读到 %u 条 / 缺口 %d / 异常 %d / 记账错 %d / "
-                 "末序 %u / 末条 lost=%u\n",
+                 "撕裂 %d / 末序 %u / 末条 lost=%u\n",
                  (unsigned)g_drained, g_audit_gap, g_audit_bad, g_audit_acct,
-                 (unsigned)g_audit_last, (unsigned)g_audit_lost);
+                 g_audit_torn, (unsigned)g_audit_last,
+                 (unsigned)g_audit_lost);
           fflush(stdout);
         }
 
@@ -3357,9 +3407,10 @@ int main(int argc, FAR char *argv[])
              g_cgs[i].faults, g_cgs[i].restarts);
     }
 
-  printf(" | events=%d lost=%d | 审计: 缺口=%d 异常=%d 记账错=%d 末序=%u\n",
+  printf(" | events=%d lost=%d | 审计: 缺口=%d 异常=%d 记账错=%d 撕裂=%d "
+         "末序=%u\n",
          g_ev_count, g_ev_lost, g_audit_gap, g_audit_bad, g_audit_acct,
-         (unsigned)g_audit_last);
+         g_audit_torn, (unsigned)g_audit_last);
 
   /* 最终态的断言：本原型跑完必须落在有效终态上 */
 
