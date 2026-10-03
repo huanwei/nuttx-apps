@@ -317,7 +317,28 @@ static char g_cfg_buf[CFG_FETCH_MAX];
 
 static int cfg_fetch(FAR char *buf, size_t cap)
 {
-  return (int)prctl(PR_ORT_CFG_GET, buf, (int)cap);
+  int n;
+  int i;
+
+  /* ★ -EAGAIN 与 -ENOENT 必须分开对待（内核侧 seqlock 的三种结果）：
+   *     -ENOENT = 代理从来没送来过 → 调用者该走"没有配置"那条路
+   *     -EAGAIN = 有配置，但这一轮没读到一致快照 → **重试**，
+   *               绝不能当成"没有" —— 那会把一次读失败
+   *               说成"配置不存在"，又是一个 H31。
+   *
+   * 归一化 errno：两个 SKU 的 prctl 返回形式不同（见容器里的说明）。 */
+
+  for (i = 0; i < 8; i++)
+    {
+      n = (int)prctl(PR_ORT_CFG_GET, buf, (int)cap);
+
+      if ((n == -1 ? errno : -n) != EAGAIN)
+        {
+          break;
+        }
+    }
+
+  return n;
 }
 
 /* ★ 解析阶段的 startup_timeout_ms 落在这里，**不直接写 g_startup_window_ms**。
@@ -1427,7 +1448,17 @@ static int ort_container_main(int argc, FAR char *argv[])
      *   而"逐字相同"正是我们用来证明"两边跑的是同一个状态机"的判据
      *   （§三·补十九）。诊断输出上的差异同样会掩盖真实差异。 */
 
-    if (n != (int)sizeof(prev))
+    if (e == EAGAIN)
+      {
+        /* ★ 读失败 ≠ 没有旧状态。
+         *   内核在撞上并发写时会返回 EAGAIN（seqlock 重试用尽），
+         *   把它当成"冷启动"就是把"没读到"说成了"没有" ——
+         *   而这两种情况的正确处置完全不同。 */
+
+        printf("[ortsup] 容器(domain %d): 旧状态**读不一致**（并发写中，"
+               "errno=%d）→ **不交接**，冷启动\n", domain, e);
+      }
+    else if (n != (int)sizeof(prev))
       {
         printf("[ortsup] 容器(domain %d): 无旧状态可接续 (errno=%d)，从 0 开始\n",
                domain, e);
@@ -1476,6 +1507,7 @@ static int ort_container_main(int argc, FAR char *argv[])
       static uint32_t snap[16];
       uint32_t seq = 0;
       unsigned long reads = 0;
+      unsigned long busy = 0;
       int torn = 0;
       int k;
 
@@ -1488,12 +1520,35 @@ static int ort_container_main(int argc, FAR char *argv[])
         {
           if (standby)
             {
-              if (prctl(PR_ORT_STATE_GET, snap, sizeof(snap))
-                  == (int)sizeof(snap))
+              int rn = (int)prctl(PR_ORT_STATE_GET, snap, sizeof(snap));
+
+              if (rn != (int)sizeof(snap))
+                {
+                  /* -EAGAIN = 撞上并发写、重试用尽。**必须单独计数**：
+                   * 否则"撕裂 0 次"可能只是"根本没读成功几次" ——
+                   * 那是另一个假通过。 */
+
+                  busy++;
+
+                  if ((busy % 200000ul) == 0)
+                    {
+                      printf("[ortsup] 压力读端: 读成功 %lu 次 / 遇忙 %lu 次\n",
+                             reads, busy);
+                      fflush(stdout);
+                    }
+                }
+              else
                 {
                   uint32_t v = snap[0];
 
                   reads++;
+
+                  if ((reads % 200000ul) == 0)
+                    {
+                      printf("[ortsup] 压力读端: 读成功 %lu 次 / 遇忙 %lu 次"
+                             " / 撕裂 %d 次\n", reads, busy, torn);
+                      fflush(stdout);
+                    }
 
                   for (k = 1; k < 16; k++)
                     {
