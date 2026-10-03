@@ -46,6 +46,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
+#include <sched.h>
 #include <errno.h>
 #include <sys/prctl.h>
 
@@ -65,6 +66,25 @@
 #ifndef CONFIG_TESTING_ORTD_PATH
 #  define CONFIG_TESTING_ORTD_PATH "/system/etc/ort.cfg"
 #endif
+
+/* 本组件要求的调度优先级。
+ *
+ * ★ 为什么在这里写一份，而不是只靠 Kconfig：
+ *   `CONFIG_TESTING_ORTD_PRIORITY`（以及 ortsup 的同名项）在
+ *   ORT-A（KERNEL，应用是文件系统上的独立 ELF）上**根本到不了源码** ——
+ *   两处都不生效：
+ *     1) 启动路径不经内置表 → 拉起时用的是默认优先级；
+ *     2) 导出给 apps 的 config.h 也不带应用自己的 Kconfig 符号
+ *        （实测：`grep TESTING_ORT import/include/nuttx/config.h` 为空）。
+ *   只有 ORT-M（PROTECTED，应用编进 nuttx_user.elf）上它才生效。
+ *
+ *   而"代理必须比监督者低优先级"是**架构不变量**，不是可调项 ——
+ *   让它在两个 SKU 上一个生效一个不生效，比写死更危险。
+ *   所以由组件自己申报（见下面的 sched_setparam），值写在这里。
+ *
+ * ⚠️ 改了这里要同时改 Kconfig，否则 ORT-M 上两者会不一致。 */
+
+#define ORTD_PRIO  120
 
 /****************************************************************************
  * Private Functions
@@ -144,6 +164,36 @@ int main(int argc, FAR char *argv[])
 
   printf("[ortd] === ORT 部署/O&M 代理原型 ===\n");
   printf("[ortd] 监视: %s（周期 %d ms）\n", path, AGENT_PERIOD_MS);
+
+  /* ── 自己申报调度优先级 ──────────────────────────────────────────────
+   *
+   * ★ 本组件是**非实时**的，它必须比监督者**低**优先级
+   *   （NuttX 里数值越大优先级越低）。这条设计意图不能靠"启动者会设" ——
+   *   `CONFIG_TESTING_ORTD_PRIORITY` 是内置应用的概念，在 ORT-A
+   *   （应用是独立 ELF）上根本不经过内置表。实测：改成自己申报之前，
+   *   ORT-A 上代理与监督者都是 100。
+   *
+   * ⚠️ 拿不到就明说 —— 否则"代理和监督者同优先级"在日志上完全看不见，
+   *   而这正是"代理可以随便慢"这条设计假设失效的样子。 */
+
+  {
+    struct sched_param sched;
+
+    sched.sched_priority = ORTD_PRIO;
+    sched_setparam(0, &sched);
+
+    if (sched_getparam(0, &sched) != 0 ||
+        sched.sched_priority != ORTD_PRIO)
+      {
+        printf("[ortd] *** 无法取得设计要求的优先级 %d（当前 %d）***\n"
+               "       本组件是非实时的，必须低于监督者\n",
+               ORTD_PRIO, (int)sched.sched_priority);
+      }
+
+    printf("[ortd] 调度优先级: %d\n", (int)sched.sched_priority);
+    fflush(stdout);
+  }
+
 
   /* ── 注册自己 ────────────────────────────────────────────────────────
    *

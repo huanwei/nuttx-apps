@@ -70,6 +70,7 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sched.h>
 #include <errno.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
@@ -94,6 +95,15 @@
 #define POOL_BASE   0x60840000u
 #define BLOCK_SIZE  (16 * 1024u)
 #define NBLOCKS     4
+
+/* 监督者自己的调度优先级。理由与 ortd 里的同名宏相同（见那里的说明）：
+ * Kconfig 的 PRIORITY 是内置应用的概念，在 ORT-A 上到不了源码，
+ * 而"监督者必须高于它监督的对象"是架构不变量，不是可调项。
+ *
+ * ★ 三个值必须保持：监督者(100) < 容器(110) < 代理(120)
+ *   —— NuttX 里数值越小优先级越高。 */
+
+#define SUPERVISOR_PRIO  100
 
 #define CONTAINER_PRIO   110
 #define CONTAINER_STACK  2048
@@ -2183,7 +2193,34 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
   /* ORT-A：独立地址空间，容器是独立 ELF */
 
   {
-    int ret = posix_spawn(&pid, CONTAINER_PATH, NULL, NULL, cargv, NULL);
+    /* ★ 必须显式设调度参数 —— 这里原来传的是 NULL（默认属性）。
+     *
+     *   后果（实测 · §三·补三十）：ORT-A 上**监督者、容器、代理
+     *   全都是优先级 100** —— 而设计要的是
+     *   监督者(100) > 容器(110) > 代理(120)（NuttX 里数值越小优先级越高）。
+     *
+     *   监督者和它监督的对象同优先级意味着它们会**时间片轮转** ——
+     *   一个硬实时监督者不能和被监督者平起平坐。
+     *
+     *   为什么在 ORT-M 上没暴露：那条路走 task_create()，本来就把
+     *   CONTAINER_PRIO 传进去了。又是"只在一边验证"漏掉的那一类。
+     */
+
+    posix_spawnattr_t attr;
+    struct sched_param sched;
+    int ret;
+
+    posix_spawnattr_init(&attr);
+
+    sched.sched_priority = CONTAINER_PRIO;
+    posix_spawnattr_setschedparam(&attr, &sched);
+    posix_spawnattr_setschedpolicy(&attr, SCHED_RR);
+    posix_spawnattr_setstacksize(&attr, CONTAINER_STACK);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSCHEDPARAM |
+                                    POSIX_SPAWN_SETSCHEDULER);
+
+    ret = posix_spawn(&pid, CONTAINER_PATH, NULL, &attr, cargv, NULL);
+    posix_spawnattr_destroy(&attr);
 
     if (ret != 0)
       {
@@ -2392,6 +2429,38 @@ int main(int argc, FAR char *argv[])
   admit_mode = (argc > 1 && strcmp(argv[1], "admit") == 0);
 
   printf("[ortsup] === ORT 监督者原型（降级状态机）===\n");
+
+  /* ── 自己申报调度优先级 ──────────────────────────────────────────────
+   *
+   * ★ 为什么不靠启动者设置：`CONFIG_TESTING_ORTSUP_PRIORITY` 是**内置应用**
+   *   的概念 —— ORT-M（PROTECTED，应用编进 nuttx_user.elf）上它生效，
+   *   ORT-A（KERNEL，应用是文件系统上的独立 ELF）上**根本不经过内置表**，
+   *   启动者只会给默认优先级。实测：两边 `ps` 看到的优先级不同。
+   *
+   *   "我要求的调度属性"本来就是组件自己的属性，由组件申报最不容易漂移：
+   *   不依赖谁把它拉起来的、也不依赖那条启动路径实现得对不对。
+   *
+   * ⚠️ 失败不静默：拿不到**设计要求的**优先级必须说出来 ——
+   *   否则"监督者和被监督者同优先级"这件事在日志上完全看不见。
+   */
+
+  {
+    struct sched_param sched;
+
+    sched.sched_priority = SUPERVISOR_PRIO;
+    sched_setparam(0, &sched);
+
+    if (sched_getparam(0, &sched) != 0 ||
+        sched.sched_priority != SUPERVISOR_PRIO)
+      {
+        printf("[ortsup] *** 无法取得设计要求的优先级 %d（当前 %d）***\n"
+               "        监督者与被监督者同优先级会让它们时间片轮转\n",
+               SUPERVISOR_PRIO, (int)sched.sched_priority);
+      }
+
+    printf("[ortsup] 调度优先级: %d\n", (int)sched.sched_priority);
+    fflush(stdout);
+  }
 
   /* ── 先注册监督者 ────────────────────────────────────────────────────
    *
