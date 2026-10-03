@@ -802,6 +802,17 @@ static void fault_sig_handler(int signo, FAR siginfo_t *info, FAR void *ctx)
  *   所以用延迟把 BOOT 阶段让出来，让日志反映的是运行期行为。
  */
 
+/* 停止请求标志。SIGTERM 处理器只置位，不做别的事 ——
+ * 处理器里能做的事越少越好（不可重入、不可阻塞、不可分配）。 */
+
+static volatile int g_stop;
+
+static void stop_sig_handler(int signo)
+{
+  (void)signo;
+  g_stop = 1;
+}
+
 static int ort_container_main(int argc, FAR char *argv[])
 {
   FAR const char *mode = NULL;
@@ -837,6 +848,13 @@ static int ort_container_main(int argc, FAR char *argv[])
   mode   = argv[k + 1];
   domain = atoi(argv[k + 2]);
   delay  = atoi(argv[k + 3]);
+
+  /* 停得下来，才谈得上"被替换"。
+   *
+   * 没有这个处理器，监督者只能 SIGKILL —— 容器没有机会把正在做的事
+   * 收尾（写回、释放、报告）。有界退出是滚动更新的前提条件。 */
+
+  signal(SIGTERM, stop_sig_handler);
 
   /* 准入等待：容器创建与监督者绑域之间有窗口（见 ortmem 的说明） */
 
@@ -890,11 +908,15 @@ static int ort_container_main(int argc, FAR char *argv[])
 
   if (strcmp(mode, "ok") == 0)
     {
-      for (;;)
+      while (!g_stop)
         {
           *own = 0xa5a5a5a5u;
           sleep(1);
         }
+
+      printf("[ortsup] 容器(domain %d): 收到停止请求，干净退出\n", domain);
+      fflush(stdout);
+      return 0;
     }
 
   if (delay > 0)
@@ -903,7 +925,25 @@ static int ort_container_main(int argc, FAR char *argv[])
              domain, delay);
       fflush(stdout);
 
-      sleep(delay);
+      /* 分段睡：整段 sleep 会让停止请求最多晚 delay 秒才被响应，
+       * 而监督者的宽限期是有界的 —— 那样宽限期就形同虚设。 */
+
+      {
+        int i;
+
+        for (i = 0; i < delay && !g_stop; i++)
+          {
+            sleep(1);
+          }
+      }
+
+      if (g_stop)
+        {
+          printf("[ortsup] 容器(domain %d): 故障注入前收到停止请求，干净退出\n",
+                 domain);
+          fflush(stdout);
+          return 0;
+        }
     }
 
   printf("[ortsup] 容器(domain %d): 越界写 %p\n", domain, (void *)other);
@@ -920,6 +960,73 @@ static int ort_container_main(int argc, FAR char *argv[])
  ****************************************************************************/
 
 static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay);
+
+/* 停止宽限期：容器必须在这么久内响应 SIGTERM 并退出。 */
+
+#define STOP_GRACE_MS  3000
+
+/****************************************************************************
+ * Name: stop_cg
+ *
+ * Description:
+ *   请一个容器停下来：先 SIGTERM，宽限期内没走就 SIGKILL 兜底。
+ *
+ * ★ 为什么是**有界**等待：
+ *   无界等待是不可接受的 —— 一个收不到（或故意不理）SIGTERM 的容器
+ *   会把整个更新流程卡死。安全系统里，"等它自己走"必须有一个上限，
+ *   然后由监督者接管。这与"不信任失效组件"是同一条公理。
+ *
+ * ★ 为什么不用 waitpid 判存活：
+ *   见手册 §三·补四 坑 4 —— NuttX 在
+ *   CONFIG_SCHED_HAVE_PARENT && !CONFIG_SCHED_CHILD_STATUS 下，
+ *   waitpid 是**等 SIGCHLD**，会阻塞。
+ *   改用 kill(pid, 0)：POSIX 的"存在性探测"，
+ *   NuttX 侧实现就是 `nxsched_get_tcb(pid) != NULL`
+ *   （见 sched/signal/sig_kill.c 的 signo == 0 分支），不阻塞、无副作用。
+ *
+ * Returned Value:
+ *   true  = 已停止（干净退出或已 SIGKILL）
+ *   false = 停不下来（SIGKILL 已发但 TCB 仍在）
+ *
+ ****************************************************************************/
+
+static bool stop_cg(FAR struct ort_cg_s *cg)
+{
+  int waited = 0;
+
+  if (cg->pid <= 0)
+    {
+      return true;
+    }
+
+  if (kill(cg->pid, SIGTERM) != 0)
+    {
+      /* 投不出去通常就是已经没了 */
+
+      cg->pid = -1;
+      return true;
+    }
+
+  while (waited < STOP_GRACE_MS)
+    {
+      usleep(10000);
+      waited += 10;
+
+      if (kill(cg->pid, 0) != 0)
+        {
+          printf("[ortsup]   %s pid=%d 在 %d ms 内干净退出\n",
+                 cg->name, (int)cg->pid, waited);
+          cg->pid = -1;
+          return true;
+        }
+    }
+
+  printf("[ortsup]   ⚠ %s pid=%d 未在 %d ms 内响应 SIGTERM → SIGKILL 兜底\n",
+         cg->name, (int)cg->pid, STOP_GRACE_MS);
+  kill(cg->pid, SIGKILL);
+  cg->pid = -1;
+  return false;
+}
 
 /****************************************************************************
  * Name: manifest_reload
@@ -1003,13 +1110,7 @@ static int manifest_reload(void)
         {
           printf("[ortsup] 配置变更: %s 已从 manifest 移除 → 停止 (pid=%d)\n",
                  g_cgs[k].name, (int)g_cgs[k].pid);
-          if (kill(g_cgs[k].pid, SIGKILL) != 0)
-            {
-              printf("[ortsup]   ⚠ kill 失败 (errno=%d) —— 该容器仍在运行\n",
-                     errno);
-            }
-
-          g_cgs[k].pid    = -1;
+          stop_cg(&g_cgs[k]);
           g_cgs[k].failed = true;
         }
     }
@@ -1043,10 +1144,7 @@ static int manifest_reload(void)
           printf("[ortsup] 配置变更: %s 的声明变了 → 重启 (pid=%d)\n",
                  scratch[k].namebuf, (int)live->pid);
 
-          if (live->pid > 0 && kill(live->pid, SIGKILL) != 0)
-            {
-              printf("[ortsup]   ⚠ kill 失败 (errno=%d)\n", errno);
-            }
+          stop_cg(live);
 
           applied++;
         }
