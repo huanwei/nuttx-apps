@@ -1028,6 +1028,87 @@ static bool stop_cg(FAR struct ort_cg_s *cg)
   return false;
 }
 
+
+/****************************************************************************
+ * Name: replace_cg
+ *
+ * Description:
+ *   把 live 换成 spec，**先起新的、证明它活着、再停旧的**。
+ *
+ * ★ 修的是 §三·补二十一 的第 3 条限制："重载无事务性 —— 先 kill 再
+ *   start，中间存在一个该容器不在运行的窗口"。
+ *
+ *   顺序反过来（现在的做法），窗口长度 = spawn + 新实例的启动时间，
+ *   期间该 CG **无人服务**。容器越多、启动越慢，窗口越长。
+ *
+ *   正确的顺序是这个函数：旧的继续服务，新的在旁边起来，
+ *   跑完启动窗口证明自己没坏，然后才把旧的撤下。
+ *
+ * "证明"用什么判据 —— 复用既有的启动窗口（STARTUP_WINDOW_MS）：
+ *   它是**监督者单方面可判定**的，不依赖容器上报 ready
+ *   （见文件头"用 STARTUP_WINDOW_MS 而不是容器主动上报 ready"）。
+ *   一个新实例能撑过启动窗口不失效，就认为它可以接管。
+ *
+ * Returned Value:
+ *   true  = 已提交（旧的已停，spec->pid 是新的）
+ *   false = 已回滚（新实例没撑住，旧的仍在跑，spec 未被采纳）
+ *
+ ****************************************************************************/
+
+static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
+{
+  pid_t newpid;
+  int waited = 0;
+  bool healthy = true;
+
+  spec->pid = -1;
+
+  if (start_cg(spec, "fault", spec->critical ? 8 : 3) != 0)
+    {
+      printf("[ortsup]   ✗ 新实例起不来 → 放弃本次变更，旧实例继续\n");
+      return false;
+    }
+
+  newpid = spec->pid;
+  printf("[ortsup]   新实例 pid=%d 已起，旧实例 pid=%d 继续服务，"
+         "等启动窗口 %d ms\n", (int)newpid, (int)live->pid,
+         g_startup_window_ms);
+
+  /* 等它跑完启动窗口。
+   *
+   * ★ 这里**不去排空内核事件队列** —— 那会把其它 CG 的事件也吞掉，
+   *   破坏主循环的消费顺序（事件队列是"逐条独立、按序消费"的）。
+   *   所以直接用 kill(pid, 0) 探活，让事件老老实实待在队列里。
+   */
+
+  while (waited < g_startup_window_ms)
+    {
+      usleep(LOOP_MS * 1000);
+      waited += LOOP_MS;
+
+      if (kill(newpid, 0) != 0)
+        {
+          healthy = false;
+          break;
+        }
+    }
+
+  if (!healthy)
+    {
+      printf("[ortsup]   ✗ 新实例 pid=%d 未撑过启动窗口 → **回滚**，"
+             "旧实例 pid=%d 原样继续\n", (int)newpid, (int)live->pid);
+      spec->pid = -1;
+      return false;
+    }
+
+  /* 新的证明了自己 → 撤下旧的。到这里才真正"提交" */
+
+  printf("[ortsup]   ✓ 新实例 pid=%d 已过启动窗口(%d ms) → 撤下旧实例 pid=%d\n",
+         (int)newpid, waited, (int)live->pid);
+  stop_cg(live);
+  return true;
+}
+
 /****************************************************************************
  * Name: manifest_reload
  *
@@ -1141,12 +1222,42 @@ static int manifest_reload(void)
         }
       else if (!cg_spec_equal(live, &scratch[k]))
         {
-          printf("[ortsup] 配置变更: %s 的声明变了 → 重启 (pid=%d)\n",
+          printf("[ortsup] 配置变更: %s 的声明变了（pid=%d）\n",
                  scratch[k].namebuf, (int)live->pid);
 
-          stop_cg(live);
+          /* ★ 先起新的、证明活着、再停旧的 —— 见 replace_cg()。
+           *   失败则回滚：scratch[k] 不被采纳，下面拷贝时
+           *   让 live 的原规格继续生效。 */
 
-          applied++;
+          if (replace_cg(live, &scratch[k]))
+            {
+              applied++;
+            }
+          else
+            {
+              /* ★ 回滚必须**把 live 的原样写回 scratch[k]**。
+               *
+               *   光 `continue` 是不够的 —— 下面那句
+               *   `memcpy(g_cgs, scratch, ...)` 是按位置整体覆盖的，
+               *   scratch[k] 里此刻装的还是**新规格**，
+               *   于是"回滚"照样会把变更应用下去。
+               *   （写的时候差点就这么交了 —— 回滚路径最容易只写一半。）
+
+               *   名字要拷进 scratch 自己的 namebuf：直接指 live->namebuf
+               *   的话，memcpy 之后指针会跨条目指向别人的缓冲区。 */
+
+              strcpy(scratch[k].namebuf, live->namebuf);
+              scratch[k].name        = scratch[k].namebuf;
+              scratch[k].domain      = live->domain;
+              scratch[k].critical    = live->critical;
+              scratch[k].max_restarts  = live->max_restarts;
+              scratch[k].handles_fault = live->handles_fault;
+              scratch[k].pid         = live->pid;
+              scratch[k].admitted_ms = live->admitted_ms;
+              scratch[k].restarts    = live->restarts;
+              scratch[k].faults      = live->faults;
+              scratch[k].failed      = live->failed;
+            }
         }
       else
         {
