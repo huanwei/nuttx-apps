@@ -247,6 +247,12 @@ static unsigned int g_caps;
 
 static int g_now_ms;
 
+/* 事件序审计（§三·补三十一 的验收装置） */
+
+static uint32_t g_audit_last;    /* 上一条读到的事件号 */
+static int      g_audit_gap;     /* 累计缺口（丢了但账对得上） */
+static int      g_audit_bad;     /* 累计异常（倒退/重复/账对不上） */
+
 /* 上一次 reload 失败的原因。用于把重复的同一错误折叠成一条。 */
 
 static char g_reload_lasterr[160];
@@ -928,6 +934,42 @@ static void drain_faults(void)
           g_ev_faults[g_ev_count] = (int)rec.faults;
         }
 
+      /* ── 事件序审计（§三·补三十一 的验收装置）────────────────────
+       *
+       * 内核那边 seq 是**全局单调**的事件号。所以监督者这一侧能独立
+       * 判断三件事，不需要相信内核：
+       *
+       *   seq 严格递增、缺口恰好等于 lost  → 事件流是好的
+       *   seq 有缺口但没有报 lost          → **丢了却没记账**（R1/R4）
+       *   seq 不增反退 / 重复              → **两条事件认领了同一个槽**（R1）
+       *
+       * 这是"监督者单方面可判定"的判据 —— 与 ort_caps()、
+       * audit_protocol() 同一个思路。 */
+
+      if (rec.seq <= g_audit_last)
+        {
+          g_audit_bad++;
+          printf("[ortsup] *** 事件序异常: seq=%u 未递增"
+                 "（上一条 %u）—— 可能有事件被覆盖或重复认领 ***\n",
+                 (unsigned)rec.seq, (unsigned)g_audit_last);
+        }
+      else if (rec.seq > g_audit_last + 1)
+        {
+          uint32_t gap = rec.seq - g_audit_last - 1;
+
+          g_audit_gap += gap;
+
+          if (rec.lost == 0 && g_audit_last != 0)
+            {
+              /* 有缺口，但记录里说"一条都没丢" —— 账对不上 */
+              g_audit_bad++;
+              printf("[ortsup] *** 事件序异常: 缺口 %u 条，"
+                     "但记录里 lost=0（账对不上）***\n", (unsigned)gap);
+            }
+        }
+
+      g_audit_last = rec.seq;
+
       g_ev_count++;
       g_ev_lost = (int)rec.lost;
 
@@ -1226,6 +1268,7 @@ static int ort_container_main(int argc, FAR char *argv[])
   int nopub = 0;                 /* 测试装置：不发布状态 */
   int nosignal = 0;              /* 测试装置：忽略 SIGTERM */
   int hammer = 0;                /* 测试装置：紧循环读写快照（撞撕裂窗口） */
+  int burst = 0;                 /* 测试装置：不等延迟立即故障（撞事件队列） */
   int delay = 0;
   int domain = 0;
   int version = 0;
@@ -1285,6 +1328,17 @@ static int ort_container_main(int argc, FAR char *argv[])
            *   用来造一个"兑现不了 SIGTERM 有界退出"的容器。 */
 
           nosignal = 1;
+        }
+      else if (strcmp(argv[i], "burst") == 0)
+        {
+          /* ★ 测试装置：**不等延迟，立即故障**。
+           *
+           *   用途：让多个 CG 在**不同核上近乎同时**故障，去撞
+           *   故障事件队列的生产者竞争（§三·补三十一 的 R1/R2/R5）。
+           *   配合监督者对 burst_ 前缀的 CG 用 0 重启延迟，
+           *   故障率能上去两三个数量级。 */
+
+          burst = 1;
         }
       else if (strcmp(argv[i], "hammer") == 0)
         {
@@ -1606,6 +1660,16 @@ static int ort_container_main(int argc, FAR char *argv[])
       return 0;
     }
 
+  /* ★ burst **不覆盖** argv 里的延迟 —— 首次启动仍然按延迟来。
+   *
+   *   第一版在这里写了 `delay = 0`，结果容器在**启动窗口内**就故障，
+   *   触发 startup 策略直接进 SAFE_STATE（H29 的设计是对的），
+   *   整个压力测试第一步就终结了。
+   *
+   *   "故障要快"这件事由**监督者的重启路径**决定：它对 burst_ 前缀的
+   *   CG 传 0 延迟。容器只管照 argv 办。 */
+
+  (void)burst;
   if (delay > 0)
     {
       printf("[ortsup] 容器(domain %d): 正常工作中，%d 秒后注入故障\n",
@@ -2323,6 +2387,10 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
       {
         cargv[n++] = (FAR char *)"hammer";
       }
+    else if (strncmp(cg->name, "burst_", 6) == 0)
+      {
+        cargv[n++] = (FAR char *)"burst";
+      }
 
     cargv[n] = NULL;
   }
@@ -2508,9 +2576,14 @@ static void on_cg_failed(FAR struct ort_cg_s *cg)
       printf("[ortsup] %s: 重启 %d/%d\n", cg->name, cg->restarts,
              cg->max_restarts);
 
-      /* 故障重启：前身已经死了，没有重叠期 —— 它一上来就是现任 */
+      /* 故障重启：前身已经死了，没有重叠期 —— 它一上来就是现任。
+       *
+       * ★ 测试装置：burst_ 前缀的 CG 用 0 延迟 —— 让故障率上去，
+       *   才有机会撞到故障事件队列的生产者竞争（§三·补三十一）。
+       *   产品路径不会有这个前缀。 */
 
-      if (start_cg(cg, "fault", 1, false) != 0)
+      if (start_cg(cg, "fault",
+                   strncmp(cg->name, "burst_", 6) == 0 ? 0 : 1, false) != 0)
         {
           cg->failed = true;
           state_to(ORT_DEGRADED);
@@ -3009,7 +3082,8 @@ int main(int argc, FAR char *argv[])
              g_cgs[i].faults, g_cgs[i].restarts);
     }
 
-  printf(" | events=%d lost=%d\n", g_ev_count, g_ev_lost);
+  printf(" | events=%d lost=%d | 审计: 缺口=%d 异常=%d\n",
+         g_ev_count, g_ev_lost, g_audit_gap, g_audit_bad);
 
   /* 最终态的断言：本原型跑完必须落在有效终态上 */
 
