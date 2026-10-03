@@ -105,6 +105,10 @@ static int g_startup_window_ms = STARTUP_WINDOW_MS;
 
 #define LOOP_MS  5
 
+/* manifest 轮询周期 */
+
+#define RELOAD_POLL_MS  2000
+
 /****************************************************************************
  * 状态定义（《设计》§2.1）
  ****************************************************************************/
@@ -137,7 +141,8 @@ static FAR const char *state_name(enum ort_sysstate_e s)
 
 struct ort_cg_s
 {
-  FAR const char *name;
+  char            namebuf[16];   /* 名字的所有权在这里，解析器不分配 */
+  FAR const char *name;          /* 恒等于 namebuf */
   int             domain;
   bool            critical;      /* onFailure: 关键 → SAFE_STATE；否则 DEGRADE */
   int             max_restarts;  /* 0 = NEVER（SAFE_STATIC 推荐值） */
@@ -188,6 +193,11 @@ static unsigned int g_caps;
  */
 
 static int g_now_ms;
+static int g_last_reload_ms;
+
+/* 上一次 reload 失败的原因。用于把重复的同一错误折叠成一条。 */
+
+static char g_reload_lasterr[160];
 
 #define NCGS (g_ncgs)
 
@@ -225,6 +235,13 @@ static int g_now_ms;
 
 #define MANIFEST_PATH      "/system/etc/ort.cfg"
 #define MANIFEST_MAXLINE   256   /* 注释里有 UTF-8 中文，一字符 3 字节，别卡太紧 */
+
+/* ★ 解析阶段的 startup_timeout_ms 落在这里，**不直接写 g_startup_window_ms**。
+ *   否则一份校验失败的 manifest 也已经改掉了运行时配置 ——
+ *   而"拒绝新配置、保持旧配置"要求的是**一个字段都不能动**。
+ *   提交动作只在调用方确认加载成功后做。 */
+
+static int g_mf_startup_ms = STARTUP_WINDOW_MS;
 
 static char g_mf_buf[160];
 static FAR const char *g_mf_err;   /* 校验失败说明（指向 g_mf_buf，不分配） */
@@ -327,16 +344,25 @@ static bool mf_bool(FAR const char *v, FAR bool *out)
   return false;
 }
 
-/* CG 名要存下来 —— 解析缓冲区每行复用，不能留指针进去 */
-
-static char g_cg_names[MAX_CGS][16];
-static unsigned int g_cg_seen[MAX_CGS];
-
 #define SEEN_DOMAIN   (1u << 0)
 #define SEEN_CRITICAL (1u << 1)
 #define SEEN_RESTARTS (1u << 2)
 #define SEEN_HANDLES  (1u << 3)
 #define SEEN_ALL      (SEEN_DOMAIN | SEEN_CRITICAL | SEEN_RESTARTS | SEEN_HANDLES)
+
+/* 两份规格是否**等价**（只看声明，不看运行时状态）。
+ *
+ * 等价 = 不需要动它 —— 这正是"滚动更新"区别于"整体重启"的地方：
+ * 只重启**声明变了**的容器，没变的绝不打断。 */
+
+static bool cg_spec_equal(FAR const struct ort_cg_s *a,
+                          FAR const struct ort_cg_s *b)
+{
+  return a->domain        == b->domain &&
+         a->critical      == b->critical &&
+         a->max_restarts  == b->max_restarts &&
+         a->handles_fault == b->handles_fault;
+}
 
 /****************************************************************************
  * Name: manifest_load
@@ -349,16 +375,21 @@ static unsigned int g_cg_seen[MAX_CGS];
  *
  ****************************************************************************/
 
-static int manifest_load(FAR const char *path)
+static int manifest_load(FAR const char *path,
+                         FAR struct ort_cg_s *cgs, int maxcgs,
+                         FAR int *ncgs)
 {
   FAR struct ort_cg_s *cg = NULL;
   char line[MANIFEST_MAXLINE];
+  char names[MAX_CGS][16];        /* 每个 CG 的名字存这儿 —— 解析缓冲区每行复用 */
+  unsigned int seen[MAX_CGS];     /* 每个 CG 已出现过的键 */
   FILE *fp;
   int lineno = 0;
   bool have_version = false;
+  int n = 0;
   int k;
 
-  g_ncgs = 0;
+  *ncgs = 0;
   g_mf_err = NULL;
 
   fp = fopen(path, "r");
@@ -414,38 +445,37 @@ static int manifest_load(FAR const char *path)
               goto fail;
             }
 
-          if (strlen(name) >= sizeof(g_cg_names[0]))
+          if (strlen(name) >= sizeof(names[0]))
             {
               mf_err(lineno, "段名过长");
               goto fail;
             }
 
-          if (g_ncgs >= MAX_CGS)
+          if (n >= maxcgs)
             {
               mf_err(lineno, "CG 数量超过 MAX_CGS");
               goto fail;
             }
 
-          for (k = 0; k < g_ncgs; k++)
+          for (k = 0; k < n; k++)
             {
-              if (strcmp(g_cg_names[k], name) == 0)
+              if (strcmp(names[k], name) == 0)
                 {
                   mf_err(lineno, "CG 重名（同一容器组只能出现一次）");
                   goto fail;
                 }
             }
 
-          strcpy(g_cg_names[g_ncgs], name);
-
-          cg = &g_cgs[g_ncgs];
+          cg          = &cgs[n];
           memset(cg, 0, sizeof(*cg));
-          cg->name        = g_cg_names[g_ncgs];
+          strcpy(cg->namebuf, name);
+          cg->name    = cg->namebuf;
           cg->domain      = -1;      /* -1 = 未声明，后面校验会拦 */
           cg->pid         = -1;
           cg->admitted_ms = -1;
 
-          g_cg_seen[g_ncgs] = 0;
-          g_ncgs++;
+          seen[n] = 0;
+          n++;
           continue;
         }
 
@@ -486,7 +516,7 @@ static int manifest_load(FAR const char *path)
             }
           else if (strcmp(key, "startup_timeout_ms") == 0)
             {
-              if (!mf_int(val, &g_startup_window_ms))
+              if (!mf_int(val, &g_mf_startup_ms))
                 {
                   mf_err(lineno, "startup_timeout_ms 必须是十进制非负整数");
                   goto fail;
@@ -511,13 +541,13 @@ static int manifest_load(FAR const char *path)
               goto fail;
             }
 
-          if (g_cg_seen[g_ncgs - 1] & SEEN_DOMAIN)
+          if (seen[n - 1] & SEEN_DOMAIN)
             {
               mf_err(lineno, "domain 重复");
               goto fail;
             }
 
-          g_cg_seen[g_ncgs - 1] |= SEEN_DOMAIN;
+          seen[n - 1] |= SEEN_DOMAIN;
         }
       else if (strcmp(key, "critical") == 0)
         {
@@ -527,13 +557,13 @@ static int manifest_load(FAR const char *path)
               goto fail;
             }
 
-          if (g_cg_seen[g_ncgs - 1] & SEEN_CRITICAL)
+          if (seen[n - 1] & SEEN_CRITICAL)
             {
               mf_err(lineno, "critical 重复");
               goto fail;
             }
 
-          g_cg_seen[g_ncgs - 1] |= SEEN_CRITICAL;
+          seen[n - 1] |= SEEN_CRITICAL;
         }
       else if (strcmp(key, "max_restarts") == 0)
         {
@@ -543,13 +573,13 @@ static int manifest_load(FAR const char *path)
               goto fail;
             }
 
-          if (g_cg_seen[g_ncgs - 1] & SEEN_RESTARTS)
+          if (seen[n - 1] & SEEN_RESTARTS)
             {
               mf_err(lineno, "max_restarts 重复");
               goto fail;
             }
 
-          g_cg_seen[g_ncgs - 1] |= SEEN_RESTARTS;
+          seen[n - 1] |= SEEN_RESTARTS;
         }
       else if (strcmp(key, "handles_fault") == 0)
         {
@@ -559,13 +589,13 @@ static int manifest_load(FAR const char *path)
               goto fail;
             }
 
-          if (g_cg_seen[g_ncgs - 1] & SEEN_HANDLES)
+          if (seen[n - 1] & SEEN_HANDLES)
             {
               mf_err(lineno, "handles_fault 重复");
               goto fail;
             }
 
-          g_cg_seen[g_ncgs - 1] |= SEEN_HANDLES;
+          seen[n - 1] |= SEEN_HANDLES;
         }
       else
         {
@@ -588,15 +618,15 @@ static int manifest_load(FAR const char *path)
       goto fail;
     }
 
-  if (g_ncgs < 1)
+  if (n < 1)
     {
       mf_err(0, "至少要有一个 CG（空配置等于没有可编排的对象）");
       goto fail;
     }
 
-  for (k = 0; k < g_ncgs; k++)
+  for (k = 0; k < n; k++)
     {
-      if (g_cg_seen[k] != SEEN_ALL)
+      if (seen[k] != SEEN_ALL)
         {
           mf_err(0, "CG 段字段不全（domain/critical/max_restarts/"
                     "handles_fault 四项都必须显式给出）");
@@ -611,7 +641,7 @@ static int manifest_load(FAR const char *path)
 
         for (j = 0; j < k; j++)
           {
-            if (g_cgs[j].domain == g_cgs[k].domain)
+            if (cgs[j].domain == cgs[k].domain)
               {
                 mf_err(0, "两个 CG 用了同一个 domain（等于它们不隔离）");
                 goto fail;
@@ -620,6 +650,7 @@ static int manifest_load(FAR const char *path)
       }
     }
 
+  *ncgs = n;
   return OK;
 
 fail:
@@ -628,7 +659,7 @@ fail:
       fclose(fp);
     }
 
-  g_ncgs = 0;
+  n = 0;
   return -EINVAL;
 }
 
@@ -887,6 +918,177 @@ static int ort_container_main(int argc, FAR char *argv[])
 /****************************************************************************
  * 监督者
  ****************************************************************************/
+
+static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay);
+
+/****************************************************************************
+ * Name: manifest_reload
+ *
+ * Description:
+ *   重新读 manifest，校验通过则**只把差异应用下去**。
+ *
+ * ★ reload 失败时的处置，与启动时**故意不同**：
+ *
+ *     启动时失败 → 拒绝启动（fail-closed）
+ *     运行中失败 → **保持当前配置继续运行**（fail-safe）
+ *
+ *   看起来矛盾，其实是因为**处境不同**：
+ *
+ *     - 启动时手上没有任何"已知可用"的配置，唯一的诚实动作是拒绝。
+ *       用默认值兜底 = 按一套没人写过的配置运行。
+ *     - 运行中手上正跑着一份**已经工作着的**配置。此时新配置有问题，
+ *       正确的动作是"不采纳" —— 退回一个不存在的配置才是荒谬的。
+ *
+ *   把这两件事写成同一个策略（要么都拒、要么都退回默认）都会错。
+ *   这也是 functional safety 里 fail-safe / fail-closed 两个词
+ *   不能混用的原因。
+ *
+ * Returned Value:
+ *   OK      已应用（或无差异）
+ *   -EINVAL 新配置不合法 —— 当前配置**原样保留**
+ *
+ ****************************************************************************/
+
+static int manifest_reload(void)
+{
+  static struct ort_cg_s scratch[MAX_CGS];   /* 先解析到暂存区，验完再采纳 */
+  int n_prev = g_ncgs;
+  int n = 0;
+  int k;
+  int j;
+  int applied = 0;
+
+  if (manifest_load(MANIFEST_PATH, scratch, MAX_CGS, &n) != OK)
+    {
+      /* ★ 只在错误**变了**的时候打印。
+       *
+       *   轮询是每 2 秒一次，不折叠的话一份坏配置会把日志刷满 ——
+       *   而运维真正需要的是"什么时候开始坏的、坏在哪"，
+       *   不是"它重复了多少次"。实测：不折叠时 13 秒刷了 6 遍同一条。
+       */
+
+      if (strcmp(g_mf_err ? g_mf_err : "?", g_reload_lasterr) != 0)
+        {
+          printf("[ortsup] *** 拒绝新配置（当前配置原样继续运行）***\n");
+          printf("[ortsup] %s: %s\n", MANIFEST_PATH,
+                 g_mf_err ? g_mf_err : "未知原因");
+          fflush(stdout);
+
+          strncpy(g_reload_lasterr, g_mf_err ? g_mf_err : "?",
+                  sizeof(g_reload_lasterr) - 1);
+          g_reload_lasterr[sizeof(g_reload_lasterr) - 1] = '\0';
+        }
+
+      return -EINVAL;
+    }
+
+  g_reload_lasterr[0] = '\0';   /* 成功一次就把折叠状态清掉 */
+
+  /* ── 已删除的 CG：停掉 ───────────────────────────────────────────── */
+
+  for (k = 0; k < n_prev; k++)
+    {
+      bool still = false;
+
+      for (j = 0; j < n; j++)
+        {
+          if (strcmp(scratch[j].namebuf, g_cgs[k].name) == 0)
+            {
+              still = true;
+              break;
+            }
+        }
+
+      if (!still && g_cgs[k].pid > 0)
+        {
+          printf("[ortsup] 配置变更: %s 已从 manifest 移除 → 停止 (pid=%d)\n",
+                 g_cgs[k].name, (int)g_cgs[k].pid);
+          if (kill(g_cgs[k].pid, SIGKILL) != 0)
+            {
+              printf("[ortsup]   ⚠ kill 失败 (errno=%d) —— 该容器仍在运行\n",
+                     errno);
+            }
+
+          g_cgs[k].pid    = -1;
+          g_cgs[k].failed = true;
+        }
+    }
+
+  /* ── 新增 / 变更 ───────────────────────────────────────────────────
+   *
+   * 先把"变更"挑出来重启，最后再把 scratch 整体搬过去 ——
+   * 顺序反了会把旧规格覆盖掉，就没法判断"变了没有"了。
+   */
+
+  for (k = 0; k < n; k++)
+    {
+      FAR struct ort_cg_s *live = NULL;
+
+      for (j = 0; j < n_prev; j++)
+        {
+          if (strcmp(scratch[k].namebuf, g_cgs[j].name) == 0)
+            {
+              live = &g_cgs[j];
+              break;
+            }
+        }
+
+      if (live == NULL)
+        {
+          printf("[ortsup] 配置变更: %s 是新增的\n", scratch[k].namebuf);
+          applied++;
+        }
+      else if (!cg_spec_equal(live, &scratch[k]))
+        {
+          printf("[ortsup] 配置变更: %s 的声明变了 → 重启 (pid=%d)\n",
+                 scratch[k].namebuf, (int)live->pid);
+
+          if (live->pid > 0 && kill(live->pid, SIGKILL) != 0)
+            {
+              printf("[ortsup]   ⚠ kill 失败 (errno=%d)\n", errno);
+            }
+
+          applied++;
+        }
+      else
+        {
+          /* ★ 声明没变 → **保持 pid 与计数器不动**。
+           *   这条就是滚动更新的全部意义：不打断没变的容器。 */
+
+          scratch[k].pid         = live->pid;
+          scratch[k].admitted_ms = live->admitted_ms;
+          scratch[k].restarts    = live->restarts;
+          scratch[k].faults      = live->faults;
+          scratch[k].failed      = live->failed;
+        }
+    }
+
+  memcpy(g_cgs, scratch, sizeof(g_cgs[0]) * n);
+  for (k = n; k < n_prev; k++)
+    {
+      memset(&g_cgs[k], 0, sizeof(g_cgs[0]));
+    }
+
+  /* 到这里才提交 —— 见 g_mf_startup_ms 的说明 */
+
+  g_startup_window_ms = g_mf_startup_ms;
+  g_ncgs              = n;
+
+  printf("[ortsup] manifest 已重载: %d 个 CG，%d 项变更\n", n, applied);
+
+  /* 新增或重启的 CG 现在拉起来 */
+
+  for (k = 0; k < n; k++)
+    {
+      if (g_cgs[k].pid <= 0 && !g_cgs[k].failed)
+        {
+          start_cg(&g_cgs[k], "fault", g_cgs[k].critical ? 8 : 3);
+        }
+    }
+
+  fflush(stdout);
+  return OK;
+}
 
 /****************************************************************************
  * Name: admit_ok
@@ -1191,7 +1393,7 @@ int main(int argc, FAR char *argv[])
    */
 
   {
-    int ret = manifest_load(MANIFEST_PATH);
+    int ret = manifest_load(MANIFEST_PATH, g_cgs, MAX_CGS, &g_ncgs);
 
     if (ret != OK)
       {
@@ -1202,6 +1404,10 @@ int main(int argc, FAR char *argv[])
         fflush(stdout);
         return 2;
       }
+
+    /* 解析成功才提交（见 g_mf_startup_ms 的说明） */
+
+    g_startup_window_ms = g_mf_startup_ms;
   }
 
   printf("[ortsup] manifest: %s（%d 个 CG，启动窗口 %d ms）\n",
@@ -1360,6 +1566,23 @@ int main(int argc, FAR char *argv[])
         {
           printf("[ortsup] *** 监督循环超时 ***\n");
           break;
+        }
+
+      /* ── manifest 轮询 ─────────────────────────────────────────────
+       *
+       * 每 RELOAD_POLL_MS 重读一次。用轮询而不是 inotify/SIGHUP：
+       * hostfs 下没有 inotify，而 SIGHUP 需要一个能发信号的助手 ——
+       * 两者都会把"演示能不能跑"绑到别的东西上。
+       *
+       * 原型里轮询是可接受的：文件小、间隔长、解析不分配内存。
+       * 正式实现应当换成变更通知，并把解析移到**优先级更低**的
+       * 上下文 —— 现在它跑在监督循环里，会占掉这段时间。
+       */
+
+      if (g_now_ms - g_last_reload_ms >= RELOAD_POLL_MS)
+        {
+          g_last_reload_ms = g_now_ms;
+          manifest_reload();
         }
 
       /* 排空内核队列，逐条投递给状态机（每条独立，不共享"当前值"） */
