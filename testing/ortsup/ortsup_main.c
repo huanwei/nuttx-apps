@@ -86,6 +86,11 @@
 
 #define CONTAINER_PATH  "/system/bin/ortsup"
 
+/* 状态发布周期。要比启动窗口（1.5s）短一个数量级，
+ * 否则接替者读到的是过期快照。 */
+
+#define PUBLISH_PERIOD_US  100000
+
 #define POOL_BASE   0x60840000u
 #define BLOCK_SIZE  (16 * 1024u)
 #define NBLOCKS     4
@@ -807,6 +812,10 @@ static void fault_sig_handler(int signo, FAR siginfo_t *info, FAR void *ctx)
 
 static volatile int g_stop;
 
+/* 状态计数器：真实容器这里是控制环的状态。见 ort_container_main 里的说明。 */
+
+static uint32_t g_tick;
+
 static void stop_sig_handler(int signo)
 {
   (void)signo;
@@ -848,6 +857,35 @@ static int ort_container_main(int argc, FAR char *argv[])
   mode   = argv[k + 1];
   domain = atoi(argv[k + 2]);
   delay  = atoi(argv[k + 3]);
+
+  /* ── 状态接续 ────────────────────────────────────────────────────────
+   *
+   * 真实容器在这里是控制环的积分器 / 滤波器 / 上次输出。
+   * 原型用一个**单调计数器**，因为它一眼可判：
+   *   替换后从 0 重新开始 = 状态没接上；从 N 继续 = 接上了。
+   *
+   * ★ 这一步是行业冗余链在单板上的对应物（见假设审计 H32）：
+   *   没有它，"先起后杀"只是让进程不缺席，功能仍然被打断。
+   */
+
+  {
+    uint32_t prev = 0;
+    int n = prctl(PR_ORT_STATE_GET, &prev, sizeof(prev));
+
+    if (n == (int)sizeof(prev))
+      {
+        g_tick = prev;
+        printf("[ortsup] 容器(domain %d): **接续旧状态** tick=%u（不是冷启动）\n",
+               domain, (unsigned)g_tick);
+      }
+    else
+      {
+        printf("[ortsup] 容器(domain %d): 无旧状态可接续 (ret=%d)，从 0 开始\n",
+               domain, n);
+      }
+
+    fflush(stdout);
+  }
 
   /* 停得下来，才谈得上"被替换"。
    *
@@ -911,10 +949,18 @@ static int ort_container_main(int argc, FAR char *argv[])
       while (!g_stop)
         {
           *own = 0xa5a5a5a5u;
-          sleep(1);
+
+          /* 周期发布 —— 模拟冗余链的"持续跟踪"。
+           * 发布周期必须**明显短于**重启预算与启动窗口，
+           * 否则接替者读到的是过期快照。 */
+
+          g_tick++;
+          prctl(PR_ORT_STATE_PUT, &g_tick, sizeof(g_tick));
+          usleep(PUBLISH_PERIOD_US);
         }
 
-      printf("[ortsup] 容器(domain %d): 收到停止请求，干净退出\n", domain);
+      printf("[ortsup] 容器(domain %d): 收到停止请求，干净退出（tick=%u）\n",
+             domain, (unsigned)g_tick);
       fflush(stdout);
       return 0;
     }
@@ -931,16 +977,19 @@ static int ort_container_main(int argc, FAR char *argv[])
       {
         int i;
 
-        for (i = 0; i < delay && !g_stop; i++)
+        for (i = 0; i < delay * 10 && !g_stop; i++)
           {
-            sleep(1);
+            g_tick++;
+            prctl(PR_ORT_STATE_PUT, &g_tick, sizeof(g_tick));
+            usleep(PUBLISH_PERIOD_US);
           }
       }
 
       if (g_stop)
         {
-          printf("[ortsup] 容器(domain %d): 故障注入前收到停止请求，干净退出\n",
-                 domain);
+          printf("[ortsup] 容器(domain %d): 故障注入前收到停止请求，"
+                 "干净退出（tick=%u，已发布）\n",
+                 domain, (unsigned)g_tick);
           fflush(stdout);
           return 0;
         }
