@@ -865,11 +865,69 @@ struct state_blob_s
 
 static volatile int g_stop;
 
+/* 本实例是不是"对外负责"的那个。
+ *
+ * ★ 重叠期里新旧两个实例都在跑，但**只有现任有权写状态**。
+ *   接替者在新手期只**读**（跟踪现任），被监督者点名之后才接管。
+ *
+ *   为什么不能两边都写：槽是单槽，两边都写会来回翻，
+ *   下一个接替者读到的可能来自任意一个 —— 那不是状态，是噪声。
+ */
+
+static volatile int g_active;
+static int g_domain;
+
 /* 状态计数器：真实容器这里是控制环的状态。见 ort_container_main 里的说明。 */
 
 static uint32_t g_tick;
+static int g_was_active;
 
 /* 打包装箱后发布 —— 让"发布什么"只有一处定义 */
+
+/* 每 100 ms 走一步：**现任发布，接替者跟踪**。
+ *
+ * ★ 为什么接替者要持续跟踪，而不是启动时读一次就完事：
+ *
+ *   重叠期里旧实例还在跑、状态还在变。启动时取的那份副本，
+ *   到提交那一刻已经过期了 —— 实测差 18 个 tick
+ *   （新实例读到 24，旧实例最终走到 42）。接替者会带着一份
+ *   陈旧状态接管，而那正是"状态延续"失效的样子。
+ *
+ *   行业冗余也是这么做的：Emerson 的备用控制器**持续跟踪**主控
+ *   （文档原话 "tracks the operation"），而不是切换时才去取一次快照。
+ *   这不是实现细节，是"无扰切换"的前提。
+ */
+
+static void publish_tick(uint32_t version);
+
+static void step_state(uint32_t version)
+{
+  struct state_blob_s snap;
+
+  if (g_active)
+    {
+      if (!g_was_active)
+        {
+          g_was_active = 1;
+          printf("[ortsup] 容器(domain %d): **接管**（tick=%u，"
+                 "已持续跟踪到此刻）\n", g_domain, (unsigned)g_tick);
+          fflush(stdout);
+        }
+
+      g_tick++;
+      publish_tick(version);
+      return;
+    }
+
+  /* 新手期：跟着现任走，不写 */
+
+  if (prctl(PR_ORT_STATE_GET, &snap, sizeof(snap)) == (int)sizeof(snap) &&
+      snap.magic == STATE_MAGIC && snap.version == version &&
+      snap.tick > g_tick)
+    {
+      g_tick = snap.tick;
+    }
+}
 
 static void publish_tick(uint32_t version)
 {
@@ -885,7 +943,20 @@ static void publish_tick(uint32_t version)
 static void stop_sig_handler(int signo)
 {
   (void)signo;
-  g_stop = 1;
+
+  /* 被要求停止 = 不再是对外负责的那个实例。
+   * 立刻停止发布，否则提交之后槽里还会混进旧实例的写入。 */
+
+  g_active = 0;
+  g_stop   = 1;
+}
+
+/* 监督者在**提交点**发来：从现在起你负责。 */
+
+static void active_sig_handler(int signo)
+{
+  (void)signo;
+  g_active = 1;
 }
 
 static int ort_container_main(int argc, FAR char *argv[])
@@ -896,6 +967,7 @@ static int ort_container_main(int argc, FAR char *argv[])
   int delay = 0;
   int domain = 0;
   int version = 0;
+  int i;
   int k;
 
   /* ★ 按**标记**找参数，不按下标数。
@@ -919,6 +991,19 @@ static int ort_container_main(int argc, FAR char *argv[])
     {
       printf("[ortsup] 容器: 参数不足 (argc=%d, marker=%d)\n", argc, k);
       return 1;
+    }
+
+  /* 扫一遍看有没有 standby 标记 —— 不占位置参数，
+   * 与 "container" 标记同一套认法。 */
+
+  for (i = 0; i < argc; i++)
+    {
+      if (argv[i] != NULL && strcmp(argv[i], "standby") == 0)
+        {
+          /* 新手期：只跟踪，不发布（见 step_state 的说明） */
+
+          break;
+        }
     }
 
   mode    = argv[k + 1];
@@ -964,7 +1049,8 @@ static int ort_container_main(int argc, FAR char *argv[])
     else
       {
         g_tick = prev.tick;
-        printf("[ortsup] 容器(domain %d): **接续旧状态** tick=%u（v%d，不是冷启动）\n",
+        printf("[ortsup] 容器(domain %d): **接续旧状态** tick=%u（v%d，"
+               "之后持续跟踪直到被点名）\n",
                domain, (unsigned)g_tick, version);
       }
 
@@ -977,6 +1063,13 @@ static int ort_container_main(int argc, FAR char *argv[])
    * 收尾（写回、释放、报告）。有界退出是滚动更新的前提条件。 */
 
   signal(SIGTERM, stop_sig_handler);
+  signal(SIGUSR2, active_sig_handler);   /* 监督者在提交点点名 */
+  g_domain = domain;
+
+  /* 不是 standby 就是现任：开机启动的实例立刻负责，
+   * 不需要任何人点名（它也没有前任）。 */
+
+  g_active = (i >= argc);
 
   /* 准入等待：容器创建与监督者绑域之间有窗口（见 ortmem 的说明） */
 
@@ -1038,8 +1131,7 @@ static int ort_container_main(int argc, FAR char *argv[])
            * 发布周期必须**明显短于**重启预算与启动窗口，
            * 否则接替者读到的是过期快照。 */
 
-          g_tick++;
-          publish_tick((uint32_t)version);
+          step_state((uint32_t)version);
           usleep(PUBLISH_PERIOD_US);
         }
 
@@ -1059,12 +1151,11 @@ static int ort_container_main(int argc, FAR char *argv[])
        * 而监督者的宽限期是有界的 —— 那样宽限期就形同虚设。 */
 
       {
-        int i;
+        int j;
 
-        for (i = 0; i < delay * 10 && !g_stop; i++)
+        for (j = 0; j < delay * 10 && !g_stop; j++)
           {
-            g_tick++;
-            publish_tick((uint32_t)version);
+            step_state((uint32_t)version);
             usleep(PUBLISH_PERIOD_US);
           }
       }
@@ -1092,7 +1183,8 @@ static int ort_container_main(int argc, FAR char *argv[])
  * 监督者
  ****************************************************************************/
 
-static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay);
+static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
+                    bool standby);
 
 /* 停止宽限期：容器必须在这么久内响应 SIGTERM 并退出。 */
 
@@ -1196,7 +1288,7 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
 
   spec->pid = -1;
 
-  if (start_cg(spec, "fault", spec->critical ? 8 : 3) != 0)
+  if (start_cg(spec, "fault", spec->critical ? 8 : 3, true) != 0)
     {
       printf("[ortsup]   ✗ 新实例起不来 → 放弃本次变更，旧实例继续\n");
       return false;
@@ -1238,6 +1330,14 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
 
   printf("[ortsup]   ✓ 新实例 pid=%d 已过启动窗口(%d ms) → 撤下旧实例 pid=%d\n",
          (int)newpid, waited, (int)live->pid);
+
+  /* ★ 顺序：先点名新实例（它开始发布自己的状态），再撤旧的
+   *   （旧的收到 SIGTERM 会立刻停止发布）。
+   *
+   *   反过来的话，中间会有一个"没人发布"的空档；虽然状态是快照
+   *   不是流，空档不至于出错，但会白白丢掉最后一段状态演进。 */
+
+  kill(newpid, SIGUSR2);
   stop_cg(live);
   return true;
 }
@@ -1424,7 +1524,7 @@ static int manifest_reload(void)
     {
       if (g_cgs[k].pid <= 0 && !g_cgs[k].failed)
         {
-          start_cg(&g_cgs[k], "fault", g_cgs[k].critical ? 8 : 3);
+          start_cg(&g_cgs[k], "fault", g_cgs[k].critical ? 8 : 3, false);
         }
     }
 
@@ -1456,9 +1556,10 @@ static bool admit_ok(FAR const struct ort_cg_s *cg)
          (g_caps & ORT_CAP_FAULT_HANDLER) != 0;
 }
 
-static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay)
+static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
+                    bool standby)
 {
-  FAR char *cargv[6];
+  FAR char *cargv[7];
   char vbuf[12];
   char dbuf[8];
   char lbuf[8];
@@ -1510,7 +1611,14 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay)
   cargv[2] = dbuf;
   cargv[3] = lbuf;
   cargv[4] = vbuf;
-  cargv[5] = NULL;
+  cargv[5] = standby ? (FAR char *)"standby" : NULL;
+  cargv[6] = NULL;
+
+  /* ★ 角色用 argv 传，不用信号。
+   *
+   *   信号有竞态：若在容器装好处理器之前到达，SIGUSR2 的**默认动作**
+   *   可能直接把新实例杀掉 —— 而那正是我们要它活着的时候。
+   *   argv 是出生时就定下的，没有这个窗口。 */
 
 #if defined(CONFIG_BUILD_KERNEL)
 
@@ -1660,7 +1768,9 @@ static void on_cg_failed(FAR struct ort_cg_s *cg)
       printf("[ortsup] %s: 重启 %d/%d\n", cg->name, cg->restarts,
              cg->max_restarts);
 
-      if (start_cg(cg, "fault", 1) != 0)
+      /* 故障重启：前身已经死了，没有重叠期 —— 它一上来就是现任 */
+
+      if (start_cg(cg, "fault", 1, false) != 0)
         {
           cg->failed = true;
           state_to(ORT_DEGRADED);
@@ -1862,8 +1972,8 @@ int main(int argc, FAR char *argv[])
    *    （那就是 T7：直接 NOMINAL → SAFE_STATE，同样正确）。
    */
 
-  if (start_cg(&g_cgs[0], "fault", boot_mode ? 0 : 3) != 0 ||
-      start_cg(&g_cgs[1], "fault", boot_mode ? 2 : 8) != 0)
+  if (start_cg(&g_cgs[0], "fault", boot_mode ? 0 : 3, false) != 0 ||
+      start_cg(&g_cgs[1], "fault", boot_mode ? 2 : 8, false) != 0)
     {
       state_to(ORT_BOOT_FAILED);
       return 1;
