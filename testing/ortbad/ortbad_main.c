@@ -184,6 +184,17 @@ int main(int argc, FAR char *argv[])
       cargv[1] = (FAR char *)"child";
       cargv[2] = NULL;
 
+      /* ★ `sup` 模式要**按路径**派生一个子进程 —— 那是 KERNEL 构建
+       *   （独立地址空间 + syscall 代理）才有的能力。
+       *   PROTECTED 构建（ORT-M）没有路径派生，容器是 `task_create`
+       *   按入口符号建的。所以这个模式在 M 上不可用 —— 明说，不假装。
+       *
+       *   （`hchild` / 默认模式不需要它，两个 SKU 都能跑。） */
+
+#ifndef CONFIG_BUILD_KERNEL
+      printf("[ortbad] sup 模式在非 KERNEL 构建（ORT-M）上不可用\n");
+      return 2;
+#else
       if (posix_spawn(&cpid, "/system/bin/ortbad", NULL, NULL,
                       cargv, NULL) != 0)
         {
@@ -193,6 +204,7 @@ int main(int argc, FAR char *argv[])
 
       printf("[ortbad] 容器 pid=%d 已派生，等它被终止...\n", (int)cpid);
       fflush(stdout);
+#endif
 
       /* ★ 不调用 waitpid()。
        *
