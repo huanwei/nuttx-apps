@@ -1545,15 +1545,43 @@ static int ort_container_main(int argc, FAR char *argv[])
   if (badptr)
     {
       uintptr_t bad = 0xdeadbe00u;
+      uint8_t   good[64];     /* 状态槽原型期定长 64 字节（内核侧 ORT_STATE_MAX） */
+      int       r;
 
-      printf("[ortsup] 容器 %d: 用未映射指针 %p 调 PR_ORT_STATE_PUT…\n",
+      /* ── 臂 1（处理）：未映射指针 ────────────────────────────────────
+       *
+       * ★ 必须打印**返回值**，不能只打印"内核活着回来了"。
+       *   "活着"本身不是证据：调用根本没走到 memcpy、或者返回值被
+       *   忽略，看起来都和"校验生效"一模一样 ——
+       *   §三·补三十三 第 6 节就是这么被自己的装置骗过一次的。
+       */
+
+      printf("[ortsup] 容器 %d: 臂1 未映射指针 %p → PR_ORT_STATE_PUT…\n",
              domain, (void *)bad);
       fflush(stdout);
 
-      (void)prctl(PR_ORT_STATE_PUT, bad, 64);
+      errno = 0;
+      r = prctl(PR_ORT_STATE_PUT, bad, 64);
 
-      printf("[ortsup] 容器 %d: *** 内核活着回来了 *** —— 这条路上有校验\n",
-             domain);
+      printf("[ortsup] 容器 %d: 臂1 返回 %d errno=%d  %s\n",
+             domain, r, errno,
+             (r < 0 || errno == EFAULT) ? "★ 被拒（内核活着）"
+                                        : "*** 没有被拒 ***");
+      fflush(stdout);
+
+      /* ── 臂 2（对照）：合法指针 ──────────────────────────────────────
+       *
+       * ★ 没有这一臂，"一律返回 -EFAULT" 也能让臂 1 通过。
+       *   两臂同一个二进制、同一次运行 —— 判别力全在这里。
+       */
+
+      memset(good, 0xa5, sizeof(good));
+      errno = 0;
+      r = prctl(PR_ORT_STATE_PUT, (uintptr_t)good, 64);
+
+      printf("[ortsup] 容器 %d: 臂2 合法栈指针 → 返回 %d errno=%d  %s\n",
+             domain, r, errno,
+             (r == 0) ? "★ 照常成功" : "*** 连合法指针都拒了 ***");
       fflush(stdout);
     }
 
