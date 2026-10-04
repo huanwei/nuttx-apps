@@ -1382,6 +1382,7 @@ static int ort_container_main(int argc, FAR char *argv[])
   int hammer = 0;                /* 测试装置：紧循环读写快照（撞撕裂窗口） */
   int burst = 0;                 /* 测试装置：不等延迟立即故障（撞事件队列） */
   int badptr = 0;                /* 测试装置：用非法用户指针调 ORT 接口 */
+  int badinsn = 0;               /* 测试装置：执行一条**未定义指令** */
   int delay = 0;
   int domain = 0;
   int version = 0;
@@ -1430,6 +1431,10 @@ static int ort_container_main(int argc, FAR char *argv[])
       else if (strcmp(argv[i], "badptr") == 0)
         {
           badptr = 1;
+        }
+      else if (strcmp(argv[i], "badinsn") == 0)
+        {
+          badinsn = 1;
         }
       else if (strcmp(argv[i], "nopub") == 0)
         {
@@ -1582,6 +1587,40 @@ static int ort_container_main(int argc, FAR char *argv[])
       printf("[ortsup] 容器 %d: 臂2 合法栈指针 → 返回 %d errno=%d  %s\n",
              domain, r, errno,
              (r == 0) ? "★ 照常成功" : "*** 连合法指针都拒了 ***");
+      fflush(stdout);
+    }
+
+  /* ── 测试装置：执行一条**未定义指令** ──────────────────────────────
+   *
+   * ★ 验的是另一个债：`arm_undefinedinsn`（A）/ `arm_usagefault`（M）
+   *   的处理器里**没有用户态判别**，无条件 panic。
+   *   而 data abort / prefetch abort 两条都被特意加过 ORT 处理。
+   *
+   *   如果容器能触发它 → 一个容器跳到自己的数据上（一个被写坏的
+   *   函数指针、一个坏 vtable 就够，**不需要恶意**）就能把整机打停机。
+   *   那与 §三·补三十三 同级：**容器拿到了终止整机的能力**。
+   *
+   *   判据很干净：
+   *     内核活着 → 这条路上有判别（债不成立）
+   *     内核没了 → 债成立，而且**任何容器**都能触发
+   *
+   * ⚠️ 用显式的未定义编码，不要靠"跳到一个随便的地址" ——
+   *   那样可能落到 prefetch abort（那条路已经被 ORT 处理过），
+   *   测出来的是另一条路。
+   */
+
+  if (badinsn)
+    {
+      printf("[ortsup] 容器 %d: 即将执行一条未定义指令…\n", domain);
+      fflush(stdout);
+
+#if defined(__thumb__)
+      __asm__ __volatile__(".short 0xde00");      /* Thumb UDF */
+#else
+      __asm__ __volatile__(".word 0xe7f000f0");   /* ARM  UDF */
+#endif
+
+      printf("[ortsup] 容器 %d: *** 内核活着回来了 ***\n", domain);
       fflush(stdout);
     }
 
@@ -2575,6 +2614,10 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
     else if (strncmp(cg->name, "badptr_", 7) == 0)
       {
         cargv[n++] = (FAR char *)"badptr";
+      }
+    else if (strncmp(cg->name, "badinsn_", 8) == 0)
+      {
+        cargv[n++] = (FAR char *)"badinsn";
       }
 
     cargv[n] = NULL;
