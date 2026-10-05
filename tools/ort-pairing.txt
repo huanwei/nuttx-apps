@@ -1,0 +1,14 @@
+# [ORT] 两仓库配对记录（手册 §三·补五十五）
+#
+# 含义：nuttx= 是**已被核验**的内核提交；与之配对的 apps 提交看本文件
+#       的 git 历史（每次更新它的是一个 apps 提交）。
+# 纪律：任一侧推送到 ort/13.0.1 后，**在 apps 侧**更新本文件并提交 ——
+#       把 nuttx= 更新到当时的内核 tip。一次推送 = 一次配对声明。
+# 机器检查：
+#   · CI        .github/workflows/ort-pairing.yml
+#   · 本地      tools/ort-check-pairing.sh --ci
+#   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
+#
+# 配对历史见 git log -p tools/ort-pairing.txt
+#
+nuttx=85445bc58fbf46dc7b279c521745312fc5ef3502
