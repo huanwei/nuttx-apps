@@ -477,32 +477,26 @@ int ort_container_main(int argc, FAR char *argv[])
   scenario = argv[1];
   domain   = atoi(argv[2]);
 
-  /* ★ 等待监督者绑域 —— 容器创建与绑域之间存在窗口。
+  /* ★ 等待监督者绑域 —— 内核阻塞等待（手册 §三·补五十/§三·补五十八）。
    *
-   * 为什么不能省：实测容器经常在监督者调 prctl 之前就被调度到
-   * （task_create → up_unblock_task 之间就可能切换），那时它是未绑定的，
-   * 第一次碰内存就直接 fault。
-   *
-   * 真实系统里这应该由「容器准入协议」保证 —— 监督者先建号、绑好域，
-   * 再放行容器执行。原型期用轮询把这件事显式化，而不是靠调度时序去赌。
+   * ★ 3 的迁移只做了 ortsup 侧，本装置一直是 usleep 轮询 —— 现在补齐：
+   *   与 ortsup 侧同一形态（`PR_ORT_WAIT_ADMISSION`，超时 fail-closed）。
+   *   为什么不能省：实测容器经常在监督者调 prctl 之前就被调度到
+   *   （task_create → up_unblock_task 之间就可能切换），那时它是未绑定的，
+   *   第一次碰内存就直接 fault。
    */
 
   {
-    int waited = 0;
+    int aret = (int)prctl(PR_ORT_WAIT_ADMISSION, 2000);
 
-    while (prctl(PR_GET_ORT_DOMAIN) < 0)
+    if (aret != 0)
       {
-        if (++waited > 2000)
-          {
-            printf("[ortmem] container: 等不到绑域，放弃\n");
-            return 1;
-          }
-
-        usleep(1000);
+        printf("[ortmem] container: 等不到绑域（ret=%d），放弃\n", aret);
+        return 1;
       }
 
-    printf("[ortmem] container: 准入通过，本容器域=%d（监督者指定 %d），"
-           "等了 %d ms\n", (int)prctl(PR_GET_ORT_DOMAIN), domain, waited);
+    printf("[ortmem] container: 准入通过，本容器域=%d（监督者指定 %d）\n",
+           (int)prctl(PR_GET_ORT_DOMAIN), domain);
   }
 
   if (strcmp(scenario, "basic") == 0)
