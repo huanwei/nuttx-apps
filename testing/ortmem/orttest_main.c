@@ -242,6 +242,20 @@ static void segv_return(int signo)
   fflush(stdout);
 }
 
+/* 场景：监督者注册鉴权（负例）。任务名 "ortsteal" 不在
+ * CONFIG_ORT_SUPERVISOR_TASKNAMES 白名单里 —— 即使槽位**空着**，
+ * 抢先注册也必须被 -EPERM 拒绝（旧代码"先到先得"下会成功）。 */
+
+static volatile int g_steal_done;
+static volatile int g_steal_ret;
+
+static int steal_task(int argc, FAR char *argv[])
+{
+  g_steal_ret  = prctl(PR_SET_ORT_SUPERVISOR);
+  g_steal_done = 1;
+  return g_steal_ret == -EPERM ? 0 : 4;
+}
+
 /* 场景 a：基础隔离。T1 写自有块（应成功），T2 写他域块（应 fault） */
 
 static void scene_basic(int domain)
@@ -281,8 +295,13 @@ static void scene_hijack(int domain)
 
   (void)domain;
 
+  /* 两层防线（顺序固定）：名字白名单（EPERM）在前，槽位钉住（EBUSY）在后。
+   * 容器名（"ortctnr"）不在白名单 → 这里应当拿到 EPERM；拿 0 才是没拦住。 */
+
   printf("[ortmem] HIJACK-SUPERVISOR RESULT: ret=%d (%s)\n", ret,
-         ret == -EBUSY ? "EBUSY —— 正确拒绝" : "*** 没拦住 ***");
+         ret == -EPERM  ? "EPERM —— 正确拒绝（白名单）"
+                       : ret == -EBUSY ? "EBUSY —— 正确拒绝（钉住）"
+                                       : "*** 没拦住 ***");
   fflush(stdout);
 }
 
@@ -576,10 +595,80 @@ int main(int argc, FAR char *argv[])
        *
        * 否则测的是"空槽位下能不能注册"—— 那当然成功，
        * 完全没有验证到「钉住」这条性质。（第一版就是这么写错的。）
+       *
+       * 注册鉴权上线后是**两层防线**，两臂分别验证：
+       *   臂① 容器名（"ortctnr"，非白名单）→ 白名单先拦（EPERM）
+       *   臂② **白名单内名字**（"orttest"）、但另一个任务 → 名字过关，
+       *        由**钉住**拦下（EBUSY）—— 这条才是钉住本身的性质。
        */
 
+      pid_t cpid;
+      int   i;
+      int   ok2;
+
       become_supervisor();
-      return run_container("hijack", 0);
+
+      /* 臂①（容器侧自打印判决；退出码不聚合） */
+
+      run_container("hijack", 0);
+
+      /* 臂②：白名单内名字 + 不同任务 */
+
+      g_steal_done = 0;
+      g_steal_ret  = 0;
+
+      cpid = task_create("orttest", CONTAINER_PRIO, CONTAINER_STACK,
+                         steal_task, NULL);
+      if (cpid < 0)
+        {
+          printf("[ortmem] FAIL: task_create = %d\n", (int)cpid);
+          return 1;
+        }
+
+      for (i = 0; i < 300 && !g_steal_done; i++)
+        {
+          usleep(10000);
+        }
+
+      ok2 = (g_steal_done && g_steal_ret == -EBUSY);
+      printf("[ortmem] PIN VERDICT: %s (ret=%d)\n",
+             ok2 ? "PASS（EBUSY——钉住）" : "*** FAIL ***", g_steal_ret);
+      return ok2 ? 0 : 4;
+    }
+
+  /* --- 监督者注册鉴权：非白名单任务抢先注册必须被拒 --------------------- */
+
+  if (strcmp(mode, "steal") == 0)
+    {
+      /* ★ 负例设计：**槽位此刻是空的**（本进程没注册过）。
+       *   旧代码（先到先得）下这个注册会**成功** —— 正是那条缺口；
+       *   白名单下它必须被 -EPERM 拒绝。
+       *   对照组 = 另跑一次 `orttest selfsup` 的前半（本进程名字在
+       *   白名单里，槽位空时注册应当成功）。两臂合起来才是完整判据。
+       *
+       *   等待用轮询标志位（不用 waitpid —— 见本仓库既有的
+       *   "已死的子进程收不了"教训）。
+       */
+
+      pid_t cpid = task_create("ortsteal", CONTAINER_PRIO, CONTAINER_STACK,
+                               steal_task, NULL);
+      int   i;
+
+      if (cpid < 0)
+        {
+          printf("[ortmem] FAIL: task_create = %d\n", (int)cpid);
+          return 1;
+        }
+
+      for (i = 0; i < 300 && !g_steal_done; i++)
+        {
+          usleep(10000);
+        }
+
+      printf("[ortmem] STEAL VERDICT: %s (ret=%d)\n",
+             (g_steal_done && g_steal_ret == -EPERM) ? "PASS" : "*** FAIL ***",
+             g_steal_ret);
+      return (g_steal_done && g_steal_ret == -EPERM) ? 0 : 4;
     }
 
   /* --- 容器不能自己申报域（非监督者调用应被拒）-------------------------- */
@@ -781,7 +870,8 @@ int main(int argc, FAR char *argv[])
   printf("用法:\n"
          "  orttest probe        未绑定任务写域块（负向对照，应 fault）\n"
          "  orttest selfbind     容器自己申报域（应被 -EPERM 拒绝）\n"
-         "  orttest selfsup      容器抢占监督者槽位（应被 -EBUSY 拒绝）\n"
+         "  orttest selfsup      抢占监督者槽位两臂（EPERM 白名单 / EBUSY 钉住）\n"
+         "  orttest steal        非白名单任务抢先注册（应被 -EPERM 拒绝）\n"
          "  orttest <0|1|2|3>    绑域 N：T1 自有块应成功，T2 他域块应 fault\n"
          "  orttest conc         4 个容器并发跨域抢占\n"
          "  orttest share        同容器 2 线程共享一个域\n"
