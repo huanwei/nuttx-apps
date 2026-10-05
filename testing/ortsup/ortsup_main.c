@@ -1537,17 +1537,16 @@ static int ort_container_main(int argc, FAR char *argv[])
    */
 
   {
-    int waited = 0;
+    /* ── ③ 准入协议（2026-10-05，手册 §三·补五十）──────────────────
+     *   原来这里是用户态轮询（usleep(1000) × 2000）。现在一次
+     *   内核阻塞等待（带超时）—— 不占 CPU，超时 fail-closed。 */
 
-    while (prctl(PR_GET_ORT_DOMAIN) < 0)
+    int ret = prctl(PR_ORT_WAIT_ADMISSION, 2000);
+
+    if (ret < 0)
       {
-        if (++waited > 2000)
-          {
-            printf("[ortsup] 容器 %d: 等不到绑域\n", domain);
-            return 1;
-          }
-
-        usleep(1000);
+        printf("[ortsup] 容器 %d: 等不到绑域（ret=%d）\n", domain, ret);
+        return 1;
       }
   }
 
@@ -3013,6 +3012,24 @@ int main(int argc, FAR char *argv[])
    *
    * ★ 它是**运行期**旋钮：对照的两臂跑同一个二进制。
    *   换编译再跑，就分不清是变量变了还是编译变了。 */
+
+  /* ── ③ 准入协议·负例装置：未绑域任务等待准入 → 必须超时（fail-closed）─
+   *
+   *   本任务（NSH 内建或独立运行）没有、也不会有监督者来绑域 ——
+   *   判据 = 在**指定时间内**返回 -ETIMEDOUT，且期间 CPU 不空转
+   *   （内核信号量等待）。 */
+
+  if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "waitadm") == 0)
+    {
+      unsigned ms  = (unsigned)atoi(argv[2]);
+      int      ret = prctl(PR_ORT_WAIT_ADMISSION, ms);
+
+      printf("[ortsup] WAITADM RESULT: ret=%d (%s)\n", ret,
+             ret == -ETIMEDOUT ? "ETIMEDOUT —— 正确（fail-closed）"
+                               : (ret == 0 ? "*** 不该成功：本任务没被绑域 ***"
+                                           : "其它错误"));
+      return ret == -ETIMEDOUT ? 0 : 4;
+    }
 
   if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "nosig") == 0)
     {
