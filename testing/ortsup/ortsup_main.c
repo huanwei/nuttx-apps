@@ -270,6 +270,7 @@ static int      g_audit_gap;     /* 累计缺口（丢了但账对得上） */
 static int      g_audit_bad;     /* 累计异常（倒退/重复） */
 static int      g_audit_acct;    /* 累计记账错（Δlost ≠ 缺口）—— R4 的判据 */
 static uint32_t g_drained;       /* 排出的事件总数（只用于给打印限流） */
+static uint32_t g_exit_count;    /* 退出事件（kind=1）累计条数 */
 
 /* ── 记录**内部一致性**审计（R2/R5 的判据）───────────────────────────
  *
@@ -1074,6 +1075,25 @@ static void drain_faults(void)
       g_ev_count++;
       g_ev_lost = (int)rec.lost;
 
+      /* ★ 事件分型（2026-10-05，手册 §三·补四十九）：kind=1 = 容器
+       *   **正常退出**。与故障同走上面的审计（seq 连续性 / 缺口记账
+       *   一体生效），但**不进故障路径** —— 不触发重启计数、不改
+       *   CG 状态：退出 ≠ 故障。（有故障史的容器不发 EXIT 事件。） */
+
+      if (rec.kind == 1)
+        {
+          if (g_drained < 8)
+            {
+              printf("[ortsup] ← 退出事件 #%u victim=%d code=%d\n",
+                     (unsigned)rec.seq, rec.victim, (int)rec.code);
+              fflush(stdout);
+            }
+
+          g_exit_count++;
+          g_drained++;
+          continue;
+        }
+
       /* ★ 逐条打印会淹没其它一切输出 —— 上一轮 R1/R4 的两次尝试
        *   就是这么失败的（注入者的刷屏把监督者的启动日志整个冲掉，
        *   结果连容器都没起来）。这里只对**打印**限流，
@@ -1383,6 +1403,7 @@ static int ort_container_main(int argc, FAR char *argv[])
   int burst = 0;                 /* 测试装置：不等延迟立即故障（撞事件队列） */
   int badptr = 0;                /* 测试装置：用非法用户指针调 ORT 接口 */
   int badinsn = 0;               /* 测试装置：执行一条**未定义指令** */
+  int exit0 = 0;                 /* 测试装置：正常退出（撞"退出事件"通道） */
   int delay = 0;
   int domain = 0;
   int version = 0;
@@ -1435,6 +1456,10 @@ static int ort_container_main(int argc, FAR char *argv[])
       else if (strcmp(argv[i], "badinsn") == 0)
         {
           badinsn = 1;
+        }
+      else if (strcmp(argv[i], "exit0") == 0)
+        {
+          exit0 = 1;
         }
       else if (strcmp(argv[i], "nopub") == 0)
         {
@@ -1888,6 +1913,21 @@ static int ort_container_main(int argc, FAR char *argv[])
    *
    *   "故障要快"这件事由**监督者的重启路径**决定：它对 burst_ 前缀的
    *   CG 传 0 延迟。容器只管照 argv 办。 */
+
+  /* 测试装置：正常退出 —— 撞"退出事件"通道（kind=1）。
+   *
+   * 位置很要紧：在**准入之后**（域已绑 → 组有 tg_ort_domain）、
+   * 注入故障之前，主动 _exit(0)。容器是活着走到终点的、没有任何
+   * 故障史 —— 正是退出事件要覆盖的那种死亡；在准入前退出的组
+   * 没绑域，内核的钩子会（正确地）不报。 */
+
+  if (exit0)
+    {
+      printf("[ortsup] 容器(domain %d): **正常退出模式** —— 主动 _exit(0)\n",
+             domain);
+      fflush(stdout);
+      _exit(0);
+    }
 
   (void)burst;
   if (delay > 0)
@@ -2618,6 +2658,10 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
     else if (strncmp(cg->name, "badinsn_", 8) == 0)
       {
         cargv[n++] = (FAR char *)"badinsn";
+      }
+    else if (strncmp(cg->name, "exit0_", 6) == 0)
+      {
+        cargv[n++] = (FAR char *)"exit0";
       }
 
     cargv[n] = NULL;
