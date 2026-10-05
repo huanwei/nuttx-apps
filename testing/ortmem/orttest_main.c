@@ -687,6 +687,91 @@ int main(int argc, FAR char *argv[])
       return ret == -EPERM ? 0 : 4;
     }
 
+  /* --- 域配额执法装置（手册 §三·补五十四）-------------------------------- */
+
+  if (strcmp(mode, "domquota") == 0)
+    {
+      int cap;
+      int ret;
+
+      printf("[ortmem] === 域配额执法装置（内核层）===\n");
+
+      /* 臂1：容量查询（无权限要求 —— 只读标量） */
+
+      cap = (int)prctl(PR_GET_ORT_DOMCAP);
+      printf("[ortmem] 臂1 容量查询: ret=%d %s\n", cap,
+             cap >= 1 ? "★" : "*** 异常 ***");
+
+      /* 臂2：**非**监督者设配额 → EPERM（此刻本进程还没注册）。
+       *   与 selfbind 同规矩：配额分配权就是绑域权。 */
+
+      ret = (int)prctl(PR_SET_ORT_DOMQUOTA, 1);
+      printf("[ortmem] 臂2 非监督者设配额: ret=%d %s\n", ret,
+             ret == -EPERM ? "★ EPERM 正确" : "*** 没拦住 ***");
+
+      become_supervisor();
+
+      /* 臂3：超容量 → EINVAL（信封是容量） */
+
+      ret = (int)prctl(PR_SET_ORT_DOMQUOTA, cap + 1);
+      printf("[ortmem] 臂3 配额 %d 超容量 %d: ret=%d %s\n", cap + 1, cap,
+             ret, ret == -EINVAL ? "★ EINVAL 正确" : "*** 没拦住 ***");
+
+      /* 臂4：容量内设 2 → OK */
+
+      ret = (int)prctl(PR_SET_ORT_DOMQUOTA, 2);
+      printf("[ortmem] 臂4 设配额 2: ret=%d %s\n", ret,
+             ret == 0 ? "★ 已生效" : "*** 失败 ***");
+
+      /* 臂5（**对照臂**）：预算内域 1 绑定照常成功 ——
+       *   没有它，"一律拒绝"也能让臂6通过（§三·补三十四 §9 的教训）。
+       *   scenario 用 "noop"：容器等准入通过后不匹配任何场景、
+       *   直接干净退出（收尸即 waitpid 返回）。 */
+
+      {
+        int r5 = run_container("noop", 1);
+
+        printf("[ortmem] 臂5 对照·绑定域 1（预算 2 内）: %s\n",
+               r5 == 0 ? "★ PASS（照常）" : "*** FAIL ***");
+      }
+
+      /* 臂6（**被判据**）：域 2 == 配额 → -EINVAL。
+       *   形状照 run_container，但绕过它给非零返回打的 FAIL 打印 ——
+       *   这里返回非零是**预期**。容器绑不上会等准入超时后自行退出。 */
+
+      {
+        FAR char *cargv[3];
+        char dbuf[8];
+        pid_t cpid;
+        int status;
+
+        snprintf(dbuf, sizeof(dbuf), "%d", 2);
+        cargv[0] = (FAR char *)"noop";
+        cargv[1] = dbuf;
+        cargv[2] = NULL;
+
+        cpid = task_create("ortctnr", CONTAINER_PRIO, CONTAINER_STACK,
+                           ort_container_main, cargv);
+        if (cpid < 0)
+          {
+            printf("[ortmem] 臂6 FAIL: task_create = %d\n", (int)cpid);
+            return 1;
+          }
+
+        ret = (int)prctl(PR_SET_ORT_DOMAIN, 2, (int)cpid);
+        printf("[ortmem] 臂6 绑定域 2（== 配额）: ret=%d %s\n", ret,
+               ret == -EINVAL ? "★ EINVAL 正确（被拒）"
+                              : "*** 没拦住 ***");
+
+        while (waitpid(cpid, &status, 0) < 0 && errno == EINTR)
+          {
+          }
+      }
+
+      printf("[ortmem] DOMQUOTA RESULT: 见上（臂1/2/3/4/5/6 各 ★ 即 PASS）\n");
+      return 0;
+    }
+
   /* --- 监督者通道：容器故障必须通知到监督者 ----------------------------- */
 
   if (strcmp(mode, "supervise") == 0)

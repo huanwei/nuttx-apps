@@ -424,6 +424,13 @@ static int cfg_fetch(FAR char *buf, size_t cap)
 
 static int g_mf_startup_ms = STARTUP_WINDOW_MS;
 
+/* ④ 域预算（手册 §三·补五十四）：0 = 未设。
+ * ★ 自包含语义：每次解析**从 0 开始**（显式重置，见 manifest_parse 开头），
+ *   不沿用上一份 manifest 的值 —— 每份部署自己说清楚要用多少域，
+ *   隐式继承会让"这份配置到底允许几个域"变成需要翻历史才能回答的问题。 */
+
+static int g_mf_maxdomains;
+
 static char g_mf_buf[160];
 static FAR const char *g_mf_err;   /* 校验失败说明（指向 g_mf_buf，不分配） */
 
@@ -452,6 +459,18 @@ static void mf_err(int lineno, FAR const char *msg)
  *   manifest 拒在了第 5 行（就是那个空行）。
  *   把 \r \n 归进空白集，两处一起解决。
  */
+
+/* 把本份 manifest 的域预算提交给内核（手册 §三·补五十四）。
+ * 自包含语义：不写 max_domains = **显式设回容量**，不沿用旧配额。
+ * 返回 0 或负值（prctl 直接返回负 errno）。 */
+
+static int mf_apply_quota(void)
+{
+  int cap = (int)prctl(PR_GET_ORT_DOMCAP);
+  int n   = g_mf_maxdomains > 0 ? g_mf_maxdomains : cap;
+
+  return (int)prctl(PR_SET_ORT_DOMQUOTA, n);
+}
 
 static FAR char *mf_trim(FAR char *s)
 {
@@ -577,6 +596,7 @@ static int manifest_parse(FAR const char *text, size_t len,
 
   *ncgs = 0;
   g_mf_err = NULL;
+  g_mf_maxdomains = 0;   /* 自包含：不沿用上一份（见变量处说明） */
 
   /* ★ 解析的是**内存里的字节**，不是文件。
    *
@@ -735,6 +755,18 @@ static int manifest_parse(FAR const char *text, size_t len,
               if (!mf_int(val, &g_mf_startup_ms))
                 {
                   mf_err(lineno, "startup_timeout_ms 必须是十进制非负整数");
+                  goto fail;
+                }
+            }
+          else if (strcmp(key, "max_domains") == 0)
+            {
+              /* ④ 域预算（手册 §三·补五十四）：本部署允许用的域数。
+               *   语义 = "域号 ∈ [0, max_domains)"；省略 = 容量。
+               *   上界（≤ 容量）在整体校验里对着**本构建的真实容量**查。 */
+
+              if (!mf_int(val, &g_mf_maxdomains) || g_mf_maxdomains < 1)
+                {
+                  mf_err(lineno, "max_domains 必须是 ≥ 1 的整数");
                   goto fail;
                 }
             }
@@ -899,6 +931,49 @@ static int manifest_parse(FAR const char *text, size_t len,
           }
       }
     }
+
+  /* ★ 域预算校验（手册 §三·补五十四）：对着**本构建的真实容量**查。
+   *
+   *   这正是这个字段存在的理由 —— 此前 manifest 的 domain 只能"猜"
+   *   编译期常量，猜错了要等绑域时才失败（-EINVAL），部署方看不出
+   *   是配置错还是机制坏。现在在**载入时**失败，且说清预算是多少。
+   *
+   *   容量由内核给出（PR_GET_ORT_DOMCAP）—— 两个 SKU 的容量含义一致：
+   *   域号能被**完整功能**支撑的个数（M=池块数，A=状态槽数）。
+   */
+
+  {
+    int cap    = (int)prctl(PR_GET_ORT_DOMCAP);
+    int budget;
+
+    if (cap < 1)
+      {
+        mf_err(0, "查询域容量失败 —— 拒绝按猜的预算启动");
+        goto fail;
+      }
+
+    if (g_mf_maxdomains > cap)
+      {
+        mf_err(0, "max_domains 超出本构建的域容量（域池装不下）");
+        goto fail;
+      }
+
+    budget = g_mf_maxdomains > 0 ? g_mf_maxdomains : cap;
+
+    for (k = 0; k < n; k++)
+      {
+        if (cgs[k].domain >= budget)
+          {
+            char mbuf[96];
+
+            snprintf(mbuf, sizeof(mbuf),
+                     "CG %s 的 domain=%d 超出域预算 %d"
+                     "（内核会拒绝绑域）", cgs[k].name, cgs[k].domain, budget);
+            mf_err(0, mbuf);
+            goto fail;
+          }
+      }
+  }
 
   *ncgs = n;
   return OK;
@@ -2375,6 +2450,17 @@ static int manifest_reload(void)
 
   g_reload_lasterr[0] = '\0';   /* 成功一次就把折叠状态清掉 */
 
+  /* 域预算随配置一起生效（手册 §三·补五十四）。解析时已按容量校验过，
+   * 这里失败只可能是内核侧 ABI 问题 —— 在任何提交动作**之前**做，
+   * 保证"拒绝 = 什么都没动"（此刻连已删除的 CG 都还没停）。 */
+
+  if (mf_apply_quota() != 0)
+    {
+      printf("[ortsup] *** 拒绝新配置: 域配额设置失败 ***\n");
+      fflush(stdout);
+      return -EINVAL;
+    }
+
   /* ── 已删除的 CG：停掉 ───────────────────────────────────────────── */
 
   for (k = 0; k < n_prev; k++)
@@ -3312,7 +3398,17 @@ int main(int argc, FAR char *argv[])
         return 2;
       }
 
-    /* 解析成功才提交（见 g_mf_startup_ms 的说明） */
+    /* 解析成功才提交（见 g_mf_startup_ms 的说明）。
+     * 域预算提交在最前：失败就整个拒绝启动（解析已校验过范围，
+     * 走到失败只能是内核 ABI 不匹配 —— 那不该按猜的继续跑）。 */
+
+    if (mf_apply_quota() != 0)
+      {
+        printf("[ortsup] *** 拒绝启动: 域配额设置失败 ***\n");
+        printf("[ortsup] 系统状态: BOOT_FAILED（锁存）\n");
+        fflush(stdout);
+        return 2;
+      }
 
     g_startup_window_ms = g_mf_startup_ms;
     g_last_cfg_seq      = (int)prctl(PR_GET_ORT_CFG_SEQ);
@@ -3334,6 +3430,24 @@ int main(int argc, FAR char *argv[])
                g_cgs[k].critical ? "关键" : "非关键",
                g_cgs[k].max_restarts,
                g_cgs[k].handles_fault ? "true" : "false");
+      }
+  }
+
+  /* 域预算行（手册 §三·补五十四）：把"本部署允许几个域 / 本构建容量
+   * 多少"摆在 banner 上 —— 部署方不必翻代码找编译期常量。 */
+
+  {
+    int cap = (int)prctl(PR_GET_ORT_DOMCAP);
+
+    if (g_mf_maxdomains > 0)
+      {
+        printf("[ortsup] 域预算: %d（容量 %d，配额 %d）\n",
+               g_mf_maxdomains, cap, g_mf_maxdomains);
+      }
+    else
+      {
+        printf("[ortsup] 域预算: %d（容量 %d，未设配额 = 全容量）\n",
+               cap, cap);
       }
   }
 
