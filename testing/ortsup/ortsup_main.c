@@ -29,12 +29,13 @@
  *
  * ★ 启动期 vs 运行期的分界（H29 的答案）：
  *
- *   两套策略需要一个**判据**才能切换。本原型采用：
+ *   两套策略需要一个**判据**才能切换。本原型采用**两级判据**（④）：
  *
- *     就绪判据 = 「已准入（监督者绑完域）且经过 STARTUP_WINDOW_MS 无故障」
+ *     就绪判据 = 「已准入（监督者绑完域）且（容器已上报就绪 或
+ *                 经过 STARTUP_WINDOW_MS）且无故障」
  *
- *   窗口内失效 → 走 §6 startup.onContainerGroupFail（全系统一套策略）
- *   窗口后失效 → 走 runtime.defaultOnFailure（可被单个 CG 覆盖）
+ *   窗口内失效（且未上报就绪）→ §6 startup.onContainerGroupFail（全系统一套）
+ *   已上报就绪后失效，或窗口后失效 → runtime.defaultOnFailure（单 CG 可覆盖）
  *
  *   为什么不是"BOOT 状态结束"作为分界：
  *     BOOT 是**监督者**的状态，容器是异步的 —— 监督者宣布 BOOT 完成时，
@@ -45,10 +46,19 @@
  *     然后坏了"。前者是**部署问题**（该进安全态或拒绝启动），
  *     后者是**运行时问题**（可以先重启）。两者的正确响应完全不同。
  *
- *   用 STARTUP_WINDOW_MS 而不是容器主动上报 ready：
- *     主动上报更精确，但需要容器配合 —— 而公理 S1 要求不信任失效组件。
- *     超时窗口是**监督者单方面可判定**的，不依赖容器善意。
- *     正式实现可以两者结合：上报 ready 提前结束窗口，超时兜底。
+ *   为什么是"上报 + 窗口"两级，而不是只用其中一级：
+ *     窗口是**监督者单方面可判定**的判据（公理 S1：不信任失效组件）——
+ *     它必须保留做兜底。但只看窗口会把"起得多快"钉死在窗口长度上：
+ *     容器 100 ms 就绪，系统仍要等满窗口才敢进 NOMINAL。
+ *     所以加一级**容器主动上报**（PR_ORT_READY，见手册 §三·补五十一）：
+ *     上报即结束**本 CG** 的启动窗口，之后的失效按运行期处理
+ *     （"它跑过了、然后坏了"）。不上报的容器不受影响，仍由窗口兜底。
+ *
+ *   ⚠️ 上报的诚实边界：上报不构成对容器的信任 —— 内核只允许容器声明
+ *     **自己**的组（别的组声明不了，见 task_prctl.c 的 PR_ORT_READY），
+ *     且上报只改变**归因**（startup/runtime），不改变任何资源边界。
+ *     "报了就坏"的容器被归到运行期：非关键 → 有界重启后降级；
+ *     关键 → 仍是立即安全动作。这是协议接受的代价，不是漏洞。
  *
  * ★ 本原型要演示的两条性质：
  *
@@ -231,6 +241,7 @@ struct ort_cg_s
   int             faults;
   bool            failed;        /* 已失效且不再重启 */
   int             admitted_ms;   /* 被准入的时刻（-1 = 尚未准入） */
+  int             ready;         /* ④ 就绪上报（当前实例；新实例重置为 0） */
 };
 
 /* CG 表**由 manifest 填**，不再写死在源码里。
@@ -1336,6 +1347,12 @@ static void step_state(uint32_t *tick, int *announced, int standby, int nopub,
 
       if (!nopub)          /* 测试装置：装作"没实现发布"的容器 */
         {
+          /* ④ 就绪上报（手册 §三·补五十一）：容器宣布"我起来了" ——
+           *   此后失效按运行期处理；不宣布的由启动窗口兜底。
+           *   （nopub 装置同时充当"从不就绪"的对照臂。） */
+
+          prctl(PR_ORT_READY);
+
           publish_tick(*tick, version);
         }
 
@@ -2168,10 +2185,13 @@ static void audit_protocol(void)
  *   正确的顺序是这个函数：旧的继续服务，新的在旁边起来，
  *   跑完启动窗口证明自己没坏，然后才把旧的撤下。
  *
- * "证明"用什么判据 —— 复用既有的启动窗口（STARTUP_WINDOW_MS）：
- *   它是**监督者单方面可判定**的，不依赖容器上报 ready
- *   （见文件头"用 STARTUP_WINDOW_MS 而不是容器主动上报 ready"）。
- *   一个新实例能撑过启动窗口不失效，就认为它可以接管。
+ * "证明"用什么判据 —— 仍是启动窗口（STARTUP_WINDOW_MS）本身：
+ *   这里的证明对象是"新实例能**撑过**窗口不崩"，而不是"它报没报就绪" ——
+ *   standby 实例在转正前不当 owner、不走 step_state，也就不会上报
+ *   （见容器入口的 am_owner 判断）。
+ *   ⚠️ 把 ④ 的 ready 上报也用到替换路径（转正前就报"已初始化、可接管"，
+ *   缩短双实例重叠期）是一个**未收口项** —— 它会改变 standby 的语义，
+ *   见手册 §三·补五十一的未收口清单。
  *
  * Returned Value:
  *   true  = 已提交（旧的已停，spec->pid 是新的）
@@ -2752,6 +2772,7 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
 
   cg->pid         = pid;
   cg->admitted_ms = g_now_ms;    /* ★ 准入时刻 —— 启动窗口从这里开始算 */
+  cg->ready       = 0;           /* ★ 新实例从头开始 —— 就绪必须由它自己宣布 */
   return 0;
 }
 
@@ -2775,8 +2796,13 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
 
 static bool in_startup(FAR struct ort_cg_s *cg)
 {
+  /* ④ 就绪上报（手册 §三·补五十一）：容器宣布就绪即**提前结束**它的
+   * 启动窗口 —— 之后的失效按运行期处理。未上报的仍由窗口兜底
+   * （公理 S1：不配合的容器不能拖住系统）。 */
+
   return g_state == ORT_BOOT &&
          cg->admitted_ms >= 0 &&
+         !cg->ready &&
          (g_now_ms - cg->admitted_ms) < g_startup_window_ms;
 }
 
@@ -3525,8 +3551,33 @@ int main(int argc, FAR char *argv[])
               if (g_cgs[i].pid == (pid_t)victim)
                 {
                   g_cgs[i].pid = -1;
+
+                  /* ⚠️ 就绪位**不能**在这里清（曾经犯过这个错）：
+                   *   on_cg_failed 要先用它判"这次失效算启动期还是运行期"
+                   *   —— ④ 的归因输入正是「出事那一刻它报没报就绪」。
+                   *   在判因之前清位 ⇒ BOOT 状态下的每次失效都被归到
+                   *   启动期，就绪上报**永远不起作用**，而且看起来像
+                   *   "S1 兜底照常工作"（假通过）。
+                   *   清位是**新实例**的事：start_cg 已经做了。 */
+
                   on_cg_failed(&g_cgs[i]);
                   break;
+                }
+            }
+        }
+
+      /* ④ 就绪位刷新（手册 §三·补五十一）：监督者**单方面**读内核里的
+       * 一个位 —— 轮询的是位、不是等容器做什么；容器死了/没上报都
+       * 推不出"已就绪"。 */
+
+      if (g_state == ORT_BOOT)
+        {
+          for (i = 0; i < (int)NCGS; i++)
+            {
+              if (!g_cgs[i].failed && g_cgs[i].pid > 0)
+                {
+                  g_cgs[i].ready =
+                    prctl(PR_GET_ORT_READY, (int)g_cgs[i].pid) == 1;
                 }
             }
         }
