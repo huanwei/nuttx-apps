@@ -1,11 +1,16 @@
 config TESTING_ORTIMG
 	tristate "[ORT-A] ort_image 原型（A1：受限 JSON / OCI manifest）"
 	default n
+	select LIB_ZLIB
 	---help---
 		[ORT-A / A1] ORT-A 镜像管理的第一块砖（手册 §三·补六十一）。
 
-		当前内容：受限 JSON 解析器 + OCI image manifest 提取（白名单）。
-		设计三条钉死：无动态分配 / 深度有界 / 字段白名单（见 ort_json.h）。
+		当前内容：受限 JSON 解析器 + OCI image manifest 提取（白名单）
+		+ registry pull + sha256 校验 + tar/gzip 解包 + unionfs 挂载视图。
+		设计三条钉死：无动态分配（自身）/ 深度有界 / 字段白名单。
+
+		select LIB_ZLIB：层体多为 tar+gzip，ort_tar 的解压路径需要 zlib
+		（apps/system/zlib；构建时一次性拉取并解包 zlib13.zip）。
 
 		用法：ortimg jsontest（双环境电池）/ manifest <path> / validate <path>
 		目标机上 /system 是 hostfs，夹具路径照仓库树写：

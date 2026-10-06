@@ -730,7 +730,8 @@ struct tcollect_s
 };
 
 static int tcollect_sink(FAR void *arg,
-                         FAR const struct ort_tar_entry_s *e, FAR FILE *f)
+                         FAR const struct ort_tar_entry_s *e,
+                         FAR struct ort_tar_src_s *src)
 {
   FAR struct tcollect_s *c = (FAR struct tcollect_s *)arg;
   int i = c->n;
@@ -755,8 +756,9 @@ static int tcollect_sink(FAR void *arg,
         {
           size_t want = (e->size < sizeof(c->data[0]) - 1) ?
                         (size_t)e->size : sizeof(c->data[0]) - 1;
+          int r = src->read(src->arg, c->data[i], want);
 
-          c->dlen[i] = fread(c->data[i], 1, want, f);
+          c->dlen[i] = (r > 0) ? (size_t)r : 0;
           c->data[i][c->dlen[i]] = '\0';
         }
     }
@@ -794,9 +796,41 @@ static int tar_run(FAR FILE *out, FAR const char *name, FAR uint32_t *nent,
   return ret;
 }
 
-/* 用例数（T1-T14；tar 用例是命令式写的，没有表可数 —— 增删必须同步） */
+/* 任意字节落临时文件后走文件入口（gzip 素材用） */
 
-#define ORT_NTARCASES 14
+static int tar_run_bytes(FAR FILE *out, FAR const char *name,
+                         FAR const void *p, size_t n,
+                         FAR uint32_t *nent, FAR struct tcollect_s *c)
+{
+  static const char *tmp = "/tmp/ort-ttest.gz";
+  FAR FILE *f = fopen(tmp, "wb");
+  int ret;
+
+  if (f == NULL)
+    {
+      fprintf(out, "[ttest] FAIL %s: 临时文件开不了\n", name);
+      return -100;
+    }
+
+  fwrite(p, 1, n, f);
+  fclose(f);
+
+  memset(c, 0, sizeof(*c));
+  f = fopen(tmp, "rb");
+  if (f == NULL)
+    {
+      fprintf(out, "[ttest] FAIL %s: 临时文件读不了\n", name);
+      return -100;
+    }
+
+  ret = ort_tar_walk(f, tcollect_sink, c, nent);
+  fclose(f);
+  return ret;
+}
+
+/* 用例数（T1-T18；tar 用例是命令式写的，没有表可数 —— 增删必须同步） */
+
+#define ORT_NTARCASES 18
 
 static int ort_tar_battery_run(FAR FILE *out)
 {
@@ -1025,7 +1059,7 @@ static int ort_tar_battery_run(FAR FILE *out)
       fprintf(out, "[ttest] ok   T12 size 非八进制 → SYNTAX\n");
     }
 
-  /* T13 gzip 魔数 → 明确报 GZIP */
+  /* T13 gzip 魔数但内容坏 → GZIP（§66 起 gzip 已支持，此为解压失败） */
 
   timg_reset();
   g_timg[0] = 0x1f;
@@ -1034,13 +1068,13 @@ static int ort_tar_battery_run(FAR FILE *out)
   ret = tar_run(out, "T13", &nent, &c);
   if (ret != ORT_TAR_E_GZIP)
     {
-      fprintf(out, "[ttest] FAIL T13 gzip: got=%s expect=GZIP\n",
+      fprintf(out, "[ttest] FAIL T13 gzip 坏数据: got=%s expect=GZIP\n",
               ort_tar_strerror(ret));
       fails++;
     }
   else
     {
-      fprintf(out, "[ttest] ok   T13 gzip 魔数 → GZIP（明确不收）\n");
+      fprintf(out, "[ttest] ok   T13 gzip 头但数据坏 → GZIP（解压失败）\n");
     }
 
   /* T14 v7 老式目录（type '0' + 名尾 /） */
@@ -1060,6 +1094,93 @@ static int ort_tar_battery_run(FAR FILE *out)
     {
       fprintf(out, "[ttest] ok   T14 v7 老式目录（名尾 /）\n");
     }
+
+  /* T15-T18：gzip（§66）—— 烧死的小素材（python gzip -9, mtime=0 生成，
+   * 内含单文件 gz/a.txt="gz-ok\n"；raw=10240B，gz=108B）+ 两个坏例 */
+
+  {
+    static const uint8_t gzblob[] =
+    {
+      0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xed, 0xcd,
+      0x31, 0x0e, 0x82, 0x40, 0x10, 0x05, 0xd0, 0xa9, 0x3d, 0x85, 0x17, 0x40,
+      0x09, 0x6c, 0xf4, 0x3c, 0x54, 0x14, 0x16, 0x24, 0xb0, 0x24, 0x84, 0xd3,
+      0xb3, 0x58, 0x19, 0x7b, 0x4d, 0x08, 0xef, 0x35, 0x7f, 0xf2, 0x7f, 0x31,
+      0xfd, 0x7a, 0xef, 0x6e, 0x79, 0xc9, 0xf1, 0x43, 0x75, 0xf1, 0x48, 0xe9,
+      0x9d, 0xc5, 0x77, 0xee, 0xeb, 0xc7, 0xbd, 0xf7, 0xcf, 0x36, 0x35, 0x71,
+      0xad, 0xe3, 0x0f, 0xe6, 0x29, 0x77, 0x63, 0x79, 0x19, 0xe7, 0xd4, 0xaf,
+      0xd5, 0xf0, 0xba, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x07, 0xb3, 0x01, 0xf6, 0x73, 0xb8, 0xf1, 0x00, 0x28, 0x00, 0x00,
+    };
+
+    ret = tar_run_bytes(out, "T15", gzblob, sizeof(gzblob), &nent, &c);
+    if (ret != ORT_TAR_OK || nent != 1 ||
+        strcmp(c.name[0], "gz/a.txt") != 0 ||
+        strcmp(c.data[0], "gz-ok\n") != 0)
+      {
+        fprintf(out, "[ttest] FAIL T15 gzip 正常: ret=%s n=%u n0=%s\n",
+                ort_tar_strerror(ret), (unsigned)nent, c.name[0]);
+        fails++;
+      }
+    else
+      {
+        fprintf(out, "[ttest] ok   T15 gzip 正常（inflate + 条目内容）\n");
+      }
+
+    /* T16 翻一字节 → CRC/数据坏 */
+
+    {
+      uint8_t bad[sizeof(gzblob)];
+
+      memcpy(bad, gzblob, sizeof(bad));
+      bad[sizeof(bad) / 2] ^= 0xFF;
+      ret = tar_run_bytes(out, "T16", bad, sizeof(bad), &nent, &c);
+      if (ret != ORT_TAR_E_GZIP)
+        {
+          fprintf(out, "[ttest] FAIL T16 gzip 坏数据: got=%s expect=GZIP\n",
+                  ort_tar_strerror(ret));
+          fails++;
+        }
+      else
+        {
+          fprintf(out, "[ttest] ok   T16 gzip 翻一字节 → GZIP\n");
+        }
+    }
+
+    /* T17 截尾（丢校验尾）→ 不完整 */
+
+    ret = tar_run_bytes(out, "T17", gzblob, sizeof(gzblob) - 5, &nent, &c);
+    if (ret != ORT_TAR_E_GZIP)
+      {
+        fprintf(out, "[ttest] FAIL T17 gzip 截尾: got=%s expect=GZIP\n",
+                ort_tar_strerror(ret));
+        fails++;
+      }
+    else
+      {
+        fprintf(out, "[ttest] ok   T17 gzip 截尾 → GZIP（不完整）\n");
+      }
+
+    /* T18 改尾（ISIZE 翻一字节）：tar 内容完好、**只有尾部被改** ——
+     * 必须靠"读尽 gz 流 + STREAM_END 校验"才抓得住（§66 的 drain） */
+
+    {
+      uint8_t badtail[sizeof(gzblob)];
+
+      memcpy(badtail, gzblob, sizeof(badtail));
+      badtail[sizeof(badtail) - 5] ^= 0xFF;
+      ret = tar_run_bytes(out, "T18", badtail, sizeof(badtail), &nent, &c);
+      if (ret != ORT_TAR_E_GZIP)
+        {
+          fprintf(out, "[ttest] FAIL T18 gzip 改尾: got=%s expect=GZIP\n",
+                  ort_tar_strerror(ret));
+          fails++;
+        }
+      else
+        {
+          fprintf(out, "[ttest] ok   T18 gzip 改尾（ISIZE）→ GZIP\n");
+        }
+    }
+  }
 
   return fails;
 }

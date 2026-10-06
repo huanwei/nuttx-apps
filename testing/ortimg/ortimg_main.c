@@ -229,7 +229,7 @@ static int rm_children(FAR const char *dir);
   } while (0)
 
 static int apply_sink(FAR void *arg, FAR const struct ort_tar_entry_s *e,
-                      FAR FILE *f)
+                      FAR struct ort_tar_src_s *src)
 {
   FAR struct tapply_s *a = (FAR struct tapply_s *)arg;
   static char path[384];
@@ -344,10 +344,10 @@ static int apply_sink(FAR void *arg, FAR const struct ort_tar_entry_s *e,
     while (left > 0)
       {
         size_t want = (left < sizeof(buf)) ? (size_t)left : sizeof(buf);
-        size_t got = fread(buf, 1, want, f);
+        int got = src->read(src->arg, buf, want);
         ssize_t wr;
 
-        if (got == 0)
+        if (got <= 0)
           {
             close(fd);
             a->err = 3;
@@ -355,8 +355,8 @@ static int apply_sink(FAR void *arg, FAR const struct ort_tar_entry_s *e,
             return -1;
           }
 
-        wr = write(fd, buf, got);
-        if (wr < 0 || (size_t)wr != got)
+        wr = write(fd, buf, (size_t)got);
+        if (wr < 0 || wr != got)
           {
             close(fd);
             a->err = 3;
@@ -364,7 +364,7 @@ static int apply_sink(FAR void *arg, FAR const struct ort_tar_entry_s *e,
             return -1;
           }
 
-        left -= got;
+        left -= (uint64_t)got;
       }
   }
 

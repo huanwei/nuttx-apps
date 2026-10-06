@@ -3,14 +3,19 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * [ORT-A / A1] 受限 tar（ustar）解析 —— 约定见 ort_tar.h。
+ * [ORT-A / A1] 受限 tar（ustar）解析 + gzip 流式解压 —— 约定见 ort_tar.h。
  *
- * 解析策略：逐头块读；头块起点由 walk 自己记（fseek 绝对定位对齐，
- * sink 读多读少都无所谓）—— 流式路径不依赖 sink 的"礼貌"。
+ * §66 起：输入经**读源**推进（不再 fseek）——
+ *   · 未压缩：plain src（fread），文件头部 2 字节用于 gzip 探测后回卷；
+ *   · gzip（1f 8b）：zlib inflate（windowBits=15+16，含 CRC/ISIZE 校验），
+ *     流式、不可回卷 —— 成员对齐靠"读弃余量"。
+ * 截断统一表现为短读：头短读 → E_SHORT；数据区越尾 → E_SHORT；
+ * gzip 流截断/损坏 → E_GZIP。
  ****************************************************************************/
 
 #include <string.h>
 #include <stdlib.h>
+#include <zlib.h>
 
 #include "ort_tar.h"
 
@@ -31,6 +36,11 @@
 #define TAR_MAX_ENTRIES  4096
 #define TAR_MAX_FILE     (64ull * 1024 * 1024)
 
+/* 读源约定的负值：-1 通用 IO，-2 gzip 解压失败（walk 分别映射） */
+
+#define TAR_RD_IO        (-1)
+#define TAR_RD_GZ        (-2)
+
 FAR const char *ort_tar_strerror(int err)
 {
   switch (err)
@@ -42,7 +52,7 @@ FAR const char *ort_tar_strerror(int err)
       case ORT_TAR_E_PATH:      return "PATH";
       case ORT_TAR_E_TYPE:      return "TYPE";
       case ORT_TAR_E_SYNTAX:    return "SYNTAX";
-      case ORT_TAR_E_GZIP:      return "GZIP（未支持，见头注）";
+      case ORT_TAR_E_GZIP:      return "GZIP（解压/校验失败）";
       case ORT_TAR_E_LIMIT:     return "LIMIT";
       case ORT_TAR_E_IO:        return "IO";
       case ORT_TAR_E_CB:        return "CB(中止)";
@@ -50,9 +60,160 @@ FAR const char *ort_tar_strerror(int err)
     }
 }
 
-/* 八进制字段解析：允许前导空格与结尾 NUL/空格；非八进制 -> E_SYNTAX；
- * 空字段当 0（ustar 的 uid/gid 常见全 NUL）。上限 TAR_MAX_FILE —— 对
- * size 就是要它的意思；对其它字段（mode/mtime）远够不着，无害。 */
+/* ── 未压缩文件源 ─────────────────────────────────────────────────── */
+
+struct plain_src_s
+{
+  FAR FILE *f;
+};
+
+static int plain_read(FAR void *arg, FAR void *buf, size_t len)
+{
+  FAR struct plain_src_s *p = (FAR struct plain_src_s *)arg;
+  size_t r = fread(buf, 1, len, p->f);
+
+  if (r == 0 && ferror(p->f))
+    {
+      return TAR_RD_IO;
+    }
+
+  return (int)r;
+}
+
+/* ── gzip 源（zlib inflate，流式）────────────────────────────────── *
+ *
+ * 单例静态（解析器本身单线程使用；zlib 的解压窗口由它内部 malloc，
+ * 那是第三方库的行为，本文件自身仍零动态分配）。
+ */
+
+#define GZ_IN  1024
+#define GZ_OUT 1024
+
+static struct gzsrc_s
+{
+  FAR FILE *f;
+  z_stream  strm;
+  uint8_t   in[GZ_IN];
+  uint8_t   out[GZ_OUT];
+  size_t    opos;
+  size_t    oused;
+  int       in_eof;
+  int       done;
+} g_gz;
+
+static int gzsrc_open(FAR FILE *f)
+{
+  memset(&g_gz, 0, sizeof(g_gz));
+  g_gz.f = f;
+
+  /* 15 = 最大窗口；+16 = 只收 gzip 包装（CRC32/ISIZE 由 zlib 校验） */
+
+  if (inflateInit2(&g_gz.strm, 15 + 16) != Z_OK)
+    {
+      return -1;
+    }
+
+  return 0;
+}
+
+static void gzsrc_close(void)
+{
+  inflateEnd(&g_gz.strm);
+}
+
+/* 把 gz 流剩余的字节读干净并要求到达 STREAM_END（CRC/ISIZE 由 zlib 在
+ * STREAM_END 时校验）。为什么必须：tar 在**零块**处提前结束（end marker），
+ * 若就此收工，gz 尾从没被读到 —— 截断/改尾都检不出来（§66 踩过）。 */
+
+static int gz_read(FAR void *arg, FAR void *buf, size_t len);
+
+static int gz_drain(void)
+{
+  static uint8_t sink[512];
+  int r;
+
+  while ((r = gz_read(&g_gz, sink, sizeof(sink))) > 0)
+    {
+    }
+
+  return (r == 0 && g_gz.done) ? 0 : -1;
+}
+
+static int gz_read(FAR void *arg, FAR void *buf, size_t len)
+{
+  size_t got = 0;
+
+  (void)arg;
+
+  while (got < len)
+    {
+      size_t avail = g_gz.oused - g_gz.opos;
+
+      if (avail > 0)
+        {
+          size_t n = (len - got < avail) ? (len - got) : avail;
+
+          memcpy((FAR char *)buf + got, g_gz.out + g_gz.opos, n);
+          g_gz.opos += n;
+          got       += n;
+          continue;
+        }
+
+      if (g_gz.done)
+        {
+          break;                      /* 流末：交付已得字节（0 = EOF） */
+        }
+
+      if (g_gz.strm.avail_in == 0 && !g_gz.in_eof)
+        {
+          size_t r = fread(g_gz.in, 1, GZ_IN, g_gz.f);
+
+          g_gz.strm.next_in  = g_gz.in;
+          g_gz.strm.avail_in = (uInt)r;
+          if (r == 0)
+            {
+              g_gz.in_eof = 1;
+            }
+        }
+
+      g_gz.strm.next_out  = g_gz.out;
+      g_gz.strm.avail_out = GZ_OUT;
+
+      {
+        int ret = inflate(&g_gz.strm, Z_NO_FLUSH);
+
+        g_gz.oused = GZ_OUT - g_gz.strm.avail_out;
+        g_gz.opos  = 0;
+
+        if (ret == Z_STREAM_END)
+          {
+            g_gz.done = 1;            /* CRC/ISIZE 已由 zlib 验证 */
+          }
+        else if (ret == Z_OK)
+          {
+            if (g_gz.oused == 0 && g_gz.in_eof)
+              {
+                return TAR_RD_GZ;     /* 输入尽而无进展 = 截断 */
+              }
+          }
+        else if (ret == Z_BUF_ERROR)
+          {
+            if (g_gz.in_eof)
+              {
+                return TAR_RD_GZ;
+              }
+          }
+        else
+          {
+            return TAR_RD_GZ;         /* Z_DATA_ERROR / Z_MEM_ERROR / ... */
+          }
+      }
+    }
+
+  return (int)got;
+}
+
+/* ── 头字段工具（与 §64 相同）────────────────────────────────────── */
 
 static int tar_octal(FAR const uint8_t *p, size_t len, FAR uint64_t *out)
 {
@@ -103,10 +264,6 @@ static unsigned tar_checksum(FAR const uint8_t *h)
 
   return sum;
 }
-
-/* 名字规范化 + 逃逸防护：跳空组件与 "."；任一 ".." 拒；前导 "/" 天然
- * 被"跳空组件"吞掉后成为普通相对路径 —— 不行！"/etc/x" 的逃逸意图
- * 必须拒而不是洗白：所以先看**原始**首字符。 */
 
 static int tar_join_normalize(FAR const uint8_t *name, size_t nlen,
                               FAR const uint8_t *prefix, size_t plen,
@@ -197,8 +354,6 @@ static int tar_join_normalize(FAR const uint8_t *name, size_t nlen,
   return ORT_TAR_OK;
 }
 
-/* 原始 name 字段是否以 '/' 结尾（v7 老式目录写法；要在规范化前看） */
-
 static int tar_raw_dir_slash(FAR const uint8_t *name, size_t nlen)
 {
   size_t i = 0;
@@ -211,49 +366,71 @@ static int tar_raw_dir_slash(FAR const uint8_t *name, size_t nlen)
   return (i > 0 && name[i - 1] == '/');
 }
 
-int ort_tar_walk(FAR FILE *f, FAR ort_tar_sink_t sink, FAR void *arg,
-                 FAR uint32_t *nentries)
+/* ── 成员读计数视图 ───────────────────────────────────────────────── */
+
+struct memb_src_s
+{
+  FAR struct ort_tar_src_s *up;
+  uint64_t consumed;
+};
+
+static int memb_read(FAR void *arg, FAR void *buf, size_t len)
+{
+  FAR struct memb_src_s *m = (FAR struct memb_src_s *)arg;
+  int r = m->up->read(m->up->arg, buf, len);
+
+  if (r > 0)
+    {
+      m->consumed += (uint64_t)r;
+    }
+
+  return r;
+}
+
+/* ── walk ─────────────────────────────────────────────────────────── */
+
+int ort_tar_walk_src(FAR struct ort_tar_src_s *src,
+                     FAR ort_tar_sink_t sink, FAR void *arg,
+                     FAR uint32_t *nentries)
 {
   uint8_t  h[TAR_BLOCK];
+  static uint8_t scratch[TAR_BLOCK];
   uint32_t n = 0;
-  long     pos0;
-  long     filelen;
-
-  /* 文件总长先量好：数据区越过文件尾 = 截断（否则"声明 100 字节、
-   * 实体只有一个头"会被上层的块边界 EOF 当干净结束放行） */
-
-  pos0 = ftell(f);
-  if (pos0 < 0 || fseek(f, 0, SEEK_END) != 0)
-    {
-      return ORT_TAR_E_IO;
-    }
-
-  filelen = ftell(f);
-  if (filelen < 0 || fseek(f, pos0, SEEK_SET) != 0)
-    {
-      return ORT_TAR_E_IO;
-    }
 
   for (;;)
     {
-      size_t   got;
+      size_t   got = 0;
       size_t   i;
       int      allzero = 1;
+      int      r;
       uint64_t size = 0;
       uint64_t tmp = 0;
       struct ort_tar_entry_s e;
       char     typeflag;
       int      raw_dir;
       int      ret;
-      long     hdr_off;
 
-      hdr_off = ftell(f);
-      if (hdr_off < 0)
+      for (;;)
         {
-          return ORT_TAR_E_IO;
+          r = src->read(src->arg, h + got, TAR_BLOCK - got);
+          if (r == TAR_RD_GZ)
+            {
+              return ORT_TAR_E_GZIP;
+            }
+
+          if (r < 0)
+            {
+              return ORT_TAR_E_IO;
+            }
+
+          if (r == 0)
+            {
+              break;
+            }
+
+          got += (size_t)r;
         }
 
-      got = fread(h, 1, TAR_BLOCK, f);
       if (got == 0)
         {
           break;                        /* 块边界 EOF：当结束（见头注） */
@@ -262,14 +439,6 @@ int ort_tar_walk(FAR FILE *f, FAR ort_tar_sink_t sink, FAR void *arg,
       if (got < TAR_BLOCK)
         {
           return ORT_TAR_E_SHORT;
-        }
-
-      /* gzip 魔数：明确报"这是 gzip 不是 tar"，别让它掉进 checksum 里
-       * 报个让人误解的 BADSUM */
-
-      if (h[0] == 0x1f && h[1] == 0x8b)
-        {
-          return ORT_TAR_E_GZIP;
         }
 
       for (i = 0; i < TAR_BLOCK; i++)
@@ -285,8 +454,6 @@ int ort_tar_walk(FAR FILE *f, FAR ort_tar_sink_t sink, FAR void *arg,
         {
           break;                        /* end marker */
         }
-
-      /* magic：POSIX "ustar\0" 或 GNU "ustar " */
 
       if (memcmp(h + TAR_MAGIC_OFF, "ustar", 5) != 0)
         {
@@ -353,13 +520,6 @@ int ort_tar_walk(FAR FILE *f, FAR ort_tar_sink_t sink, FAR void *arg,
 
       e.size = (e.typeflag == '5') ? 0 : size;
 
-      /* 数据区完整性（见函数头注） */
-
-      if (hdr_off + TAR_BLOCK + (long)((size + 511) & ~511ull) > filelen)
-        {
-          return ORT_TAR_E_SHORT;
-        }
-
       ret = tar_octal(h + TAR_MODE_OFF, TAR_MODE_LEN, &tmp);
       if (ret != ORT_TAR_OK)
         {
@@ -373,18 +533,87 @@ int ort_tar_walk(FAR FILE *f, FAR ort_tar_sink_t sink, FAR void *arg,
           return ORT_TAR_E_LIMIT;
         }
 
-      if (sink != NULL && sink(arg, &e, f) != 0)
+      if (sink != NULL)
         {
-          return ORT_TAR_E_CB;
+          struct memb_src_s memb;
+          struct ort_tar_src_s mview;
+
+          memb.up = src;
+          memb.consumed = 0;
+          mview.read = memb_read;
+          mview.arg  = &memb;
+
+          if (sink(arg, &e, &mview) != 0)
+            {
+              return ORT_TAR_E_CB;
+            }
+
+          if (memb.consumed > e.size)
+            {
+              return ORT_TAR_E_CB;      /* sink 越读成员数据：契约破坏 */
+            }
+
+          /* 丢弃 sink 没读的余量 —— ★ 按 **512 对齐后的** 数据区长度算！
+           * 旧实现靠绝对 fseek 天然对齐；流式后少算 padding 会让下一头
+           * 读到数据块的填充零（"全零当 end marker"还会假通过，§66 踩过） */
+
+          {
+            uint64_t padded = (e.size + TAR_BLOCK - 1) & ~(uint64_t)(TAR_BLOCK - 1);
+            uint64_t skip = padded - memb.consumed;
+
+            while (skip > 0)
+              {
+                size_t c = (skip < TAR_BLOCK) ? (size_t)skip : TAR_BLOCK;
+
+                r = src->read(src->arg, scratch, c);
+                if (r == TAR_RD_GZ)
+                  {
+                    return ORT_TAR_E_GZIP;
+                  }
+
+                if (r < 0)
+                  {
+                    return ORT_TAR_E_IO;
+                  }
+
+                if (r == 0)
+                  {
+                    return ORT_TAR_E_SHORT;     /* 数据区越过流尾 */
+                  }
+
+                skip -= (uint64_t)r;
+              }
+          }
         }
-
-      /* 对齐：下一头块起点 = 本头起点 + 512 + 数据块数×512（绝对定位，
-       * sink 读了/没读/读多都无妨） */
-
-      if (fseek(f, hdr_off + TAR_BLOCK + (long)((size + 511) & ~511ull),
-                SEEK_SET) != 0)
+      else
         {
-          return ORT_TAR_E_IO;
+          /* 无 sink 也必须推进过数据区（同样按 512 对齐的长度） */
+
+          uint64_t skip = (e.size + TAR_BLOCK - 1) &
+                          ~(uint64_t)(TAR_BLOCK - 1);
+
+          while (skip > 0)
+            {
+              size_t c = (skip < TAR_BLOCK) ? (size_t)skip : TAR_BLOCK;
+
+              r = src->read(src->arg, scratch, c);
+              if (r == TAR_RD_GZ)
+                {
+                  return ORT_TAR_E_GZIP;
+                }
+
+              if (r < 0)
+                {
+                  return ORT_TAR_E_IO;
+                }
+
+              if (r == 0)
+                {
+                  return ORT_TAR_E_SHORT;
+                }
+
+              skip -= (uint64_t)r;
+            }
         }
     }
 
@@ -394,4 +623,50 @@ int ort_tar_walk(FAR FILE *f, FAR ort_tar_sink_t sink, FAR void *arg,
     }
 
   return ORT_TAR_OK;
+}
+
+int ort_tar_walk(FAR FILE *f, FAR ort_tar_sink_t sink, FAR void *arg,
+                 FAR uint32_t *nentries)
+{
+  uint8_t magic[2];
+  size_t  r = fread(magic, 1, 2, f);
+
+  /* 回卷（gzip 探测只借头两字节；真实文件都可 seek） */
+
+  if (fseek(f, 0, SEEK_SET) != 0)
+    {
+      return ORT_TAR_E_IO;
+    }
+
+  if (r == 2 && magic[0] == 0x1f && magic[1] == 0x8b)
+    {
+      struct ort_tar_src_s s;
+      int ret;
+
+      if (gzsrc_open(f) != 0)
+        {
+          return ORT_TAR_E_GZIP;
+        }
+
+      s.read = gz_read;
+      s.arg  = &g_gz;
+      ret = ort_tar_walk_src(&s, sink, arg, nentries);
+      if (ret == ORT_TAR_OK && gz_drain() != 0)
+        {
+          ret = ORT_TAR_E_GZIP;     /* 流未到 STREAM_END：截断/改尾 */
+        }
+
+      gzsrc_close();
+      return ret;
+    }
+
+  {
+    struct plain_src_s p;
+    struct ort_tar_src_s s;
+
+    p.f = f;
+    s.read = plain_read;
+    s.arg  = &p;
+    return ort_tar_walk_src(&s, sink, arg, nentries);
+  }
 }
