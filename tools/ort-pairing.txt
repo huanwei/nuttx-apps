@@ -9,9 +9,9 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-06 orting（A1 第四步：层体解包 + rootfs 组装）
+# 最近配对事件：2026-10-06 orting（A1 第六步：gzip 层体支持 / zlib 读源化）
 #               —— apps 侧改动，内核未动（nuttx= 保持上轮 d7c05a5905；
-#               app 栈修复走 .config：POSIX_SPAWN_DEFAULT_STACKSIZE 16K）。
+#               zlib 开关走 apps 配置：LIB_ZLIB + MAX_WBITS/MEM_LEVEL）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
