@@ -11,4 +11,4 @@
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=4857e8cffa3ba1718e24fcb1c18ec4490d09f7ba
+nuttx=b044bed5b5ea8d959a566c701b99a1da4bc133da
