@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:678d50c046cf78ac94a0a2e223dc07166088853b1d1613d4cc905cc476110528",
+    "size": 28
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:a968af9378bea3ea0a2a2460b20557a72011125d10ca278c655677b22f8577c8",
+      "size": 262144
+    }
+  ],
+  "annotations": {
+    "org.opencontainers.image.title": "ort-fixture",
+    "note": "合成夹具：整链 digest 自洽（本增量只下载/校验 layer）"
+  }
+}

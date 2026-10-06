@@ -8,10 +8,12 @@
  * 实现要点：
  *   · 请求头全部准备好**一次 write** —— 少一次往返，也少一类"部分写"
  *     的边界（NuttX 上小报文一次写完是常态，write 返回值仍检查）
- *   · 响应头逐行解析（大小写不敏感的前缀匹配），只抽三样：
+ *   · 响应头逐行解析（大小写不敏感的前缀匹配），只抽四样：
  *     状态码 / Content-Length / WWW-Authenticate
- *   · body 读取：有 Content-Length 按长度读；没有就读到 EOF（1.0 语义）
- *   · 全程有界：body_cap 之外只读不存（并置 truncated 标志）
+ *   · 两条消费路径共用 http_open()（连接 + 请求 + 响应头），差异只在
+ *     body 怎么消费：get 定长进内存 / get_stream 边收边交 sink
+ *   · 全程有界：get 的 body_cap 之外只读不存（并置 truncated 标志）；
+ *     stream 的缓冲只有 1KB（层体任意大，内存常数）
  ****************************************************************************/
 
 #include <nuttx/config.h>
@@ -124,24 +126,25 @@ static int recv_exact(int fd, FAR char *dst, size_t want, size_t drop_extra,
   return 0;
 }
 
-int ort_http_get(FAR const char *host, unsigned port, FAR const char *path,
-                 FAR const char *bearer, FAR const char *accept,
-                 FAR char *body, size_t body_cap,
-                 FAR struct ort_http_resp_s *resp)
+/* 连接 + 请求 + 响应头（get / get_stream 共用）。成功返回 fd（>0），
+ * 失败返回负值（与两个公开函数的错误码同一套）。 */
+
+static int http_open(FAR const char *host, unsigned port,
+                     FAR const char *path,
+                     FAR const char *bearer, FAR const char *accept,
+                     FAR struct ort_http_resp_s *resp)
 {
   struct addrinfo hints;
   FAR struct addrinfo *ai = NULL;
   char   portstr[8];
   static char req[768];                    /* ★ 静态化：目标机 app 栈 ~2KB，
-                                            * line/req 放栈上必炸（电池同族
-                                            * 坑，2026-10-06 实测） */
+                                            * 大件放栈上必炸（2026-10-06 实测） */
   static char line[ORT_HTTP_HDR_MAX];
   int    fd = -1;
   int    ret;
-  long   content_len = -1;
-  size_t stored = 0;
 
   memset(resp, 0, sizeof(*resp));
+  resp->content_len = -1;
   memset(&hints, 0, sizeof(hints));
   hints.ai_family   = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
@@ -259,13 +262,33 @@ int ort_http_get(FAR const char *host, unsigned port, FAR const char *path,
 
       if (str_starts_ci(line, "content-length:"))
         {
-          content_len = atol(line + 15);
+          resp->content_len = atoll(line + 15);
         }
       else if (str_starts_ci(line, "www-authenticate:"))
         {
           strlcpy(resp->www_auth, line + 17, sizeof(resp->www_auth));
         }
     }
+
+  return fd;
+}
+
+int ort_http_get(FAR const char *host, unsigned port, FAR const char *path,
+                 FAR const char *bearer, FAR const char *accept,
+                 FAR char *body, size_t body_cap,
+                 FAR struct ort_http_resp_s *resp)
+{
+  int    fd;
+  long long content_len;
+  size_t stored = 0;
+
+  fd = http_open(host, port, path, bearer, accept, resp);
+  if (fd < 0)
+    {
+      return fd;
+    }
+
+  content_len = resp->content_len;
 
   /* body */
 
@@ -339,6 +362,75 @@ int ort_http_get(FAR const char *host, unsigned port, FAR const char *path,
   else if (!resp->body_truncated)
     {
       resp->body_truncated = 1;   /* 恰好填满也当截断处理（保守） */
+    }
+
+  return 0;
+}
+
+int ort_http_get_stream(FAR const char *host, unsigned port,
+                        FAR const char *path,
+                        FAR const char *bearer, FAR const char *accept,
+                        FAR ort_http_sink_t sink, FAR void *arg,
+                        FAR struct ort_http_resp_s *resp)
+{
+  static char chunk[1024];       /* ★ 静态：目标机 app 栈不见大件 */
+  int fd;
+  long long want;
+  size_t total = 0;
+
+  fd = http_open(host, port, path, bearer, accept, resp);
+  if (fd < 0)
+    {
+      return fd;
+    }
+
+  want = resp->content_len;
+
+  for (;;)
+    {
+      size_t ask = sizeof(chunk);
+      ssize_t r;
+
+      if (want >= 0)
+        {
+          if ((long long)total >= want)
+            {
+              break;                 /* 定长：读齐即停（多出的留给 close） */
+            }
+
+          if ((long long)ask > want - (long long)total)
+            {
+              ask = (size_t)(want - (long long)total);
+            }
+        }
+
+      r = recv(fd, chunk, ask, 0);
+      if (r < 0)
+        {
+          close(fd);
+          return -7;
+        }
+
+      if (r == 0)
+        {
+          break;                     /* 对端关闭 */
+        }
+
+      if (sink != NULL && sink(arg, chunk, (size_t)r) != 0)
+        {
+          close(fd);
+          return -8;                 /* sink 主动中止（如落盘失败） */
+        }
+
+      total += (size_t)r;
+    }
+
+  close(fd);
+  resp->body_len = total;
+
+  if (want >= 0 && (long long)total < want)
+    {
+      return -7;                     /* 定长没读齐 = 断流 */
     }
 
   return 0;

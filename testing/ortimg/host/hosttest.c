@@ -49,9 +49,20 @@ int main(int argc, char *argv[])
   int fails = 0;
   int got;
 
-  /* 1) 内联电池（与目标机逐字同一份） */
+  /* 1) 内联电池（与目标机逐字同一份）：JSON 族 + SHA-256 族。
+   *    RESULT 行与目标机 `orting shatest` 的输出逐字同形 —— 双环境的
+   *    比较靠它，不能自作主张换措辞。 */
 
   fails += ort_battery_run(stdout);
+
+  {
+    int hfails = ort_hash_battery_run(stdout);
+
+    printf("[ortimg] SHATEST RESULT: %s（%u 用例 + %u 特殊例）\n",
+           hfails == 0 ? "PASS" : "*** FAIL ***",
+           (unsigned)ORT_NHASHCASES, (unsigned)ORT_NHASHSPECIAL);
+    fails += hfails;
+  }
 
   /* 2) 真实夹具：alpine image manifest（含 annotations，白名单跳过） */
 

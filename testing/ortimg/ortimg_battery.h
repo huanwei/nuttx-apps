@@ -429,4 +429,194 @@ static int ort_battery_run(FAR FILE *out)
   return fails;
 }
 
+/* ── SHA-256 电池（[htest]）────────────────────────────────────────── *
+ *
+ * 期望值来源：NIST 官方向量（空/abc/56B/1M×'a'）+ python hashlib 交叉
+ * 生成（55/56/63/64/65/128 边界、模式串）——**不是**"自己实现自己验"。
+ * H11/H12/H13 走 update 分段路径（下载就是流式的），一次性与流式在
+ * 边界长度上必须同摘要。
+ */
+
+#include "ort_sha256.h"
+
+struct ort_hashcase_s
+{
+  FAR const char *name;
+  FAR const char *data;
+  size_t          len;
+  FAR const char *hex;
+};
+
+/* 128 × 'a'（H4-H9 共用；len 由用例给，字符串本身长 128） */
+
+static const char g_ha[] =
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+static const char g_nist56[] =
+  "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+
+static const struct ort_hashcase_s g_ort_hashcases[] =
+{
+  { "H1 空输入",
+    "", 0,
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+  { "H2 \"abc\"（NIST）",
+    "abc", 3,
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" },
+  { "H3 56B 双块（NIST）",
+    g_nist56, 56,
+    "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1" },
+  { "H4 55x'a'（尾差 1 到 56）",
+    g_ha, 55,
+    "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318" },
+  { "H5 56x'a'（尾恰 56）",
+    g_ha, 56,
+    "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a" },
+  { "H6 63x'a'（尾差 1 满块）",
+    g_ha, 63,
+    "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34" },
+  { "H7 64x'a'（尾恰满块）",
+    g_ha, 64,
+    "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb" },
+  { "H8 65x'a'（跨块 1 字节）",
+    g_ha, 65,
+    "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0" },
+  { "H9 128x'a'（两块整）",
+    g_ha, 128,
+    "6836cf13bac400e9105071cd6af47084dfacad4e5e302c94bfed24e013afb73e" },
+};
+
+#define ORT_NHASHCASES (sizeof(g_ort_hashcases) / sizeof(g_ort_hashcases[0]))
+#define ORT_NHASHSPECIAL 4     /* H10-H13：模式串/流式分段特殊例 */
+
+static void hash_case_report(FAR FILE *out, FAR const char *name,
+                             FAR const char *got, FAR const char *expect,
+                             FAR int *fails)
+{
+  if (strcmp(got, expect) != 0)
+    {
+      fprintf(out, "[htest] FAIL %s: got=%s expect=%s\n", name, got, expect);
+      (*fails)++;
+    }
+  else
+    {
+      fprintf(out, "[htest] ok   %s\n", name);
+    }
+}
+
+static int ort_hash_battery_run(FAR FILE *out)
+{
+  /* 模式串缓冲（运行时构造，静态存储 —— 目标机栈预算见 §61 同族注） */
+
+  static char pat300[300];                  /* "0123456789" x 30 */
+  static char pat1000[1000];                /* (i*7+3)&0xff */
+  char   hex[65];
+  uint8_t dg[32];
+  size_t i;
+  int    fails = 0;
+
+  for (i = 0; i < ORT_NHASHCASES; i++)
+    {
+      FAR const struct ort_hashcase_s *tc = &g_ort_hashcases[i];
+
+      ort_sha256_oneshot(tc->data, tc->len, dg);
+      ort_sha256_hex(dg, hex);
+      hash_case_report(out, tc->name, hex, tc->hex, &fails);
+    }
+
+  for (i = 0; i < sizeof(pat300); i++)
+    {
+      pat300[i] = (char)('0' + (i % 10));
+    }
+
+  for (i = 0; i < sizeof(pat1000); i++)
+    {
+      pat1000[i] = (char)((i * 7 + 3) & 0xff);
+    }
+
+  /* H10 300B 模式一次性 */
+
+  ort_sha256_oneshot(pat300, sizeof(pat300), dg);
+  ort_sha256_hex(dg, hex);
+  hash_case_report(out, "H10 300B 模式（一次性）", hex,
+                   "ba6ab297dbb2bcbc66d54fb768e01920acb58b5552455834f4563807cbd46efb",
+                   &fails);
+
+  /* H11 同数据**逐字节**流式 —— 分段路径在 64B 块边界上的等价性 */
+
+  {
+    struct ort_sha256_s c;
+
+    ort_sha256_init(&c);
+    for (i = 0; i < sizeof(pat300); i++)
+      {
+        ort_sha256_update(&c, &pat300[i], 1);
+      }
+
+    ort_sha256_final(&c, dg);
+    ort_sha256_hex(dg, hex);
+    hash_case_report(out, "H11 300B 逐字节流式（=H10）", hex,
+                     "ba6ab297dbb2bcbc66d54fb768e01920acb58b5552455834f4563807cbd46efb",
+                     &fails);
+  }
+
+  /* H12 1000B 乱块粒度流式（7+13+1+64+215+700） */
+
+  {
+    struct ort_sha256_s c;
+    static const size_t chunks[] = { 7, 13, 1, 64, 215, 700 };
+    size_t off = 0;
+
+    ort_sha256_init(&c);
+    for (i = 0; i < sizeof(chunks) / sizeof(chunks[0]); i++)
+      {
+        ort_sha256_update(&c, pat1000 + off, chunks[i]);
+        off += chunks[i];
+      }
+
+    ort_sha256_final(&c, dg);
+    ort_sha256_hex(dg, hex);
+    hash_case_report(out, "H12 1000B 乱块粒度流式", hex,
+                     "1e9bc38cbf860b9ec31918b065f9b52476c549a782e0e7990bed8ce3868d2371",
+                     &fails);
+  }
+
+  /* H13 1M x 'a' 按 1024B 块流式（NIST 向量；不占 1MB 内存） */
+
+  {
+    struct ort_sha256_s c;
+    static char ablk[1024] =
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    unsigned int k;
+
+    /* 上面的字面量只有 128 字节（其余被补 0）—— 用首 128 字节铺满 */
+
+    for (k = 128; k < sizeof(ablk); k += 128)
+      {
+        memcpy(ablk + k, ablk, 128);
+      }
+
+    /* 恰好 1,000,000 字节 = 976×1024 + 576（不是 1000×1024！——
+     * 多喂 24000 字节就是另一种输入，NIST 向量对不上） */
+
+    ort_sha256_init(&c);
+    for (k = 0; k < 976; k++)
+      {
+        ort_sha256_update(&c, ablk, sizeof(ablk));
+      }
+
+    ort_sha256_update(&c, ablk, 576);
+
+    ort_sha256_final(&c, dg);
+    ort_sha256_hex(dg, hex);
+    hash_case_report(out, "H13 1M x 'a' 流式（NIST）", hex,
+                     "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+                     &fails);
+  }
+
+  return fails;
+}
+
 #endif /* __APPS_TESTING_ORTIMG_ORTIMG_BATTERY_H */

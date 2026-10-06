@@ -19,12 +19,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include "ort_json.h"
 #include "ortimg_battery.h"
 #include "ort_http.h"
+#include "ort_sha256.h"
 
 #define ORTIMG_MAX_FILE  (ORT_JSON_MAX_INPUT + 1)
+
+/* 镜像存储根：设计文档写 /var/ort/images —— 本板 /var 无挂载，tmpfs 在
+ * /tmp（qemu_bringup 挂），故用 /tmp/ort 做根；产品化时由 init 把持久
+ * 存储挂到 /var，路径前缀随挂载点平移（手册 §三·补六十三 边界）。 */
+#define ORT_STORE_ROOT   "/tmp/ort"
+
+/* 单层体上限（prototype 防线：tmpfs 在 RAM，别让一张大 manifest 抽干内存） */
+#define ORT_BLOB_MAX     (64 * 1024 * 1024)
 
 static FAR char *g_buf;
 
@@ -59,6 +71,76 @@ static int read_file(FAR const char *path, FAR size_t *out_len)
 
   *out_len = n;
   g_buf[n] = '\0';
+  return 0;
+}
+
+/* ── 小工具 ───────────────────────────────────────────────────────── */
+
+static int mkdir_p(FAR const char *path)
+{
+  static char tmp[320];
+  size_t i;
+
+  if (strlen(path) >= sizeof(tmp))
+    {
+      return -1;
+    }
+
+  strlcpy(tmp, path, sizeof(tmp));
+
+  for (i = 1; tmp[i] != '\0'; i++)
+    {
+      if (tmp[i] == '/')
+        {
+          tmp[i] = '\0';
+          if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+            {
+              return -1;
+            }
+
+          tmp[i] = '/';
+        }
+    }
+
+  if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+    {
+      return -1;
+    }
+
+  return 0;
+}
+
+/* ── SHA-256 电池 / 单文件摘要 ─────────────────────────────────────── */
+
+static int do_sha(FAR const char *path)
+{
+  static char   buf[4096];        /* ★ 静态：目标机 app 栈预算 */
+  FAR FILE     *f = fopen(path, "rb");
+  struct ort_sha256_s c;
+  uint8_t raw[32];
+  char    hex[65];
+  size_t  n;
+  size_t  tot = 0;
+
+  if (f == NULL)
+    {
+      printf("[ortimg] 打不开 %s\n", path);
+      return 2;
+    }
+
+  ort_sha256_init(&c);
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+    {
+      ort_sha256_update(&c, buf, n);
+      tot += n;
+    }
+
+  fclose(f);
+  ort_sha256_final(&c, raw);
+  ort_sha256_hex(raw, hex);
+
+  printf("[ortimg] sha256 %s\n", path);
+  printf("[ortimg]   = %s（%zu 字节）\n", hex, tot);
   return 0;
 }
 
@@ -178,6 +260,137 @@ static void attr_get(FAR const char *hdr, FAR const char *name,
         }
       *out = '\0';
     }
+}
+
+/* 下载一个 blob（层体）：流式落盘 + 边收边算 SHA-256，收齐后与 digest
+ * 比对（**内容寻址校验**）；通过才把 .part 改名转正，失败一律删掉
+ * —— fail-closed。返回 0=通过 / 1=校验失败 / 2=传输或落盘失败。 */
+
+struct dl_sink_s
+{
+  int    fd;
+  struct ort_sha256_s sha;
+  size_t n;
+  int    err;
+};
+
+static int dl_sink(FAR void *arg, FAR const char *buf, size_t len)
+{
+  FAR struct dl_sink_s *d = (FAR struct dl_sink_s *)arg;
+  size_t off = 0;
+
+  if (d->n + len > ORT_BLOB_MAX)
+    {
+      d->err = 3;                   /* 超上限：sink 主动中止 */
+      return -1;
+    }
+
+  while (off < len)
+    {
+      ssize_t w = write(d->fd, buf + off, len - off);
+
+      if (w <= 0)
+        {
+          d->err = 1;
+          return -1;
+        }
+
+      off += (size_t)w;
+    }
+
+  ort_sha256_update(&d->sha, buf, len);
+  d->n += len;
+  return 0;
+}
+
+static int blob_download(FAR const char *host, unsigned port,
+                         FAR const char *repo, FAR const char *bearer,
+                         FAR const char *digest, uint64_t msize)
+{
+  static char path[320];
+  static char dir[256];
+  static char part[300];
+  static char final[300];
+  static struct ort_http_resp_s r;
+  static struct dl_sink_s d;
+  FAR const char *hex = digest;
+  uint8_t raw[32];
+  char    got[65];
+  int     fd;
+  int     ret;
+
+  if (strncmp(hex, "sha256:", 7) == 0)
+    {
+      hex += 7;
+    }
+
+  snprintf(dir,   sizeof(dir),   ORT_STORE_ROOT "/images/sha256/%s", hex);
+  snprintf(part,  sizeof(part),  "%s/layer.tar.part", dir);
+  snprintf(final, sizeof(final), "%s/layer.tar", dir);
+  snprintf(path,  sizeof(path),  "/v2/%s/blobs/%s", repo, digest);
+
+  printf("[pull] ⑥ %s\n", path);
+  printf("[pull]    层体 %llu 字节 → %s\n",
+         (unsigned long long)msize, final);
+
+  if (mkdir_p(dir) != 0)
+    {
+      printf("[pull]    建目录失败: %s（errno=%d）\n", dir, errno);
+      return 2;
+    }
+
+  fd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0)
+    {
+      printf("[pull]    建文件失败: %s（errno=%d）\n", part, errno);
+      return 2;
+    }
+
+  memset(&d, 0, sizeof(d));
+  d.fd = fd;
+  ort_sha256_init(&d.sha);
+
+  ret = ort_http_get_stream(host, port, path, bearer, NULL,
+                            dl_sink, &d, &r);
+  close(fd);
+
+  if (ret != 0 || r.status != 200)
+    {
+      printf("[pull]    blob 下载失败（ret=%d status=%d errno=%d）\n",
+             ret, r.status, errno);
+      unlink(part);
+      return 2;
+    }
+
+  ort_sha256_final(&d.sha, raw);
+  ort_sha256_hex(raw, got);
+
+  printf("[pull]    收到 %zu 字节，算得 sha256:%s\n", d.n, got);
+
+  if (strcmp(got, hex) != 0)
+    {
+      printf("[pull]    sha256 校验 FAILED：算得 %s，期望 %s\n", got, hex);
+      unlink(part);
+      return 1;
+    }
+
+  if ((uint64_t)d.n != msize)
+    {
+      printf("[pull]    尺寸校验 FAILED：收到 %zu，manifest 记 %llu\n",
+             d.n, (unsigned long long)msize);
+      unlink(part);
+      return 1;
+    }
+
+  if (rename(part, final) != 0)
+    {
+      printf("[pull]    转正失败: %s → %s（errno=%d）\n", part, final, errno);
+      unlink(part);
+      return 2;
+    }
+
+  printf("[pull]    sha256 校验 OK（与 manifest 一致），落盘 %s\n", final);
+  return 0;
 }
 
 static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
@@ -369,6 +582,34 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
           }
       }
 
+      /* ⑥ 层体下载 + 内容寻址校验 + 落盘（A1 第三步） */
+
+      {
+        uint32_t i;
+
+        for (i = 0; i < g_mf.nlayers; i++)
+          {
+            int r;
+
+            if (i >= 8)
+              {
+                printf("[pull]    （层数 %u 超原型上限 8，其余未下载）\n",
+                       (unsigned)g_mf.nlayers);
+                break;
+              }
+
+            r = blob_download(host, port, repo,
+                              g_token[0] ? g_token : NULL,
+                              g_mf.layers[i].digest, g_mf.layers[i].size);
+            if (r != 0)
+              {
+                printf("[pull]    layer[%u] 未通过（r=%d）→ pull 失败\n",
+                       (unsigned)i, r);
+                return 1;
+              }
+          }
+      }
+
       printf("[pull] PULL RESULT: OK\n");
     }
 
@@ -394,6 +635,25 @@ int main(int argc, FAR char *argv[])
              (unsigned)(ORT_NCASES + ORT_NSTRCASES + ORT_NIDXCASES));
       free(g_buf);
       return fails == 0 ? 0 : 1;
+    }
+
+  if (argc >= 2 && strcmp(argv[1], "shatest") == 0)
+    {
+      int fails = ort_hash_battery_run(stdout);
+
+      printf("[ortimg] SHATEST RESULT: %s（%u 用例 + %u 特殊例）\n",
+             fails == 0 ? "PASS" : "*** FAIL ***",
+             (unsigned)ORT_NHASHCASES, (unsigned)ORT_NHASHSPECIAL);
+      free(g_buf);
+      return fails == 0 ? 0 : 1;
+    }
+
+  if (argc >= 3 && strcmp(argv[1], "sha") == 0)
+    {
+      int r = do_sha(argv[2]);
+
+      free(g_buf);
+      return r;
     }
 
   if (argc >= 3 && strcmp(argv[1], "manifest") == 0)
@@ -443,8 +703,9 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
-  printf("用法: orting jsontest | manifest <path> | validate <path> |\n"
-         "      httpget <host> <port> <path> | pull <host> <port> <repo> <tag>\n");
+  printf("用法: orting jsontest | shatest | manifest <path> | validate <path> |\n"
+         "      sha <path> | httpget <host> <port> <path> |\n"
+         "      pull <host> <port> <repo> <tag>\n");
   free(g_buf);
   return 2;
 }
