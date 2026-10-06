@@ -91,4 +91,39 @@ int ort_json_validate(const char *s, size_t len);
 int ort_manifest_parse(const char *s, size_t len,
                        struct ort_manifest_s *out);
 
+/* 顶层字符串字段取值（白名单式）：给 registry 握手取 "token" 用。
+ *   只认**顶层**字段；找到且是字符串 → 拷进 dst（含 NUL，超 cap 报
+ *   E_SYNTAX）；找不到 / 值不是字符串 → E_REQUIRED；重复键取**先**出现的。
+ * 其余内容照常严格校验（不能因为只想要一个字段就放行畸形 JSON）。 */
+
+int ort_json_get_str(FAR const char *s, size_t len, FAR const char *key,
+                     FAR char *dst, size_t cap);
+
+/* OCI image index（manifest list）白名单提取。
+ *   manifests[].{digest, platform{os,architecture[,variant]}}
+ * 传 image manifest 进来会得 E_REQUIRED（没有 manifests 数组）——
+ * 客户端据此区分"这是索引"还是"这是镜像清单"（两个解析器互为判据）。 */
+
+#define ORT_INDEX_MAX 32
+
+struct ort_index_entry_s
+{
+  char digest[72];
+  char os[16];
+  char arch[16];
+  char variant[16];
+};
+
+struct ort_index_s
+{
+  uint32_t schema_version;
+  char     media_type[96];
+  uint32_t nentries;          /* 1..ORT_INDEX_MAX */
+  struct ort_index_entry_s entries[ORT_INDEX_MAX];
+  uint32_t ignored_fields;
+};
+
+int ort_index_parse(FAR const char *s, size_t len,
+                    FAR struct ort_index_s *out);
+
 #endif /* __APPS_TESTING_ORTIMG_ORT_JSON_H */

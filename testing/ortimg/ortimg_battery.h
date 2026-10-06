@@ -212,6 +212,82 @@ static const struct ort_case_s g_ort_cases[] =
 
 #define ORT_NCASES (sizeof(g_ort_cases) / sizeof(g_ort_cases[0]))
 
+/* ── get_str 用例（registry 握手取 token）───────────────────────────── */
+
+struct ort_strcase_s
+{
+  FAR const char *name;
+  FAR const char *json;
+  FAR const char *key;
+  size_t          cap;
+  int             expect;
+  FAR const char *expect_val;   /* expect==OK 时断言取值 */
+};
+
+static const struct ort_strcase_s g_ort_strcases[] =
+{
+  { "G1 正常取到 token", "{\"token\":\"abc.def.ghi\"}",
+    "token", 64, ORT_JSON_OK, "abc.def.ghi" },
+  { "G2 缺字段 → REQUIRED", "{\"a\":1}", "token", 64,
+    ORT_JSON_E_REQUIRED, NULL },
+  { "G3 值不是字符串 → SYNTAX", "{\"token\":123}", "token", 64,
+    ORT_JSON_E_SYNTAX, NULL },
+  { "G4 超过 cap → SYNTAX",
+    "{\"token\":\"0123456789012345678901234567890123456789\"}",
+    "token", 16, ORT_JSON_E_SYNTAX, NULL },
+  { "G5 只认顶层（嵌套找不到）",
+    "{\"x\":{\"token\":\"a\"}}", "token", 64,
+    ORT_JSON_E_REQUIRED, NULL },
+  { "G6 重复键取先出现的",
+    "{\"token\":\"first\",\"token\":\"second\"}", "token", 64,
+    ORT_JSON_OK, "first" },
+};
+
+#define ORT_NSTRCASES (sizeof(g_ort_strcases) / sizeof(g_ort_strcases[0]))
+
+/* ── index 用例 ────────────────────────────────────────────────────── */
+
+struct ort_idxcase_s
+{
+  FAR const char *name;
+  FAR const char *json;
+  int             expect;
+  int             expect_n;      /* expect==OK 时断言条数 */
+};
+
+static const struct ort_idxcase_s g_ort_idxcases[] =
+{
+  { "I1 两条 index（合法）",
+    "{\"schemaVersion\":2,"
+    "\"mediaType\":\"application/vnd.oci.image.index.v1+json\","
+    "\"manifests\":["
+    "{\"digest\":\"sha256:" D64 "\","
+    "\"platform\":{\"os\":\"linux\",\"architecture\":\"amd64\"}},"
+    "{\"digest\":\"sha256:" D64B "\","
+    "\"platform\":{\"os\":\"linux\",\"architecture\":\"arm\","
+    "\"variant\":\"v7\"}}]}",
+    ORT_JSON_OK, 2 },
+
+  { "I2 image manifest 进 index 解析器 → REQUIRED",
+    "{\"schemaVersion\":2,"
+    "\"config\":{\"digest\":\"sha256:" D64 "\",\"size\":1},"
+    "\"layers\":[{\"digest\":\"sha256:" D64B "\",\"size\":1}]}",
+    ORT_JSON_E_REQUIRED, 0 },
+
+  { "I3 条目缺 platform → REQUIRED",
+    "{\"schemaVersion\":2,"
+    "\"manifests\":[{\"digest\":\"sha256:" D64 "\"}]}",
+    ORT_JSON_E_REQUIRED, 0 },
+
+  { "I4 条目 digest 非法 → DIGEST",
+    "{\"schemaVersion\":2,"
+    "\"manifests\":[{\"digest\":\"sha256:zz\","
+    "\"platform\":{\"os\":\"linux\",\"architecture\":\"arm\"}}]}",
+    ORT_JSON_E_DIGEST, 0 },
+};
+
+#define ORT_NIDXCASES (sizeof(g_ort_idxcases) / sizeof(g_ort_idxcases[0]))
+
 /* ── 运行器：返回失败数 ─────────────────────────────────────────────── */
 
 static int ort_battery_run(FAR FILE *out)
@@ -219,10 +295,12 @@ static int ort_battery_run(FAR FILE *out)
   size_t i;
   int    fails = 0;
 
-  for (i = 0; i < ORT_NCASES; i++)
+  {
+    static struct ort_manifest_s mf;   /* ★ 静态：帧预算见文件尾注 */
+
+    for (i = 0; i < ORT_NCASES; i++)
     {
       FAR const struct ort_case_s *tc = &g_ort_cases[i];
-      struct ort_manifest_s mf;
       int got = ort_manifest_parse(tc->json, strlen(tc->json), &mf);
 
       if (got != tc->expect)
@@ -245,6 +323,7 @@ static int ort_battery_run(FAR FILE *out)
 
       fprintf(out, "[jtest] ok   %s\n", tc->name);
     }
+  }
 
   /* 非 NUL 结尾：把 P1 的字节拷进**恰好等长**的缓冲，紧贴另一块数据，
    * 解析器必须只读 len 界内（越界会把隔壁字节读进来，判据就脏了）。 */
@@ -291,6 +370,59 @@ static int ort_battery_run(FAR FILE *out)
     else
       {
         fprintf(out, "[jtest] ok   N23 超长输入（>64KB 拒，不读正文）\n");
+      }
+  }
+
+  /* get_str 族 */
+
+  {
+    size_t i;
+
+    for (i = 0; i < ORT_NSTRCASES; i++)
+      {
+        FAR const struct ort_strcase_s *tc = &g_ort_strcases[i];
+        char val[128];
+        int  got = ort_json_get_str(tc->json, strlen(tc->json), tc->key,
+                                    val, tc->cap);
+
+        if (got != tc->expect ||
+            (got == ORT_JSON_OK && tc->expect_val != NULL &&
+             strcmp(val, tc->expect_val) != 0))
+          {
+            fprintf(out, "[jtest] FAIL %s\n", tc->name);
+            fails++;
+          }
+        else
+          {
+            fprintf(out, "[jtest] ok   %s\n", tc->name);
+          }
+      }
+  }
+
+  /* index 族 —— ★ ix 必须 static：struct ort_index_s ≈4.5KB，目标机
+   * app 栈默认 4KB —— 放栈上会溢出踩堆、且**无声**（宿主机不限栈所以
+   * 宿主全绿、目标卡死；2026-10-06 实测踩过）。 */
+
+  {
+    static struct ort_index_s ix;
+    size_t i;
+
+    for (i = 0; i < ORT_NIDXCASES; i++)
+      {
+        FAR const struct ort_idxcase_s *tc = &g_ort_idxcases[i];
+        int got = ort_index_parse(tc->json, strlen(tc->json), &ix);
+
+        if (got != tc->expect ||
+            (got == ORT_JSON_OK && (int)ix.nentries != tc->expect_n))
+          {
+            fprintf(out, "[jtest] FAIL %s: got=%s n=%u\n", tc->name,
+                    ort_json_strerror(got), (unsigned)ix.nentries);
+            fails++;
+          }
+        else
+          {
+            fprintf(out, "[jtest] ok   %s\n", tc->name);
+          }
       }
   }
 

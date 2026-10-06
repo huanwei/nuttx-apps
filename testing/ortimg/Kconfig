@@ -19,6 +19,6 @@ config TESTING_ORTIMG_PRIORITY
 
 config TESTING_ORTIMG_STACKSIZE
 	int "ortimg stack size"
-	default 4096
+	default 8192
 
 endif # TESTING_ORTIMG
