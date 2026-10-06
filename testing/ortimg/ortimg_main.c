@@ -21,12 +21,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 #include "ort_json.h"
 #include "ortimg_battery.h"
 #include "ort_http.h"
 #include "ort_sha256.h"
+#include "ort_tar.h"
 
 #define ORTIMG_MAX_FILE  (ORT_JSON_MAX_INPUT + 1)
 
@@ -141,6 +143,446 @@ static int do_sha(FAR const char *path)
 
   printf("[ortimg] sha256 %s\n", path);
   printf("[ortimg]   = %s（%zu 字节）\n", hex, tot);
+  return 0;
+}
+
+/* ── 层体应用（tar → 目录，OCI 覆盖/whiteout 语义）─────────────────── *
+ *
+ * 受限递归的路径池：深度 ≤ 8，**每层独立静态缓冲**（递归的各级不互踩，
+ * 也不吃目标机那点栈 —— 踩过 4KB 栈的坑，见 §61 注）。
+ */
+
+#define ORT_DEPTH_MAX 8
+static char g_pfull[ORT_DEPTH_MAX][384];
+static char g_prel[ORT_DEPTH_MAX][320];
+
+/* 删除文件/整棵子树（whiteout 用；ENOENT 当成功——白掉不存在的名字
+ * 是合法的）。 */
+
+static int rm_subtree(FAR const char *path, int depth)
+{
+  struct stat st;
+
+  if (depth >= ORT_DEPTH_MAX)
+    {
+      return -1;
+    }
+
+  if (stat(path, &st) != 0)
+    {
+      return (errno == ENOENT) ? 0 : -1;
+    }
+
+  if (S_ISDIR(st.st_mode))
+    {
+      FAR DIR *d = opendir(path);
+      FAR struct dirent *de;
+      FAR char *child = g_pfull[depth];
+
+      if (d == NULL)
+        {
+          return -1;
+        }
+
+      while ((de = readdir(d)) != NULL)
+        {
+          if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            {
+              continue;
+            }
+
+          snprintf(child, sizeof(g_pfull[0]), "%s/%s", path, de->d_name);
+          if (rm_subtree(child, depth + 1) != 0)
+            {
+              closedir(d);
+              return -1;
+            }
+        }
+
+      closedir(d);
+      return rmdir(path);
+    }
+
+  return unlink(path);
+}
+
+struct tapply_s
+{
+  FAR const char *dest;
+  uint32_t        nent;
+  int             err;
+  FAR const char *errmsg;
+};
+
+static int rm_children(FAR const char *dir);
+
+/* 拼路径 + 显式截断检查（"静默截断"是本项目的大忌，宁可 fail-closed） */
+
+#define SPATH_OR_FAIL(...) \
+  do { \
+    if (snprintf(path, sizeof(path), __VA_ARGS__) >= (int)sizeof(path)) \
+      { \
+        a->err = 6; \
+        a->errmsg = "路径过长"; \
+        return -1; \
+      } \
+  } while (0)
+
+static int apply_sink(FAR void *arg, FAR const struct ort_tar_entry_s *e,
+                      FAR FILE *f)
+{
+  FAR struct tapply_s *a = (FAR struct tapply_s *)arg;
+  static char path[384];
+  FAR const char *base;
+  int fd;
+
+  a->nent++;
+
+  base = strrchr(e->name, '/');
+  base = (base != NULL) ? base + 1 : e->name;
+
+  /* whiteout：.wh.<name> 删目标、自身不落盘；.wh..wh..opq 清空本目录
+   * 现有内容（目录保留）。注：opq 按"遇到才清"，与同层先应用的条目
+   * 的相对顺序语义有细微出入（tar 顺序通常把 opq 排前）——如实标注。 */
+
+  if (strncmp(base, ".wh.", 4) == 0)
+    {
+      if (strcmp(base, ".wh..wh..opq") == 0)
+        {
+          size_t dl = (size_t)(base - e->name);   /* "dir/" 前缀长度（可 0） */
+
+          if (dl >= 1)
+            {
+              SPATH_OR_FAIL("%s/%.*s", a->dest, (int)dl - 1, e->name);
+            }
+          else
+            {
+              SPATH_OR_FAIL("%s", a->dest);
+            }
+
+          if (rm_children(path) != 0)
+            {
+              a->err = 4;
+              a->errmsg = "opaque 清理失败";
+              return -1;
+            }
+        }
+      else if (base == e->name)
+        {
+          SPATH_OR_FAIL("%s/%s", a->dest, base + 4);
+          if (rm_subtree(path, 0) != 0)
+            {
+              a->err = 5;
+              a->errmsg = "whiteout 删除失败";
+              return -1;
+            }
+        }
+      else
+        {
+          SPATH_OR_FAIL("%s/%.*s%s", a->dest,
+                        (int)(base - e->name), e->name, base + 4);
+          if (rm_subtree(path, 0) != 0)
+            {
+              a->err = 5;
+              a->errmsg = "whiteout 删除失败";
+              return -1;
+            }
+        }
+
+      return 0;
+    }
+
+  SPATH_OR_FAIL("%s/%s", a->dest, e->name);
+
+  if (e->typeflag == '5')
+    {
+      if (mkdir_p(path) != 0)
+        {
+          a->err = 1;
+          a->errmsg = "建目录失败";
+          return -1;
+        }
+
+      return 0;
+    }
+
+  /* 普通文件：先保父目录。注意 path 已被上面写过，父目录用 e->name 算。 */
+
+  if (base != e->name)
+    {
+      static char pdir[384];
+
+      if (snprintf(pdir, sizeof(pdir), "%s/%.*s", a->dest,
+                   (int)(base - e->name) - 1, e->name) >= (int)sizeof(pdir))
+        {
+          a->err = 6;
+          a->errmsg = "父路径过长";
+          return -1;
+        }
+
+      if (mkdir_p(pdir) != 0)
+        {
+          a->err = 1;
+          a->errmsg = "建父目录失败";
+          return -1;
+        }
+    }
+
+  fd = open(path, O_WRONLY | O_CREAT | O_TRUNC,
+            (e->mode & 0777) != 0 ? (e->mode & 0777) : 0644);
+  if (fd < 0)
+    {
+      a->err = 2;
+      a->errmsg = "建文件失败";
+      return -1;
+    }
+
+  {
+    static char buf[4096];
+    uint64_t left = e->size;
+
+    while (left > 0)
+      {
+        size_t want = (left < sizeof(buf)) ? (size_t)left : sizeof(buf);
+        size_t got = fread(buf, 1, want, f);
+        ssize_t wr;
+
+        if (got == 0)
+          {
+            close(fd);
+            a->err = 3;
+            a->errmsg = "层体数据提前结束";
+            return -1;
+          }
+
+        wr = write(fd, buf, got);
+        if (wr < 0 || (size_t)wr != got)
+          {
+            close(fd);
+            a->err = 3;
+            a->errmsg = "落盘失败";
+            return -1;
+          }
+
+        left -= got;
+      }
+  }
+
+  close(fd);
+  return 0;
+}
+
+/* 清一个目录下的全部内容（不删目录本身）—— opaque 用 */
+
+static int rm_children(FAR const char *dir)
+{
+  FAR DIR *d = opendir(dir);
+  FAR struct dirent *de;
+
+  if (d == NULL)
+    {
+      return (errno == ENOENT) ? 0 : -1;
+    }
+
+  while ((de = readdir(d)) != NULL)
+    {
+      if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+        {
+          continue;
+        }
+
+      snprintf(g_pfull[0], sizeof(g_pfull[0]), "%s/%s", dir, de->d_name);
+      if (rm_subtree(g_pfull[0], 1) != 0)
+        {
+          closedir(d);
+          return -1;
+        }
+    }
+
+  closedir(d);
+  return 0;
+}
+
+static int do_tar_apply(FAR const char *archive, FAR const char *dest)
+{
+  static struct tapply_s a;
+  FAR FILE *f;
+  uint32_t nent = 0;
+  int ret;
+
+  if (mkdir_p(dest) != 0)
+    {
+      printf("[ortimg] untar: 建目标目录失败 %s\n", dest);
+      return 2;
+    }
+
+  f = fopen(archive, "rb");
+  if (f == NULL)
+    {
+      printf("[ortimg] untar: 打不开 %s（errno=%d）\n", archive, errno);
+      return 2;
+    }
+
+  memset(&a, 0, sizeof(a));
+  a.dest = dest;
+  ret = ort_tar_walk(f, apply_sink, &a, &nent);
+  fclose(f);
+
+  if (ret != ORT_TAR_OK)
+    {
+      printf("[ortimg] untar FAIL: %s（已处理 %u 条目%s%s）\n",
+             ort_tar_strerror(ret), (unsigned)nent,
+             a.errmsg ? "，sink: " : "", a.errmsg ? a.errmsg : "");
+      return 1;
+    }
+
+  printf("[ortimg] untar OK: %u 条目 → %s\n", (unsigned)nent, dest);
+  return 0;
+}
+
+/* ── rootfs 清单（双环境逐字比较用）───────────────────────────────── *
+ * 格式：<相对路径> <大小> <sha256>
+ * 顺序规则：每层目录按名字字节序、遇到先序输出 —— 宿主 python 参考实现
+ * 用同一规则（见 proposals/scripts/ort-rootfs-ref.py）。 */
+
+static int file_hash_print(FAR FILE *out, FAR const char *full,
+                           FAR const char *rel)
+{
+  static char buf[4096];
+  struct ort_sha256_s c;
+  uint8_t raw[32];
+  char    hex[65];
+  FAR FILE *f = fopen(full, "rb");
+  size_t  n;
+  size_t  tot = 0;
+
+  if (f == NULL)
+    {
+      fprintf(out, "%s ??? 打不开（errno=%d）\n", rel, errno);
+      return -1;
+    }
+
+  ort_sha256_init(&c);
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+    {
+      ort_sha256_update(&c, buf, n);
+      tot += n;
+    }
+
+  fclose(f);
+  ort_sha256_final(&c, raw);
+  ort_sha256_hex(raw, hex);
+
+  fprintf(out, "%s %zu %s\n", rel, tot, hex);
+  return 0;
+}
+
+static int lsroot_walk(FAR FILE *out, FAR const char *full, FAR const char *rel,
+                       int depth, FAR size_t *nfiles)
+{
+  char last[128] = "";
+
+  for (;;)
+    {
+      FAR DIR *d = opendir(full);
+      FAR struct dirent *de;
+      char best[128] = "";
+
+      if (d == NULL)
+        {
+          return -1;
+        }
+
+      /* 每轮找"比 last 大的最小名字"——目录小，多扫几遍换零分配/零排序 */
+
+      while ((de = readdir(d)) != NULL)
+        {
+          if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            {
+              continue;
+            }
+
+          if (strcmp(de->d_name, last) <= 0)
+            {
+              continue;
+            }
+
+          if (best[0] == '\0' || strcmp(de->d_name, best) < 0)
+            {
+              strncpy(best, de->d_name, sizeof(best) - 1);
+              best[sizeof(best) - 1] = '\0';
+            }
+        }
+
+      closedir(d);
+
+      if (best[0] == '\0')
+        {
+          return 0;
+        }
+
+      if (depth >= ORT_DEPTH_MAX)
+        {
+          return -2;
+        }
+
+      {
+        FAR char *full2 = g_pfull[depth];
+        FAR char *rel2  = g_prel[depth];
+        struct stat st;
+
+        snprintf(full2, sizeof(g_pfull[0]), "%s/%s", full, best);
+        if (rel[0] != '\0')
+          {
+            snprintf(rel2, sizeof(g_prel[0]), "%s/%s", rel, best);
+          }
+        else
+          {
+            snprintf(rel2, sizeof(g_prel[0]), "%s", best);
+          }
+
+        if (stat(full2, &st) != 0)
+          {
+            return -1;
+          }
+
+        if (S_ISDIR(st.st_mode))
+          {
+            int rr = lsroot_walk(out, full2, rel2, depth + 1, nfiles);
+
+            if (rr != 0)
+              {
+                return rr;
+              }
+          }
+        else
+          {
+            if (file_hash_print(out, full2, rel2) != 0)
+              {
+                return -1;
+              }
+
+            (*nfiles)++;
+          }
+      }
+
+      strncpy(last, best, sizeof(last) - 1);
+      last[sizeof(last) - 1] = '\0';
+    }
+}
+
+static int do_lsroot(FAR const char *root)
+{
+  size_t nf = 0;
+  int ret = lsroot_walk(stdout, root, "", 0, &nf);
+
+  if (ret != 0)
+    {
+      printf("[ortimg] LSROOT FAIL（%d）\n", ret);
+      return 1;
+    }
+
+  printf("[ortimg] lsroot: %zu 个文件\n", nf);
   return 0;
 }
 
@@ -610,6 +1052,53 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
           }
       }
 
+      /* ⑦ 层体解包 → rootfs（OCI 覆盖/whiteout 语义：后层盖前层） */
+
+      {
+        static char rootfs[256];
+        char rs[160];
+        size_t k = 0;
+        uint32_t i;
+
+        while (repo[k] != '\0' && k < sizeof(rs) - 1)
+          {
+            rs[k] = (repo[k] == '/') ? '_' : repo[k];
+            k++;
+          }
+
+        rs[k] = '\0';
+
+        if (snprintf(rootfs, sizeof(rootfs), ORT_STORE_ROOT "/rootfs/%s@%s",
+                     rs, tag) >= (int)sizeof(rootfs))
+          {
+            printf("[pull]    rootfs 路径过长（repo/tag 请短些）\n");
+            return 2;
+          }
+
+        for (i = 0; i < g_mf.nlayers && i < 8; i++)
+          {
+            static char lp[300];
+            FAR const char *hex2 = g_mf.layers[i].digest;
+
+            if (strncmp(hex2, "sha256:", 7) == 0)
+              {
+                hex2 += 7;
+              }
+
+            snprintf(lp, sizeof(lp),
+                     ORT_STORE_ROOT "/images/sha256/%s/layer.tar", hex2);
+
+            printf("[pull] ⑦ 应用层[%u] → %s\n", (unsigned)i, rootfs);
+            if (do_tar_apply(lp, rootfs) != 0)
+              {
+                printf("[pull]    层[%u]应用失败 → pull 失败\n", (unsigned)i);
+                return 1;
+              }
+          }
+
+        printf("[pull]    rootfs: %s\n", rootfs);
+      }
+
       printf("[pull] PULL RESULT: OK\n");
     }
 
@@ -648,9 +1137,36 @@ int main(int argc, FAR char *argv[])
       return fails == 0 ? 0 : 1;
     }
 
+  if (argc >= 2 && strcmp(argv[1], "tartest") == 0)
+    {
+      int fails = ort_tar_battery_run(stdout);
+
+      printf("[ortimg] TARTEST RESULT: %s（%u 用例）\n",
+             fails == 0 ? "PASS" : "*** FAIL ***",
+             (unsigned)ORT_NTARCASES);
+      free(g_buf);
+      return fails == 0 ? 0 : 1;
+    }
+
   if (argc >= 3 && strcmp(argv[1], "sha") == 0)
     {
       int r = do_sha(argv[2]);
+
+      free(g_buf);
+      return r;
+    }
+
+  if (argc >= 4 && strcmp(argv[1], "untar") == 0)
+    {
+      int r = do_tar_apply(argv[2], argv[3]);
+
+      free(g_buf);
+      return r;
+    }
+
+  if (argc >= 3 && strcmp(argv[1], "lsroot") == 0)
+    {
+      int r = do_lsroot(argv[2]);
 
       free(g_buf);
       return r;
@@ -703,9 +1219,10 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
-  printf("用法: orting jsontest | shatest | manifest <path> | validate <path> |\n"
-         "      sha <path> | httpget <host> <port> <path> |\n"
-         "      pull <host> <port> <repo> <tag>\n");
+  printf("用法: orting jsontest | shatest | tartest |\n"
+         "      manifest <path> | validate <path> | sha <path> |\n"
+         "      untar <archive> <destdir> | lsroot <dir> |\n"
+         "      httpget <host> <port> <path> | pull <host> <port> <repo> <tag>\n");
   free(g_buf);
   return 2;
 }

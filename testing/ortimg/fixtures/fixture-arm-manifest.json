@@ -8,13 +8,18 @@
   },
   "layers": [
     {
-      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-      "digest": "sha256:a968af9378bea3ea0a2a2460b20557a72011125d10ca278c655677b22f8577c8",
-      "size": 262144
+      "mediaType": "application/vnd.oci.image.layer.v1.tar",
+      "digest": "sha256:b3d07b8fe1c30309e7f0c2a34f359cb81ce4763ee35a210a460f67c0e07bcbb4",
+      "size": 81920
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar",
+      "digest": "sha256:7c6c73c01e954d51cf91bd5f0718e4883925bad19de283633eee0f5f8094262d",
+      "size": 10240
     }
   ],
   "annotations": {
     "org.opencontainers.image.title": "ort-fixture",
-    "note": "合成夹具：整链 digest 自洽（本增量只下载/校验 layer）"
+    "note": "合成夹具：整链 digest 自洽；layer1 含覆盖与 whiteout"
   }
 }

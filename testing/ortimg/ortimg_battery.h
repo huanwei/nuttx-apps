@@ -619,4 +619,449 @@ static int ort_hash_battery_run(FAR FILE *out)
   return fails;
 }
 
+/* ── tar 电池（[ttest]）────────────────────────────────────────────── *
+ *
+ * 用例图在内存里现造（timg_* 小工具），落 /tmp 临时文件后走真实文件
+ * 路径 —— 双环境同一份造图代码，避免"宿主 python 造的图和目标机读的
+ * 不是一回事"。
+ */
+
+#include "ort_tar.h"
+
+#define TARIMG_MAX 16384
+
+static uint8_t g_timg[TARIMG_MAX];
+static size_t  g_tlen;
+
+static void timg_octal(FAR uint8_t *p, size_t len, uint64_t v)
+{
+  size_t i;
+
+  for (i = 0; i < len; i++)
+    {
+      p[len - 1 - i] = (uint8_t)('0' + (v & 7));
+      v >>= 3;
+    }
+}
+
+static void timg_fixsum(FAR uint8_t *h)
+{
+  unsigned sum = 0;
+  size_t i;
+
+  memset(h + 148, ' ', 8);
+  for (i = 0; i < 512; i++)
+    {
+      sum += h[i];
+    }
+
+  timg_octal(h + 148, 8, sum);
+}
+
+static void timg_reset(void)
+{
+  memset(g_timg, 0, sizeof(g_timg));
+  g_tlen = 0;
+}
+
+static void timg_hdr(FAR const char *name, uint64_t size, char type,
+                     FAR const char *prefix)
+{
+  uint8_t *h = g_timg + g_tlen;
+
+  if (name != NULL)
+    {
+      size_t l = strlen(name);
+
+      if (l > 100)
+        {
+          l = 100;
+        }
+
+      memcpy(h, name, l);
+    }
+
+  timg_octal(h + 100, 8, 0644);   /* mode */
+  timg_octal(h + 108, 8, 0);      /* uid */
+  timg_octal(h + 116, 8, 0);      /* gid */
+  timg_octal(h + 124, 12, size);  /* size */
+  timg_octal(h + 136, 12, 0);     /* mtime */
+  h[156] = (uint8_t)type;
+  memcpy(h + 257, "ustar", 5);
+  h[262] = '\0';
+  h[263] = '0';
+  h[264] = '0';
+
+  if (prefix != NULL)
+    {
+      size_t l = strlen(prefix);
+
+      if (l > 155)
+        {
+          l = 155;
+        }
+
+      memcpy(h + 345, prefix, l);
+    }
+
+  timg_fixsum(h);
+  g_tlen += 512;
+}
+
+static void timg_data(FAR const void *data, size_t len)
+{
+  memcpy(g_timg + g_tlen, data, len);
+  g_tlen += (len + 511) & ~(size_t)511;
+}
+
+static void timg_end(void)
+{
+  g_tlen += 1024;                 /* 两个零块（reset 后本就全 0） */
+}
+
+struct tcollect_s
+{
+  int      n;
+  char     name[8][80];
+  uint64_t size[8];
+  char     type[8];
+  char     data[8][32];
+  size_t   dlen[8];
+};
+
+static int tcollect_sink(FAR void *arg,
+                         FAR const struct ort_tar_entry_s *e, FAR FILE *f)
+{
+  FAR struct tcollect_s *c = (FAR struct tcollect_s *)arg;
+  int i = c->n;
+
+  if (i < 8)
+    {
+      size_t l = strlen(e->name);
+
+      if (l > sizeof(c->name[0]) - 1)
+        {
+          l = sizeof(c->name[0]) - 1;
+        }
+
+      memcpy(c->name[i], e->name, l);
+      c->name[i][l] = '\0';
+      c->size[i] = e->size;
+      c->type[i] = e->typeflag;
+      c->data[i][0] = '\0';
+      c->dlen[i] = 0;
+
+      if (e->typeflag == '0' && e->size > 0)
+        {
+          size_t want = (e->size < sizeof(c->data[0]) - 1) ?
+                        (size_t)e->size : sizeof(c->data[0]) - 1;
+
+          c->dlen[i] = fread(c->data[i], 1, want, f);
+          c->data[i][c->dlen[i]] = '\0';
+        }
+    }
+
+  c->n++;
+  return 0;
+}
+
+static int tar_run(FAR FILE *out, FAR const char *name, FAR uint32_t *nent,
+                   FAR struct tcollect_s *c)
+{
+  static const char *tmp = "/tmp/ort-ttest.tar";
+  FAR FILE *f = fopen(tmp, "wb");
+  int ret;
+
+  if (f == NULL)
+    {
+      fprintf(out, "[ttest] FAIL %s: 临时文件开不了\n", name);
+      return -100;
+    }
+
+  fwrite(g_timg, 1, g_tlen, f);
+  fclose(f);
+
+  memset(c, 0, sizeof(*c));
+  f = fopen(tmp, "rb");
+  if (f == NULL)
+    {
+      fprintf(out, "[ttest] FAIL %s: 临时文件读不了\n", name);
+      return -100;
+    }
+
+  ret = ort_tar_walk(f, tcollect_sink, c, nent);
+  fclose(f);
+  return ret;
+}
+
+/* 用例数（T1-T14；tar 用例是命令式写的，没有表可数 —— 增删必须同步） */
+
+#define ORT_NTARCASES 14
+
+static int ort_tar_battery_run(FAR FILE *out)
+{
+  struct tcollect_s c;
+  uint32_t nent;
+  int      fails = 0;
+  int      ret;
+
+  /* T1 单文件 */
+
+  timg_reset();
+  timg_hdr("a.txt", 6, '0', NULL);
+  timg_data("hello\n", 6);
+  timg_end();
+  ret = tar_run(out, "T1", &nent, &c);
+  if (ret != ORT_TAR_OK || nent != 1 || strcmp(c.name[0], "a.txt") != 0 ||
+      c.size[0] != 6 || strcmp(c.data[0], "hello\n") != 0)
+    {
+      fprintf(out, "[ttest] FAIL T1 单文件: ret=%s n=%u\n",
+              ort_tar_strerror(ret), (unsigned)nent);
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T1 单文件（名字/大小/内容）\n");
+    }
+
+  /* T2 目录 + prefix 拼接 */
+
+  timg_reset();
+  timg_hdr("d", 0, '5', NULL);
+  timg_hdr("a.txt", 3, '0', "deep");
+  timg_data("xyz", 3);
+  timg_end();
+  ret = tar_run(out, "T2", &nent, &c);
+  if (ret != ORT_TAR_OK || nent != 2 || c.type[0] != '5' ||
+      strcmp(c.name[0], "d") != 0 || strcmp(c.name[1], "deep/a.txt") != 0 ||
+      strcmp(c.data[1], "xyz") != 0)
+    {
+      fprintf(out, "[ttest] FAIL T2 目录+prefix: ret=%s n=%u n1=%s\n",
+              ort_tar_strerror(ret), (unsigned)nent, c.name[1]);
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T2 目录 + prefix 拼接\n");
+    }
+
+  /* T3 名字规范化（./ 与 a/./b） */
+
+  timg_reset();
+  timg_hdr("./x", 1, '0', NULL);
+  timg_data("X", 1);
+  timg_hdr("a/./b", 1, '0', NULL);
+  timg_data("B", 1);
+  timg_end();
+  ret = tar_run(out, "T3", &nent, &c);
+  if (ret != ORT_TAR_OK || nent != 2 || strcmp(c.name[0], "x") != 0 ||
+      strcmp(c.name[1], "a/b") != 0)
+    {
+      fprintf(out, "[ttest] FAIL T3 规范化: n0=%s n1=%s\n",
+              c.name[0], c.name[1]);
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T3 规范化（./ 与 a/./b）\n");
+    }
+
+  /* T4 空 tar（仅 end marker） */
+
+  timg_reset();
+  timg_end();
+  ret = tar_run(out, "T4", &nent, &c);
+  if (ret != ORT_TAR_OK || nent != 0)
+    {
+      fprintf(out, "[ttest] FAIL T4 空 tar: ret=%s n=%u\n",
+              ort_tar_strerror(ret), (unsigned)nent);
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T4 空 tar（0 条目）\n");
+    }
+
+  /* T5 magic 坏 */
+
+  timg_reset();
+  timg_hdr("a.txt", 0, '0', NULL);
+  timg_end();
+  g_timg[257] = 'X';
+  ret = tar_run(out, "T5", &nent, &c);
+  if (ret != ORT_TAR_E_BADMAGIC)
+    {
+      fprintf(out, "[ttest] FAIL T5 magic: got=%s expect=BADMAGIC\n",
+              ort_tar_strerror(ret));
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T5 magic 坏 → BADMAGIC\n");
+    }
+
+  /* T6 checksum 坏（改一个字节不修校验和） */
+
+  timg_reset();
+  timg_hdr("a.txt", 1, '0', NULL);
+  timg_data("A", 1);
+  timg_end();
+  g_timg[124] ^= 1;
+  ret = tar_run(out, "T6", &nent, &c);
+  if (ret != ORT_TAR_E_BADSUM)
+    {
+      fprintf(out, "[ttest] FAIL T6 checksum: got=%s expect=BADSUM\n",
+              ort_tar_strerror(ret));
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T6 checksum 坏 → BADSUM\n");
+    }
+
+  /* T7 绝对路径 */
+
+  timg_reset();
+  timg_hdr("/etc/passwd", 1, '0', NULL);
+  timg_data("x", 1);
+  timg_end();
+  ret = tar_run(out, "T7", &nent, &c);
+  if (ret != ORT_TAR_E_PATH)
+    {
+      fprintf(out, "[ttest] FAIL T7 绝对路径: got=%s expect=PATH\n",
+              ort_tar_strerror(ret));
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T7 绝对路径 → PATH\n");
+    }
+
+  /* T8 ".." 逃逸 */
+
+  timg_reset();
+  timg_hdr("a/../../x", 1, '0', NULL);
+  timg_data("x", 1);
+  timg_end();
+  ret = tar_run(out, "T8", &nent, &c);
+  if (ret != ORT_TAR_E_PATH)
+    {
+      fprintf(out, "[ttest] FAIL T8 ..逃逸: got=%s expect=PATH\n",
+              ort_tar_strerror(ret));
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T8 \"..\" 逃逸 → PATH\n");
+    }
+
+  /* T9 symlink 不收 */
+
+  timg_reset();
+  timg_hdr("lnk", 0, '2', NULL);
+  timg_end();
+  ret = tar_run(out, "T9", &nent, &c);
+  if (ret != ORT_TAR_E_TYPE)
+    {
+      fprintf(out, "[ttest] FAIL T9 symlink: got=%s expect=TYPE\n",
+              ort_tar_strerror(ret));
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T9 symlink → TYPE（明确不收）\n");
+    }
+
+  /* T10 pax 扩展头不收 */
+
+  timg_reset();
+  timg_hdr("PaxHead", 0, 'x', NULL);
+  timg_end();
+  ret = tar_run(out, "T10", &nent, &c);
+  if (ret != ORT_TAR_E_TYPE)
+    {
+      fprintf(out, "[ttest] FAIL T10 pax: got=%s expect=TYPE\n",
+              ort_tar_strerror(ret));
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T10 pax 扩展头 → TYPE（不静默丢语义）\n");
+    }
+
+  /* T11 数据截断（声明 100B，实体只有一个头） */
+
+  timg_reset();
+  timg_hdr("a.txt", 100, '0', NULL);
+  ret = tar_run(out, "T11", &nent, &c);
+  if (ret != ORT_TAR_E_SHORT)
+    {
+      fprintf(out, "[ttest] FAIL T11 截断: got=%s expect=SHORT\n",
+              ort_tar_strerror(ret));
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T11 数据截断 → SHORT\n");
+    }
+
+  /* T12 size 非八进制（修好校验和，确保报的是 SYNTAX 不是 BADSUM） */
+
+  timg_reset();
+  timg_hdr("a.txt", 1, '0', NULL);
+  timg_data("A", 1);
+  timg_end();
+  g_timg[131] = '8';              /* size 字段内塞非八进制 */
+  timg_fixsum(g_timg);            /* 头在 offset 0 */
+  ret = tar_run(out, "T12", &nent, &c);
+  if (ret != ORT_TAR_E_SYNTAX)
+    {
+      fprintf(out, "[ttest] FAIL T12 size 非八进制: got=%s expect=SYNTAX\n",
+              ort_tar_strerror(ret));
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T12 size 非八进制 → SYNTAX\n");
+    }
+
+  /* T13 gzip 魔数 → 明确报 GZIP */
+
+  timg_reset();
+  g_timg[0] = 0x1f;
+  g_timg[1] = 0x8b;
+  g_tlen = 512;
+  ret = tar_run(out, "T13", &nent, &c);
+  if (ret != ORT_TAR_E_GZIP)
+    {
+      fprintf(out, "[ttest] FAIL T13 gzip: got=%s expect=GZIP\n",
+              ort_tar_strerror(ret));
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T13 gzip 魔数 → GZIP（明确不收）\n");
+    }
+
+  /* T14 v7 老式目录（type '0' + 名尾 /） */
+
+  timg_reset();
+  timg_hdr("dir/", 0, '0', NULL);
+  timg_end();
+  ret = tar_run(out, "T14", &nent, &c);
+  if (ret != ORT_TAR_OK || nent != 1 || c.type[0] != '5' ||
+      strcmp(c.name[0], "dir") != 0)
+    {
+      fprintf(out, "[ttest] FAIL T14 v7 目录: ret=%s type=%c name=%s\n",
+              ort_tar_strerror(ret), c.type[0], c.name[0]);
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T14 v7 老式目录（名尾 /）\n");
+    }
+
+  return fails;
+}
+
 #endif /* __APPS_TESTING_ORTIMG_ORTIMG_BATTERY_H */

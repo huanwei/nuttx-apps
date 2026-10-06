@@ -64,6 +64,14 @@ int main(int argc, char *argv[])
     fails += hfails;
   }
 
+  {
+    int tfails = ort_tar_battery_run(stdout);
+
+    printf("[ortimg] TARTEST RESULT: %s（%u 用例）\n",
+           tfails == 0 ? "PASS" : "*** FAIL ***", (unsigned)ORT_NTARCASES);
+    fails += tfails;
+  }
+
   /* 2) 真实夹具：alpine image manifest（含 annotations，白名单跳过） */
 
   {
