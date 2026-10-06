@@ -9,9 +9,9 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-06 orting（A1 第六步：gzip 层体支持 / zlib 读源化）
+# 最近配对事件：2026-10-06 orting（A1→A2 桥：镜像到进程 orthello）
 #               —— apps 侧改动，内核未动（nuttx= 保持上轮 d7c05a5905；
-#               zlib 开关走 apps 配置：LIB_ZLIB + MAX_WBITS/MEM_LEVEL）。
+#               本轮内核仅探针（已回退零改动）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
