@@ -1,0 +1,24 @@
+config TESTING_ORTIMG
+	tristate "[ORT-A] ort_image 原型（A1：受限 JSON / OCI manifest）"
+	default n
+	---help---
+		[ORT-A / A1] ORT-A 镜像管理的第一块砖（手册 §三·补六十一）。
+
+		当前内容：受限 JSON 解析器 + OCI image manifest 提取（白名单）。
+		设计三条钉死：无动态分配 / 深度有界 / 字段白名单（见 ort_json.h）。
+
+		用法：ortimg jsontest（双环境电池）/ manifest <path> / validate <path>
+		目标机上 /system 是 hostfs，夹具路径照仓库树写：
+		  /system/testing/ortimg/fixtures/alpine-manifest.json
+
+if TESTING_ORTIMG
+
+config TESTING_ORTIMG_PRIORITY
+	int "ortimg task priority"
+	default 100
+
+config TESTING_ORTIMG_STACKSIZE
+	int "ortimg stack size"
+	default 4096
+
+endif # TESTING_ORTIMG

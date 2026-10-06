@@ -1,0 +1,3 @@
+ifneq ($(CONFIG_TESTING_ORTIMG),)
+CONFIGURED_APPS += $(APPDIR)/testing/ortimg
+endif
