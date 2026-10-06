@@ -137,12 +137,35 @@ static int do_sha(FAR const char *path)
       tot += n;
     }
 
-  fclose(f);
   ort_sha256_final(&c, raw);
   ort_sha256_hex(raw, hex);
 
   printf("[ortimg] sha256 %s\n", path);
   printf("[ortimg]   = %s（%zu 字节）\n", hex, tot);
+
+  /* ★ seek 复验（§67 排查用）：回卷后重读一遍再哈希。两次不一致 =
+   * 该文件系统的 seek/重读语义不可靠（unionfs 的 ELF 装载故障即此类）。 */
+
+  if (fseek(f, 0, SEEK_SET) == 0)
+    {
+      ort_sha256_init(&c);
+      tot = 0;
+      while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        {
+          ort_sha256_update(&c, buf, n);
+          tot += n;
+        }
+
+      ort_sha256_final(&c, raw);
+      ort_sha256_hex(raw, hex);
+      printf("[ortimg]   = %s（seek 重读，%zu 字节）\n", hex, tot);
+    }
+  else
+    {
+      printf("[ortimg]   = seek 不支持（errno=%d）\n", errno);
+    }
+
+  fclose(f);
   return 0;
 }
 

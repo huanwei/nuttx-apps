@@ -1,0 +1,19 @@
+config TESTING_ORTHELLO
+	tristate "[ORT-A] 镜像里的程序（夹具角色；被嵌进镜像层后从挂载视图 exec）"
+	default n
+	---help---
+		[ORT-A / A1→A2] "镜像到进程"的桥：本程序被打进 OCI 层
+		（fixture-gen 嵌 bin/orthello 进 layer0），运行时从 unionfs
+		挂载视图 exec，读一个镜像里的文件并打印内容（手册 §三·补六十七）。
+
+if TESTING_ORTHELLO
+
+config TESTING_ORTHELLO_PRIORITY
+	int "orthello task priority"
+	default 100
+
+config TESTING_ORTHELLO_STACKSIZE
+	int "orthello stack size"
+	default 4096
+
+endif # TESTING_ORTHELLO

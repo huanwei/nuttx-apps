@@ -9,8 +9,8 @@
   "layers": [
     {
       "mediaType": "application/vnd.oci.image.layer.v1.tar",
-      "digest": "sha256:b3d07b8fe1c30309e7f0c2a34f359cb81ce4763ee35a210a460f67c0e07bcbb4",
-      "size": 81920
+      "digest": "sha256:3fa8597587caedc2825f626c8f96750db8395b4ff08e91e63427cb86ea0f9ba2",
+      "size": 215040
     },
     {
       "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
