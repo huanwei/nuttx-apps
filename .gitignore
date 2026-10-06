@@ -49,3 +49,4 @@ compile_commands.json
 .aider*
 .clang-format
 .cache
+testing/orthello/*.tar
