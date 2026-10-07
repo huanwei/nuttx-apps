@@ -941,11 +941,19 @@ static int do_run(FAR const char *view, FAR const char *path)
  *   有 FAULT 事件 → 崩溃（报 pc/addr/faults —— "容器为什么死"）
  *   有 EXIT 事件  → 正常退出（报 code；EXIT 事件要求域已绑）
  *   都无          → 无事件（如实报，不退化为瞎猜）
+ * §75 起再加**重启策略**：崩溃且预算未耗尽 → 重启（ORT_SUP_RESTARTS）；
+ * 耗尽 → 放弃（记一次降级）；重启后转好 → 报"恢复"；首跑即好 →
+ * "直接正常"。段末汇总 —— M 侧降级状态机的最小版。
  * 退场释放监督者槽（PR_ORT_SUPERVISOR_RESET —— 原型测试 API）。
  * 白名单：CONFIG_ORT_SUPERVISOR_TASKNAMES 必须含 orting（本 SKU 已配）。
  *
  * 用法：orting sup <view> <config1> [config2 ...]
  */
+
+/* 重启预算（§75 重启策略）：崩溃容器最多重启 ORT_SUP_RESTARTS 次，
+ * 耗尽即放弃 —— M 侧降级状态机（重启预算 → DEGRADED）的最小版。 */
+
+#define ORT_SUP_RESTARTS 2
 
 static void ort_sup_wake(int signo)
 {
@@ -954,6 +962,9 @@ static void ort_sup_wake(int signo)
 
 static int do_sup(FAR const char *view, int ncfg, FAR char * const *cfgs)
 {
+  int given_up = 0;    /* 重启预算耗尽 */
+  int recovered = 0;   /* 重启后正常退出 */
+  int clean = 0;       /* 首跑即正常 */
   int rc = 0;
   int ret;
   int i;
@@ -983,97 +994,143 @@ static int do_sup(FAR const char *view, int ncfg, FAR char * const *cfgs)
 
   for (i = 0; i < ncfg; i++)
     {
-      struct ort_faultrec_s rec;
-      pid_t pid = -1;
-      int   st = 0;
-      int   nev = 0;
-      int   nf = 0;
-      int   nx = 0;
-      uintptr_t last_pc = 0;
-      uintptr_t last_addr = 0;
-      uint32_t  last_faults = 0;
-      int       last_code = 0;
+      int restarts = 0;
+      int verdict = 0;   /* 0=无事件/未拉起 1=崩溃（预算耗尽）2=正常 */
 
-      ret = run_spawn(view, cfgs[i], &pid);
-      if (ret != 0)
+      /* 每次尝试 = spawn → 绑域 → wait → 抽事件 → 判别；崩溃且预算
+       * 未耗尽 → 重启（§75 重启策略）。 */
+
+      for (;;)
         {
-          printf("[sup] 容器[%d] 未拉起（r=%d）——继续后续\n", i, ret);
-          rc = 1;
-          continue;
-        }
+          struct ort_faultrec_s rec;
+          pid_t pid = -1;
+          int   st = 0;
+          int   nev = 0;
+          int   nf = 0;
+          int   nx = 0;
+          uintptr_t last_pc = 0;
+          uintptr_t last_addr = 0;
+          uint32_t  last_faults = 0;
+          int       last_code = 0;
 
-      /* 按 pid 绑域（监督者权限）：域≠0 时内核才发 EXIT 事件；
-       * A 侧域语义是 no-op（MMU），绑域 = 记录 + 事件资格 */
-
-      ret = prctl(PR_SET_ORT_DOMAIN, i + 1, (pid_t)pid);
-      if (ret < 0)
-        {
-          printf("[sup] 容器[%d] 绑域失败: %d（继续——FAULT 不依赖域）\n",
-                 i, ret);
-        }
-
-      do
-        {
-          ret = waitpid(pid, &st, 0);
-        }
-      while (ret < 0 && errno == EINTR);   /* 醒信号打断 → 继续等 */
-
-      if (ret < 0)
-        {
-          printf("[sup] 容器[%d] waitpid 失败（errno=%d）\n", i, errno);
-          rc = 1;
-          continue;
-        }
-
-      /* 抽事件队列（只认本容器；队列是监督者私有视图，串行下无夹杂） */
-
-      while ((ret = prctl(PR_GET_ORT_FAULT, &rec)) > 0)
-        {
-          nev++;
-
-          if (rec.kind == 0 && rec.victim == (int)pid)
+          ret = run_spawn(view, cfgs[i], &pid);
+          if (ret != 0)
             {
-              nf++;
-              last_pc = rec.pc;
-              last_addr = rec.addr;
-              last_faults = rec.faults;
+              printf("[sup] 容器[%d] 未拉起（r=%d）——放弃该容器\n", i, ret);
+              rc = 1;
+              break;
             }
-          else if (rec.kind == 1 && rec.victim == (int)pid)
+
+          /* 按 pid 绑域（监督者权限）：域≠0 时内核才发 EXIT 事件；
+           * A 侧域语义是 no-op（MMU），绑域 = 记录 + 事件资格 */
+
+          ret = prctl(PR_SET_ORT_DOMAIN, i + 1, (pid_t)pid);
+          if (ret < 0)
             {
-              nx++;
-              last_code = rec.code;
+              printf("[sup] 容器[%d] 绑域失败: %d（继续——FAULT 不依赖域）\n",
+                     i, ret);
+            }
+
+          do
+            {
+              ret = waitpid(pid, &st, 0);
+            }
+          while (ret < 0 && errno == EINTR);   /* 醒信号打断 → 继续等 */
+
+          if (ret < 0)
+            {
+              printf("[sup] 容器[%d] waitpid 失败（errno=%d）\n", i, errno);
+              rc = 1;
+              break;
+            }
+
+          /* 抽事件队列（只认本容器；队列是监督者私有视图，串行下无夹杂） */
+
+          while ((ret = prctl(PR_GET_ORT_FAULT, &rec)) > 0)
+            {
+              nev++;
+
+              if (rec.kind == 0 && rec.victim == (int)pid)
+                {
+                  nf++;
+                  last_pc = rec.pc;
+                  last_addr = rec.addr;
+                  last_faults = rec.faults;
+                }
+              else if (rec.kind == 1 && rec.victim == (int)pid)
+                {
+                  nx++;
+                  last_code = rec.code;
+                }
+              else
+                {
+                  printf("[sup] （读到非本容器记录 seq=%u victim=%d kind=%u）\n",
+                         (unsigned)rec.seq, rec.victim, (unsigned)rec.kind);
+                }
+            }
+
+          if (ret < 0)
+            {
+              printf("[sup] 读事件失败: %d（errno=%d）\n", ret, errno);
+              rc = 1;
+            }
+
+          printf("[sup] 容器[%d] pid=%d 退出码=%d 事件=%d（FAULT %d / EXIT %d）\n",
+                 i, (int)pid, WEXITSTATUS(st), nev, nf, nx);
+
+          if (nf > 0)
+            {
+              printf("[sup] 判别: 崩溃（FAULT pc=0x%x addr=0x%x faults=%u）\n",
+                     (unsigned)last_pc, (unsigned)last_addr,
+                     (unsigned)last_faults);
+
+              if (restarts < ORT_SUP_RESTARTS)
+                {
+                  restarts++;
+                  printf("[sup] 容器[%d] 重启 %d/%d（预算 %d）\n",
+                         i, restarts, ORT_SUP_RESTARTS, ORT_SUP_RESTARTS);
+                  continue;
+                }
+
+              printf("[sup] 容器[%d] 重启预算耗尽 → 放弃（记一次降级）\n", i);
+              given_up++;
+              verdict = 1;
+              break;
+            }
+
+          if (nx > 0)
+            {
+              printf("[sup] 判别: 正常退出（EXIT 事件 code=%d）\n", last_code);
+              verdict = 2;
+              break;
+            }
+
+          printf("[sup] 判别: 无事件（退出码=%d）\n", WEXITSTATUS(st));
+          verdict = 0;
+          break;
+        }
+
+      if (verdict == 2)
+        {
+          if (restarts > 0)
+            {
+              printf("[sup] 容器[%d] 恢复（重启 %d 次后正常退出）\n",
+                     i, restarts);
+              recovered++;
             }
           else
             {
-              printf("[sup] （读到非本容器记录 seq=%u victim=%d kind=%u）\n",
-                     (unsigned)rec.seq, rec.victim, (unsigned)rec.kind);
+              clean++;
             }
         }
-
-      if (ret < 0)
+      else if (verdict == 0)
         {
-          printf("[sup] 读事件失败: %d（errno=%d）\n", ret, errno);
-          rc = 1;
-        }
-
-      printf("[sup] 容器[%d] pid=%d 退出码=%d 事件=%d（FAULT %d / EXIT %d）\n",
-             i, (int)pid, WEXITSTATUS(st), nev, nf, nx);
-
-      if (nf > 0)
-        {
-          printf("[sup] 判别: 崩溃（FAULT pc=0x%x addr=0x%x faults=%u）\n",
-                 (unsigned)last_pc, (unsigned)last_addr,
-                 (unsigned)last_faults);
-        }
-      else if (nx > 0)
-        {
-          printf("[sup] 判别: 正常退出（EXIT 事件 code=%d）\n", last_code);
-        }
-      else
-        {
-          printf("[sup] 判别: 无事件（退出码=%d）\n", WEXITSTATUS(st));
+          printf("[sup] 容器[%d] 无可判结果——如实记（不计入汇总）\n", i);
         }
     }
+
+  printf("[sup] 汇总: 放弃 %d 个 / 恢复 %d 个 / 直接正常 %d 个（预算 %d）\n",
+         given_up, recovered, clean, ORT_SUP_RESTARTS);
 
   ret = prctl(PR_ORT_SUPERVISOR_RESET);
   printf("[sup] 卸任: %s（槽释放）\n", ret == 0 ? "OK" : "失败");

@@ -18,9 +18,10 @@
  *   直接跑（对照臂）→ env ORT_FIXTURE=(无) + cwd=/（未注入）——
  *   两臂同形不同值，判据靠计数区分来源。
  *
- * §73 起第三个参数是**故障模式**（crash / udf / handler，见 main 内注）——
- *   经侧配置（fixture-{crash,udf,handler}.json，不走 digest 链）由
- *   `orting run` 拉起，验证"容器崩、系统活"在镜像运行时路径上的闭环。
+ * §73 起第三个参数是**故障模式**（crash / udf / handler / crash-once，
+ *   见 main 内注）——经侧配置（fixture-{crash,udf,handler,crash-once}
+ *   .json，不走 digest 链）由 `orting run` 拉起，验证"容器崩、系统活"
+ *   在镜像运行时路径上的闭环；§75 起 crash-once 供重启策略的恢复臂。
  *
  * 刻意极小：没有参数就读固定文件失败，有一参数读那一个文件。
  ****************************************************************************/
@@ -112,6 +113,39 @@ int main(int argc, FAR char *argv[])
     {
       __asm__ volatile (".inst 0xde00");   /* Thumb UDF #0 */
       printf("ORTHELLO: udf 未发生（不该到这）\n");
+    }
+  else if (argc >= 3 && strcmp(argv[2], "crash-once") == 0)
+    {
+      /* §75：**首跑崩、次跑好** —— 重启策略的"恢复"臂。标记用**相对
+       * 路径**（PWD 解析 → 落在视图工作目录，跨次 spawn 保留在 upper
+       * 层）——顺带把 §70 的 PWD 相对解析从源码结论变成实跑。 */
+
+      FAR FILE *m = fopen("crashed.once", "r");
+
+      if (m != NULL)
+        {
+          fclose(m);
+          printf("ORTHELLO: 第二次机会（标记在）→ 正常退出\n");
+        }
+      else
+        {
+          m = fopen("crashed.once", "w");
+          if (m != NULL)
+            {
+              fputs("boom\n", m);
+              fclose(m);
+            }
+
+          printf("ORTHELLO: 首次运行 → 建标记并崩溃\n");
+
+          {
+            FAR volatile unsigned *p = (FAR volatile unsigned *)0x10;
+
+            *p = 0xbad;
+          }
+
+          printf("ORTHELLO: crash-once 未发生（不该到这）\n");
+        }
     }
 #ifndef CONFIG_DISABLE_SIGNALS
   else if (argc >= 3 && strcmp(argv[2], "handler") == 0)
