@@ -13,6 +13,8 @@
  *                                —— 自动动线：pull → 组装 → 挂载视图（一条命令）
  *   orting start <view> <host> <port> <repo> <tag>
  *                                —— up + run：镜像到进程一条命令
+ *   orting sup <view> <cfg1> [cfg2 ...]
+ *                                —— 运行时兼任监督者：崩没崩的正面判别
  *   orting down <view>           —— 卸载视图（生命周期收尾）
  *   orting validate <path>       —— 通用 JSON 校验（只报错名）
  *
@@ -34,6 +36,8 @@
 #include <sys/wait.h>
 #include <sys/mount.h>
 #include <sys/statfs.h>
+#include <sys/prctl.h>
+#include <signal.h>
 
 #include "ort_json.h"
 #include "ortimg_battery.h"
@@ -760,7 +764,12 @@ static int map_path(FAR const char *view, FAR const char *in,
   return 0;
 }
 
-static int do_run(FAR const char *view, FAR const char *path)
+/* run 的"派生半"：视图先验 → 配置解析 → argv/环境/工作目录 → spawn。
+ * do_run（wait + 报退出码）与 do_sup（绑域 + 抽事件队列 + 判别）共用
+ * —— §74 拆分，行为不变。 */
+
+static int run_spawn(FAR const char *view, FAR const char *path,
+                     FAR pid_t *outpid)
 {
   struct stat vst;
   size_t len = 0;
@@ -768,7 +777,6 @@ static int do_run(FAR const char *view, FAR const char *path)
   int    na = 0;
   int    ne = 0;
   pid_t  pid;
-  int    st;
   int    ret;
 
   /* 视图先验：根不成立就什么都不建、不拉（fail-closed） */
@@ -889,6 +897,21 @@ static int do_run(FAR const char *view, FAR const char *path)
     }
 
   printf("[run] spawned pid=%d\n", (int)pid);
+  *outpid = pid;
+  return 0;
+}
+
+static int do_run(FAR const char *view, FAR const char *path)
+{
+  pid_t pid;
+  int   st;
+  int   ret;
+
+  ret = run_spawn(view, path, &pid);
+  if (ret != 0)
+    {
+      return ret;
+    }
 
   if (waitpid(pid, &st, 0) < 0)
     {
@@ -900,12 +923,161 @@ static int do_run(FAR const char *view, FAR const char *path)
    * （task_exithook.c），且"异常终止"的默认动作**就是** _exit(EXIT_FAILURE)
    * （sig_default.c）—— `WIFSIGNALED` 硬编码 false ⇒ **崩溃与 exit(1)
    * 在 waitpid 层面不可分**。如实按"退出码"报；==1 时带注记。
-   * （容器崩溃的**可分**信号要另开通道 —— 见手册 §三·补七十三 边界。） */
+   * （可分信号走 ORT 故障通道 —— §74 的 `orting sup`；边界见 §73。） */
 
   printf("[run] 退出码=%d%s\n", WEXITSTATUS(st),
          WEXITSTATUS(st) == 1
            ? "（=EXIT_FAILURE；NuttX 崩溃与 exit(1) 不可分——§73）" : "");
   return WEXITSTATUS(st) == 0 ? 0 : 1;
+}
+
+/* ── sup：运行时兼任监督者 —— "崩没崩"的**正面判别**（A2 增量⑤）───── *
+ *
+ * 背景（§73 边界）：NuttX 的 waitpid 里**崩溃与 exit(1) 不可分**；
+ * 内核的 ORT 故障通道可以区分 —— 但它只对监督者开放，且监督者
+ * **首次注册即钉 pid** ⇒ "每次 CLI 一个进程"的形态拿不到通道。
+ * 正确形态是**一个进程兼三职**：注册监督者 → 依次拉起容器（spawn 后
+ * 按 pid 绑域）→ 每个容器 wait 后抽事件队列 → 正面判别：
+ *   有 FAULT 事件 → 崩溃（报 pc/addr/faults —— "容器为什么死"）
+ *   有 EXIT 事件  → 正常退出（报 code；EXIT 事件要求域已绑）
+ *   都无          → 无事件（如实报，不退化为瞎猜）
+ * 退场释放监督者槽（PR_ORT_SUPERVISOR_RESET —— 原型测试 API）。
+ * 白名单：CONFIG_ORT_SUPERVISOR_TASKNAMES 必须含 orting（本 SKU 已配）。
+ *
+ * 用法：orting sup <view> <config1> [config2 ...]
+ */
+
+static void ort_sup_wake(int signo)
+{
+  (void)signo;
+}
+
+static int do_sup(FAR const char *view, int ncfg, FAR char * const *cfgs)
+{
+  int rc = 0;
+  int ret;
+  int i;
+
+  ret = prctl(PR_SET_ORT_SUPERVISOR);
+  if (ret < 0)
+    {
+      printf("[sup] 注册监督者失败: %d（errno=%d）→ sup 中止\n",
+             ret, errno);
+      return 1;
+    }
+
+  /* 醒信号（ORT_SIGFAULT=SIGUSR1，内核 nxsig_queue 每事件一次）——
+   * 必须装处理器：不装则投递会打断 waitpid（EINTR），装了按契约
+   * 收下再继续等（事件本体在队列里，不靠信号传数据）。 */
+
+  {
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = ort_sup_wake;
+    sigaction(ORT_SIGFAULT, &sa, NULL);
+  }
+
+  printf("[sup] 上任: pid=%d 能力位=0x%08x（醒信号 SIGUSR1 已装）\n",
+         (int)getpid(), (unsigned)prctl(PR_GET_ORT_CAPS));
+
+  for (i = 0; i < ncfg; i++)
+    {
+      struct ort_faultrec_s rec;
+      pid_t pid = -1;
+      int   st = 0;
+      int   nev = 0;
+      int   nf = 0;
+      int   nx = 0;
+      uintptr_t last_pc = 0;
+      uintptr_t last_addr = 0;
+      uint32_t  last_faults = 0;
+      int       last_code = 0;
+
+      ret = run_spawn(view, cfgs[i], &pid);
+      if (ret != 0)
+        {
+          printf("[sup] 容器[%d] 未拉起（r=%d）——继续后续\n", i, ret);
+          rc = 1;
+          continue;
+        }
+
+      /* 按 pid 绑域（监督者权限）：域≠0 时内核才发 EXIT 事件；
+       * A 侧域语义是 no-op（MMU），绑域 = 记录 + 事件资格 */
+
+      ret = prctl(PR_SET_ORT_DOMAIN, i + 1, (pid_t)pid);
+      if (ret < 0)
+        {
+          printf("[sup] 容器[%d] 绑域失败: %d（继续——FAULT 不依赖域）\n",
+                 i, ret);
+        }
+
+      do
+        {
+          ret = waitpid(pid, &st, 0);
+        }
+      while (ret < 0 && errno == EINTR);   /* 醒信号打断 → 继续等 */
+
+      if (ret < 0)
+        {
+          printf("[sup] 容器[%d] waitpid 失败（errno=%d）\n", i, errno);
+          rc = 1;
+          continue;
+        }
+
+      /* 抽事件队列（只认本容器；队列是监督者私有视图，串行下无夹杂） */
+
+      while ((ret = prctl(PR_GET_ORT_FAULT, &rec)) > 0)
+        {
+          nev++;
+
+          if (rec.kind == 0 && rec.victim == (int)pid)
+            {
+              nf++;
+              last_pc = rec.pc;
+              last_addr = rec.addr;
+              last_faults = rec.faults;
+            }
+          else if (rec.kind == 1 && rec.victim == (int)pid)
+            {
+              nx++;
+              last_code = rec.code;
+            }
+          else
+            {
+              printf("[sup] （读到非本容器记录 seq=%u victim=%d kind=%u）\n",
+                     (unsigned)rec.seq, rec.victim, (unsigned)rec.kind);
+            }
+        }
+
+      if (ret < 0)
+        {
+          printf("[sup] 读事件失败: %d（errno=%d）\n", ret, errno);
+          rc = 1;
+        }
+
+      printf("[sup] 容器[%d] pid=%d 退出码=%d 事件=%d（FAULT %d / EXIT %d）\n",
+             i, (int)pid, WEXITSTATUS(st), nev, nf, nx);
+
+      if (nf > 0)
+        {
+          printf("[sup] 判别: 崩溃（FAULT pc=0x%x addr=0x%x faults=%u）\n",
+                 (unsigned)last_pc, (unsigned)last_addr,
+                 (unsigned)last_faults);
+        }
+      else if (nx > 0)
+        {
+          printf("[sup] 判别: 正常退出（EXIT 事件 code=%d）\n", last_code);
+        }
+      else
+        {
+          printf("[sup] 判别: 无事件（退出码=%d）\n", WEXITSTATUS(st));
+        }
+    }
+
+  ret = prctl(PR_ORT_SUPERVISOR_RESET);
+  printf("[sup] 卸任: %s（槽释放）\n", ret == 0 ? "OK" : "失败");
+  return rc;
 }
 
 /* ── 自动动线：一条命令 = pull → 组装 → 挂载视图（A2 增量②）───────── *
@@ -1756,6 +1928,14 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
+  if (argc >= 4 && strcmp(argv[1], "sup") == 0)
+    {
+      /* sup <view> <config1> [config2 ...] —— 运行时兼任监督者 */
+      int r = do_sup(argv[2], argc - 3, &argv[3]);
+      free(g_buf);
+      return r;
+    }
+
   if (argc >= 3 && strcmp(argv[1], "validate") == 0)
     {
       int r = do_validate(argv[2]);
@@ -1802,6 +1982,7 @@ int main(int argc, FAR char *argv[])
          "      run <view> <config> | down <view> |\n"
          "      up <view> <host> <port> <repo> <tag> |\n"
          "      start <view> <host> <port> <repo> <tag> |\n"
+         "      sup <view> <config1> [config2 ...] |\n"
          "      httpget <host> <port> <path> | pull <host> <port> <repo> <tag>\n");
   free(g_buf);
   return 2;
