@@ -9,10 +9,10 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-07 ORT（§78 编排环：`orch` wait-any+个体策略；
-#               ⚠️ 同轮压出并发风暴偶发内核 panic（预定 §79 专项）；
-#               apps 侧 orting 改动，内核未动，nuttx= 仍为 fd227fd1c0）。
+# 最近配对事件：2026-10-08 ORT（§79 上半场：panic 双缺陷拆分 —— ①NULL 帧
+#               延迟投递已修（异步臂装载，= 第 4 处修正版）；②活任务投递
+#               SP 未收口；apps 侧未动，内核 b474325cfb）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=fd227fd1c0e65d10aaa140e16e173c7e2cefd9e1
+nuttx=b474325cfb744ecdd3f49f895b4ca11bbfde1402
