@@ -8,6 +8,7 @@
  *   orting jsontest              —— 跑双环境电池（与宿主机同一份）
  *   orting manifest <path>       —— 解析一份真实 manifest 并打印字段
  *   orting config <path>         —— 解析 OCI image config（⑧ 落盘件的独立复读）
+ *   orting run <view> <config>   —— 照着 config 起进程（Entrypoint+Env+WorkingDir）
  *   orting validate <path>       —— 通用 JSON 校验（只报错名）
  *
  * 目标机上 /system 是 hostfs（宿主 nuttx-apps 树），所以夹具直接用
@@ -24,6 +25,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <spawn.h>
+#include <sys/wait.h>
 
 #include "ort_json.h"
 #include "ortimg_battery.h"
@@ -704,6 +707,198 @@ static int do_config(FAR const char *path)
   return 0;
 }
 
+/* ── 照着 config 起进程（A2 增量①）────────────────────────────────── *
+ *
+ * 原型期的"容器内路径"映射：**绝对路径** → <view>+<path>（argv 与
+ * WorkingDir 统一按此映射；真解是 chroot/命名空间 —— A2 后续）。相对
+ * 路径原样传参，由子进程按 PWD 解析。
+ *
+ * 环境：子环境 = **config Env + 运行时 PWD**。内核 binfmt 的语义
+ * （binfmt_execmodule.c：envp!=NULL 时子环境就是 envp 本尊）决定了
+ * **父亲环境不会漏进子进程** —— 这正是容器要的"干净环境"。config
+ * 自带的 PWD= 被过滤：WorkingDir 由运行时说了算（PWD 唯一）。
+ *
+ * WorkingDir 走 PWD 环境通道的依据（NuttX 源码）：chdir() 写
+ * setenv("PWD")、getcwd() 读 getenv("PWD")、相对路径解析在
+ * fs/inodesearch 读 PWD —— cwd 就是环境变量本身；NuttX 的 spawn
+ * 文件动作**没有** addchdir，这是唯一的正道。
+ */
+
+#define ORT_RUN_MAP_MAX 320
+
+static char g_avbuf[2 * ORT_CFG_MAX_ARG][ORT_RUN_MAP_MAX];
+static FAR char *g_argv[2 * ORT_CFG_MAX_ARG + 1];
+static char g_pwdbuf[ORT_RUN_MAP_MAX + 64];
+static FAR char *g_envp[ORT_CFG_MAX_ENV + 2];
+
+static int map_path(FAR const char *view, FAR const char *in,
+                    FAR char *out, size_t cap)
+{
+  if (in[0] != '/' || strcmp(view, "/") == 0)
+    {
+      if (strlen(in) + 1 > cap)
+        {
+          return -1;
+        }
+
+      strcpy(out, in);
+      return 0;
+    }
+
+  if (snprintf(out, cap, "%s%s", view, in) >= (int)cap)
+    {
+      return -1;
+    }
+
+  return 0;
+}
+
+static int do_run(FAR const char *view, FAR const char *path)
+{
+  struct stat vst;
+  size_t len = 0;
+  uint32_t i;
+  int    na = 0;
+  int    ne = 0;
+  pid_t  pid;
+  int    st;
+  int    ret;
+
+  /* 视图先验：根不成立就什么都不建、不拉（fail-closed） */
+
+  if (stat(view, &vst) != 0)
+    {
+      printf("[run] 视图打不开: %s（errno=%d）\n", view, errno);
+      return 1;
+    }
+
+  if (!S_ISDIR(vst.st_mode))
+    {
+      printf("[run] 视图不是目录: %s\n", view);
+      return 1;
+    }
+
+  if (read_file(path, &len) != 0)
+    {
+      return 2;
+    }
+
+  ret = ort_config_parse(g_buf, len, &g_cfg);
+  if (ret != ORT_JSON_OK)
+    {
+      printf("[run] 配置拒绝: %s（%zu 字节）\n", ort_json_strerror(ret), len);
+      return 1;
+    }
+
+  /* argv := entrypoint + cmd（OCI 语义），绝对路径按视图映射 */
+
+  for (i = 0; i < g_cfg.nentrypoint; i++)
+    {
+      if (map_path(view, g_cfg.entrypoint[i], g_avbuf[na],
+                   sizeof(g_avbuf[0])) != 0)
+        {
+          printf("[run] argv 映射超界（entrypoint[%u]）\n", (unsigned)i);
+          return 1;
+        }
+
+      g_argv[na] = g_avbuf[na];
+      na++;
+    }
+
+  for (i = 0; i < g_cfg.ncmd; i++)
+    {
+      if (map_path(view, g_cfg.cmd[i], g_avbuf[na],
+                   sizeof(g_avbuf[0])) != 0)
+        {
+          printf("[run] argv 映射超界（cmd[%u]）\n", (unsigned)i);
+          return 1;
+        }
+
+      g_argv[na] = g_avbuf[na];
+      na++;
+    }
+
+  if (na == 0)
+    {
+      printf("[run] 无 argv（解析已保证不会发生）\n");
+      return 1;
+    }
+
+  g_argv[na] = NULL;
+
+  /* 环境：config Env（滤掉 PWD=）+ 运行时 PWD */
+
+  for (i = 0; i < g_cfg.nenv; i++)
+    {
+      if (strncmp(g_cfg.env[i], "PWD=", 4) == 0)
+        {
+          continue;
+        }
+
+      g_envp[ne++] = g_cfg.env[i];
+    }
+
+  if (g_cfg.workdir[0])
+    {
+      static char wdbuf[ORT_RUN_MAP_MAX];
+
+      if (map_path(view, g_cfg.workdir, wdbuf, sizeof(wdbuf)) != 0)
+        {
+          printf("[run] workdir 映射超界: %s\n", g_cfg.workdir);
+          return 1;
+        }
+
+      if (mkdir_p(wdbuf) != 0)
+        {
+          printf("[run] workdir 建点失败: %s（errno=%d）\n", wdbuf, errno);
+          return 1;
+        }
+
+      printf("[run] workdir 就绪: %s\n", wdbuf);
+
+      snprintf(g_pwdbuf, sizeof(g_pwdbuf), "PWD=%s", wdbuf);
+      g_envp[ne++] = g_pwdbuf;
+    }
+
+  g_envp[ne] = NULL;
+
+  printf("[run] view=%s 配置 arch=%s os=%s（入口 %u/命令 %u/环境 %u）\n",
+         view, g_cfg.arch, g_cfg.os, (unsigned)g_cfg.nentrypoint,
+         (unsigned)g_cfg.ncmd, (unsigned)g_cfg.nenv);
+
+  for (i = 0; i < (uint32_t)na; i++)
+    {
+      printf("[run] argv[%u]=%s\n", (unsigned)i, g_argv[i]);
+    }
+
+  printf("[run] 环境 %d 条，PWD=%s\n", ne,
+         g_cfg.workdir[0] ? g_pwdbuf + 4 : "(未设)");
+
+  ret = posix_spawn(&pid, g_argv[0], NULL, NULL, g_argv, g_envp);
+  if (ret != 0)
+    {
+      printf("[run] spawn 失败 rc=%d errno=%d\n", ret, errno);
+      return 1;
+    }
+
+  printf("[run] spawned pid=%d\n", (int)pid);
+
+  if (waitpid(pid, &st, 0) < 0)
+    {
+      printf("[run] waitpid 失败（errno=%d）\n", errno);
+      return 1;
+    }
+
+  if (WIFEXITED(st))
+    {
+      printf("[run] 退出码=%d\n", WEXITSTATUS(st));
+      return WEXITSTATUS(st) == 0 ? 0 : 1;
+    }
+
+  printf("[run] 非正常退出（st=%d）\n", st);
+  return 1;
+}
+
 static int do_validate(FAR const char *path)
 {
   size_t len = 0;
@@ -1315,6 +1510,14 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
+  if (argc >= 4 && strcmp(argv[1], "run") == 0)
+    {
+      /* run <view> <config> —— 照着 config 起进程 */
+      int r = do_run(argv[2], argv[3]);
+      free(g_buf);
+      return r;
+    }
+
   if (argc >= 3 && strcmp(argv[1], "validate") == 0)
     {
       int r = do_validate(argv[2]);
@@ -1358,6 +1561,7 @@ int main(int argc, FAR char *argv[])
   printf("用法: orting jsontest | shatest | tartest |\n"
          "      manifest <path> | config <path> | validate <path> |\n"
          "      sha <path> | untar <archive> <destdir> | lsroot <dir> |\n"
+         "      run <view> <config> |\n"
          "      httpget <host> <port> <path> | pull <host> <port> <repo> <tag>\n");
   free(g_buf);
   return 2;
