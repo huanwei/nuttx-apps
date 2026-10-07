@@ -288,6 +288,58 @@ static const struct ort_idxcase_s g_ort_idxcases[] =
 
 #define ORT_NIDXCASES (sizeof(g_ort_idxcases) / sizeof(g_ort_idxcases[0]))
 
+/* ── image config 用例（config blob）────────────────────────────────── */
+
+struct ort_cfgcase_s
+{
+  FAR const char *name;
+  FAR const char *json;
+  int             expect;
+  int             expect_ep;     /* expect==OK 时断言条数；-1 不断言 */
+  int             expect_cmd;
+  int             expect_env;
+};
+
+static const struct ort_cfgcase_s g_ort_cfgcases[] =
+{
+  { "CF1 完整合法（ep2/cmd1/env2/wd）",
+    "{\"architecture\":\"arm\",\"os\":\"linux\","
+    "\"config\":{\"Env\":[\"PATH=/bin\",\"ORT=1\"],"
+    "\"Entrypoint\":[\"/bin/orthello\",\"--t\"],"
+    "\"Cmd\":[\"/etc/hello.txt\"],\"WorkingDir\":\"/tmp/wd\"}}",
+    ORT_JSON_OK, 2, 1, 2 },
+
+  { "CF2 缺 config 对象 → REQUIRED",
+    "{\"architecture\":\"arm\",\"os\":\"linux\"}",
+    ORT_JSON_E_REQUIRED, 0, 0, 0 },
+
+  { "CF3 Entrypoint 是字符串 → SYNTAX",
+    "{\"architecture\":\"arm\",\"os\":\"linux\","
+    "\"config\":{\"Entrypoint\":\"/bin/x\"}}",
+    ORT_JSON_E_SYNTAX, 0, 0, 0 },
+
+  { "CF4 Entrypoint 超上限（9 项）→ LIMIT（不截断）",
+    "{\"architecture\":\"arm\",\"os\":\"linux\","
+    "\"config\":{\"Entrypoint\":["
+    "\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\"]}}",
+    ORT_JSON_E_LIMIT, 0, 0, 0 },
+
+  { "CF5 既无 Entrypoint 也无 Cmd → REQUIRED",
+    "{\"architecture\":\"arm\",\"os\":\"linux\","
+    "\"config\":{\"Env\":[\"A=B\"]}}",
+    ORT_JSON_E_REQUIRED, 0, 0, 0 },
+
+  { "CF6 未知字段跳过（rootfs/history）且计数",
+    "{\"architecture\":\"arm\",\"os\":\"linux\","
+    "\"rootfs\":{\"type\":\"layers\",\"diff_ids\":[\"sha256:00\"]},"
+    "\"history\":[{\"created_by\":\"x\"}],"
+    "\"annotations\":{\"k\":\"v\"},"
+    "\"config\":{\"Cmd\":[\"run\"]}}",
+    ORT_JSON_OK, 0, 1, 0 },
+};
+
+#define ORT_NCFGCASES (sizeof(g_ort_cfgcases) / sizeof(g_ort_cfgcases[0]))
+
 /* ── 运行器：返回失败数 ─────────────────────────────────────────────── */
 
 static int ort_battery_run(FAR FILE *out)
@@ -417,6 +469,36 @@ static int ort_battery_run(FAR FILE *out)
           {
             fprintf(out, "[jtest] FAIL %s: got=%s n=%u\n", tc->name,
                     ort_json_strerror(got), (unsigned)ix.nentries);
+            fails++;
+          }
+        else
+          {
+            fprintf(out, "[jtest] ok   %s\n", tc->name);
+          }
+      }
+  }
+
+  /* config 族 —— ★ cf 静态（struct ort_config_s ≈1.4KB，栈预算同 §61） */
+
+  {
+    static struct ort_config_s cf;
+    size_t i;
+
+    for (i = 0; i < ORT_NCFGCASES; i++)
+      {
+        FAR const struct ort_cfgcase_s *tc = &g_ort_cfgcases[i];
+        int got = ort_config_parse(tc->json, strlen(tc->json), &cf);
+
+        if (got != tc->expect ||
+            (got == ORT_JSON_OK &&
+             ((tc->expect_ep >= 0 && (int)cf.nentrypoint != tc->expect_ep) ||
+              (tc->expect_cmd >= 0 && (int)cf.ncmd != tc->expect_cmd) ||
+              (tc->expect_env >= 0 && (int)cf.nenv != tc->expect_env))))
+          {
+            fprintf(out, "[jtest] FAIL %s: got=%s ep=%u cmd=%u env=%u\n",
+                    tc->name, ort_json_strerror(got),
+                    (unsigned)cf.nentrypoint, (unsigned)cf.ncmd,
+                    (unsigned)cf.nenv);
             fails++;
           }
         else

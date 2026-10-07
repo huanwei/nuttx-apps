@@ -1371,6 +1371,321 @@ int ort_index_parse(FAR const char *s, size_t len,
 }
 
 /****************************************************************************
+ * Name: parse_str_array
+ *
+ * Description:
+ *   字符串数组提取（有界，超界 E_LIMIT 不截断）。dst 为 [cap][width] 的
+ *   二维缓冲。返回 0 或错误。
+ ****************************************************************************/
+
+static int parse_str_array(FAR struct ort_cur_s *c, FAR char *dst,
+                           size_t width, uint32_t cap, FAR uint32_t *n)
+{
+  int ret;
+
+  if (c->p >= c->end || *c->p != '[')
+    {
+      return ORT_JSON_E_SYNTAX;
+    }
+
+  ret = push_depth(c);
+  if (ret != ORT_JSON_OK)
+    {
+      return ret;
+    }
+
+  c->p++;
+  skip_ws(c);
+
+  if (c->p < c->end && *c->p == ']')
+    {
+      c->p++;
+      pop_depth(c);
+      return ORT_JSON_OK;               /* 空数组合法（合法性由调用方判） */
+    }
+
+  for (;;)
+    {
+      if (*n >= cap)
+        {
+          pop_depth(c);
+          return ORT_JSON_E_LIMIT;
+        }
+
+      ret = parse_string(c, dst + (size_t)*n * width, width, NULL);
+      if (ret != ORT_JSON_OK)
+        {
+          pop_depth(c);
+          return ret;
+        }
+
+      (*n)++;
+
+      skip_ws(c);
+      if (c->p >= c->end)
+        {
+          pop_depth(c);
+          return ORT_JSON_E_SHORT;
+        }
+      if (*c->p == ',')
+        {
+          c->p++;
+          skip_ws(c);
+          continue;
+        }
+      if (*c->p == ']')
+        {
+          c->p++;
+          pop_depth(c);
+          return ORT_JSON_OK;
+        }
+
+      pop_depth(c);
+      return ORT_JSON_E_SYNTAX;
+    }
+}
+
+/****************************************************************************
+ * Name: ort_config_parse
+ *
+ * Description:
+ *   OCI image config（config blob）白名单提取 —— 见 ort_json.h 约定。
+ ****************************************************************************/
+
+int ort_config_parse(FAR const char *s, size_t len,
+                     FAR struct ort_config_s *out)
+{
+  struct ort_cur_s c;
+  bool have_arch = false;
+  bool have_os   = false;
+  bool have_cfg  = false;
+  int  ret;
+
+  if (len > ORT_JSON_MAX_INPUT)
+    {
+      return ORT_JSON_E_SIZE;
+    }
+
+  memset(out, 0, sizeof(*out));
+
+  c.p     = s;
+  c.end   = s + len;
+  c.depth = 0;
+
+  skip_ws(&c);
+  if (c.p >= c.end || *c.p != '{')
+    {
+      return ORT_JSON_E_REQUIRED;
+    }
+
+  ret = push_depth(&c);
+  if (ret != ORT_JSON_OK)
+    {
+      return ret;
+    }
+
+  c.p++;
+  skip_ws(&c);
+
+  for (;;)
+    {
+      char   key[24];
+      size_t klen = 0;
+
+      ret = parse_string(&c, key, sizeof(key), &klen);
+      if (ret != ORT_JSON_OK)
+        {
+          return ret;
+        }
+
+      skip_ws(&c);
+      if (c.p >= c.end || *c.p != ':')
+        {
+          return c.p >= c.end ? ORT_JSON_E_SHORT : ORT_JSON_E_SYNTAX;
+        }
+
+      c.p++;
+      skip_ws(&c);
+
+      if (strcmp(key, "architecture") == 0)
+        {
+          ret = parse_string(&c, out->arch, sizeof(out->arch), NULL);
+          if (ret != ORT_JSON_OK)
+            {
+              return ret;
+            }
+          have_arch = true;
+        }
+      else if (strcmp(key, "os") == 0)
+        {
+          ret = parse_string(&c, out->os, sizeof(out->os), NULL);
+          if (ret != ORT_JSON_OK)
+            {
+              return ret;
+            }
+          have_os = true;
+        }
+      else if (strcmp(key, "config") == 0)
+        {
+          if (c.p >= c.end || *c.p != '{')
+            {
+              return ORT_JSON_E_SYNTAX;
+            }
+
+          ret = push_depth(&c);
+          if (ret != ORT_JSON_OK)
+            {
+              return ret;
+            }
+
+          c.p++;
+          skip_ws(&c);
+
+          for (;;)
+            {
+              char   k2[24];
+              size_t k2len = 0;
+
+              ret = parse_string(&c, k2, sizeof(k2), &k2len);
+              if (ret != ORT_JSON_OK)
+                {
+                  return ret;
+                }
+
+              skip_ws(&c);
+              if (c.p >= c.end || *c.p != ':')
+                {
+                  return c.p >= c.end ? ORT_JSON_E_SHORT
+                                      : ORT_JSON_E_SYNTAX;
+                }
+
+              c.p++;
+              skip_ws(&c);
+
+              if (strcmp(k2, "Entrypoint") == 0)
+                {
+                  ret = parse_str_array(&c, (FAR char *)out->entrypoint,
+                                        sizeof(out->entrypoint[0]),
+                                        ORT_CFG_MAX_ARG, &out->nentrypoint);
+                  if (ret != ORT_JSON_OK)
+                    {
+                      return ret;
+                    }
+                }
+              else if (strcmp(k2, "Cmd") == 0)
+                {
+                  ret = parse_str_array(&c, (FAR char *)out->cmd,
+                                        sizeof(out->cmd[0]),
+                                        ORT_CFG_MAX_ARG, &out->ncmd);
+                  if (ret != ORT_JSON_OK)
+                    {
+                      return ret;
+                    }
+                }
+              else if (strcmp(k2, "Env") == 0)
+                {
+                  ret = parse_str_array(&c, (FAR char *)out->env,
+                                        sizeof(out->env[0]),
+                                        ORT_CFG_MAX_ENV, &out->nenv);
+                  if (ret != ORT_JSON_OK)
+                    {
+                      return ret;
+                    }
+                }
+              else if (strcmp(k2, "WorkingDir") == 0)
+                {
+                  ret = parse_string(&c, out->workdir,
+                                     sizeof(out->workdir), NULL);
+                  if (ret != ORT_JSON_OK)
+                    {
+                      return ret;
+                    }
+                }
+              else
+                {
+                  ret = parse_value(&c);
+                  if (ret != ORT_JSON_OK)
+                    {
+                      return ret;
+                    }
+                  out->ignored_fields++;
+                }
+
+              skip_ws(&c);
+              if (c.p >= c.end)
+                {
+                  return ORT_JSON_E_SHORT;
+                }
+              if (*c.p == ',')
+                {
+                  c.p++;
+                  skip_ws(&c);
+                  continue;
+                }
+              if (*c.p == '}')
+                {
+                  c.p++;
+                  break;
+                }
+
+              return ORT_JSON_E_SYNTAX;
+            }
+
+          pop_depth(&c);
+          have_cfg = true;
+        }
+      else
+        {
+          ret = parse_value(&c);
+          if (ret != ORT_JSON_OK)
+            {
+              return ret;
+            }
+          out->ignored_fields++;
+        }
+
+      skip_ws(&c);
+      if (c.p >= c.end)
+        {
+          return ORT_JSON_E_SHORT;
+        }
+      if (*c.p == ',')
+        {
+          c.p++;
+          skip_ws(&c);
+          continue;
+        }
+      if (*c.p == '}')
+        {
+          c.p++;
+          break;
+        }
+
+      return ORT_JSON_E_SYNTAX;
+    }
+
+  pop_depth(&c);
+
+  skip_ws(&c);
+  if (c.p != c.end)
+    {
+      return ORT_JSON_E_TRAILING;
+    }
+
+  if (!have_arch || !have_os || !have_cfg)
+    {
+      return ORT_JSON_E_REQUIRED;
+    }
+
+  if (out->nentrypoint == 0 && out->ncmd == 0)
+    {
+      return ORT_JSON_E_REQUIRED;      /* 没有要跑的东西的镜像配置 = 缺件 */
+    }
+
+  return ORT_JSON_OK;
+}
+
+/****************************************************************************
  * 公共：错误名
  ****************************************************************************/
 
@@ -1390,6 +1705,7 @@ const char *ort_json_strerror(int err)
       case ORT_JSON_E_REQUIRED:  return "REQUIRED";
       case ORT_JSON_E_LAYERS:    return "LAYERS";
       case ORT_JSON_E_DIGEST:    return "DIGEST";
+      case ORT_JSON_E_LIMIT:     return "LIMIT";
       default:                   return "?";
     }
 }

@@ -7,6 +7,7 @@
  * 用法（nsh）：
  *   orting jsontest              —— 跑双环境电池（与宿主机同一份）
  *   orting manifest <path>       —— 解析一份真实 manifest 并打印字段
+ *   orting config <path>         —— 解析 OCI image config（⑧ 落盘件的独立复读）
  *   orting validate <path>       —— 通用 JSON 校验（只报错名）
  *
  * 目标机上 /system 是 hostfs（宿主 nuttx-apps 树），所以夹具直接用
@@ -50,6 +51,7 @@ static char g_http_body2[16384];
 static char g_token[4096];
 static struct ort_index_s    g_idx;
 static struct ort_manifest_s g_mf;
+static struct ort_config_s   g_cfg;   /* ⑧ 配置体（~2.5KB，同样不放进栈） */
 
 static int read_file(FAR const char *path, FAR size_t *out_len)
 {
@@ -645,6 +647,63 @@ static int do_manifest(FAR const char *path)
   return 0;
 }
 
+/* 运行参数摘要打印：pull ⑧（下载即解析）与 `orting config`（对同一份落
+ * 盘件的独立复读）共用同一条输出 —— 两处见证口径逐字相同，判据才好对拍
+ * （同 §63 哈希通道的思路：同一事实两条独立通道）。 */
+
+static void config_dump(FAR FILE *out, FAR const char *head,
+                        FAR const char *cont,
+                        FAR const struct ort_config_s *cf)
+{
+  uint32_t i;
+
+  fprintf(out, "%sconfig: arch=%s os=%s 入口=%u 命令=%u 环境=%u "
+               "workdir=%s（跳过未知 %u）\n",
+          head, cf->arch, cf->os, (unsigned)cf->nentrypoint,
+          (unsigned)cf->ncmd, (unsigned)cf->nenv,
+          cf->workdir[0] ? cf->workdir : "(无)",
+          (unsigned)cf->ignored_fields);
+
+  for (i = 0; i < cf->nentrypoint; i++)
+    {
+      fprintf(out, "%sentrypoint[%u]=%s\n", cont, (unsigned)i,
+              cf->entrypoint[i]);
+    }
+
+  for (i = 0; i < cf->ncmd; i++)
+    {
+      fprintf(out, "%scmd[%u]=%s\n", cont, (unsigned)i, cf->cmd[i]);
+    }
+
+  for (i = 0; i < cf->nenv; i++)
+    {
+      fprintf(out, "%senv[%u]=%s\n", cont, (unsigned)i, cf->env[i]);
+    }
+}
+
+static int do_config(FAR const char *path)
+{
+  size_t len = 0;
+  int ret;
+
+  if (read_file(path, &len) != 0)
+    {
+      return 2;
+    }
+
+  ret = ort_config_parse(g_buf, len, &g_cfg);
+  if (ret != ORT_JSON_OK)
+    {
+      printf("[ortimg] config 拒绝: %s（%zu 字节）\n",
+             ort_json_strerror(ret), len);
+      return 1;
+    }
+
+  printf("[ortimg] config 解析 OK（%zu 字节）\n", len);
+  config_dump(stdout, "[ortimg] ", "[ortimg]   ", &g_cfg);
+  return 0;
+}
+
 static int do_validate(FAR const char *path)
 {
   size_t len = 0;
@@ -770,7 +829,8 @@ static int dl_sink(FAR void *arg, FAR const char *buf, size_t len)
 
 static int blob_download(FAR const char *host, unsigned port,
                          FAR const char *repo, FAR const char *bearer,
-                         FAR const char *digest, uint64_t msize)
+                         FAR const char *digest, uint64_t msize,
+                         FAR const char *leaf, FAR const char *tag)
 {
   static char path[320];
   static char dir[256];
@@ -790,12 +850,12 @@ static int blob_download(FAR const char *host, unsigned port,
     }
 
   snprintf(dir,   sizeof(dir),   ORT_STORE_ROOT "/images/sha256/%s", hex);
-  snprintf(part,  sizeof(part),  "%s/layer.tar.part", dir);
-  snprintf(final, sizeof(final), "%s/layer.tar", dir);
+  snprintf(part,  sizeof(part),  "%s/%s.part", dir, leaf);
+  snprintf(final, sizeof(final), "%s/%s", dir, leaf);
   snprintf(path,  sizeof(path),  "/v2/%s/blobs/%s", repo, digest);
 
-  printf("[pull] ⑥ %s\n", path);
-  printf("[pull]    层体 %llu 字节 → %s\n",
+  printf("[pull] %s %s\n", tag, path);
+  printf("[pull]    体 %llu 字节 → %s\n",
          (unsigned long long)msize, final);
 
   if (mkdir_p(dir) != 0)
@@ -1065,7 +1125,8 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
 
             r = blob_download(host, port, repo,
                               g_token[0] ? g_token : NULL,
-                              g_mf.layers[i].digest, g_mf.layers[i].size);
+                              g_mf.layers[i].digest, g_mf.layers[i].size,
+                              "layer.tar", "⑥");
             if (r != 0)
               {
                 printf("[pull]    layer[%u] 未通过（r=%d）→ pull 失败\n",
@@ -1122,6 +1183,50 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
         printf("[pull]    rootfs: %s\n", rootfs);
       }
 
+      /* ⑧ 配置 blob 下载 + 解析（A2 起步：运行时要跑什么 —— Entrypoint/
+       *    Cmd/Env/WorkingDir）。路径与层同一条：内容寻址校验 + 原子落盘；
+       *    解析走白名单解析器（有界、超界报错不截断）。 */
+
+      {
+        FAR const char *hex3 = g_mf.config_digest;
+        static char cfgp[320];
+        size_t clen = 0;
+        int r8;
+
+        r8 = blob_download(host, port, repo,
+                           g_token[0] ? g_token : NULL,
+                           g_mf.config_digest, g_mf.config_size,
+                           "config.json", "⑧");
+        if (r8 != 0)
+          {
+            printf("[pull]    配置体未通过（r=%d）→ pull 失败\n", r8);
+            return 1;
+          }
+
+        if (strncmp(hex3, "sha256:", 7) == 0)
+          {
+            hex3 += 7;
+          }
+
+        snprintf(cfgp, sizeof(cfgp),
+                 ORT_STORE_ROOT "/images/sha256/%s/config.json", hex3);
+
+        if (read_file(cfgp, &clen) != 0)
+          {
+            return 1;
+          }
+
+        r8 = ort_config_parse(g_buf, clen, &g_cfg);
+        if (r8 != ORT_JSON_OK)
+          {
+            printf("[pull]    配置解析失败: %s（%zu 字节）\n",
+                   ort_json_strerror(r8), clen);
+            return 1;
+          }
+
+        config_dump(stdout, "[pull] ⑧ ", "[pull]    ", &g_cfg);
+      }
+
       printf("[pull] PULL RESULT: OK\n");
     }
 
@@ -1144,7 +1249,8 @@ int main(int argc, FAR char *argv[])
 
       printf("[ortimg] JSONTEST RESULT: %s（%u 用例 + 2 特殊例）\n",
              fails == 0 ? "PASS" : "*** FAIL ***",
-             (unsigned)(ORT_NCASES + ORT_NSTRCASES + ORT_NIDXCASES));
+             (unsigned)(ORT_NCASES + ORT_NSTRCASES + ORT_NIDXCASES +
+                        ORT_NCFGCASES));
       free(g_buf);
       return fails == 0 ? 0 : 1;
     }
@@ -1202,6 +1308,13 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
+  if (argc >= 3 && strcmp(argv[1], "config") == 0)
+    {
+      int r = do_config(argv[2]);
+      free(g_buf);
+      return r;
+    }
+
   if (argc >= 3 && strcmp(argv[1], "validate") == 0)
     {
       int r = do_validate(argv[2]);
@@ -1243,8 +1356,8 @@ int main(int argc, FAR char *argv[])
     }
 
   printf("用法: orting jsontest | shatest | tartest |\n"
-         "      manifest <path> | validate <path> | sha <path> |\n"
-         "      untar <archive> <destdir> | lsroot <dir> |\n"
+         "      manifest <path> | config <path> | validate <path> |\n"
+         "      sha <path> | untar <archive> <destdir> | lsroot <dir> |\n"
          "      httpget <host> <port> <path> | pull <host> <port> <repo> <tag>\n");
   free(g_buf);
   return 2;

@@ -57,7 +57,8 @@ enum ort_json_err_e
   ORT_JSON_E_SCHEMA,       /* schemaVersion 缺失或 != 2             */
   ORT_JSON_E_REQUIRED,     /* 缺必需字段（config/layers/digest…）   */
   ORT_JSON_E_LAYERS,       /* 层数超过 ORT_MANIFEST_MAX_LAYERS      */
-  ORT_JSON_E_DIGEST,       /* digest 不是 sha256:<64 小写 hex>      */
+  ORT_JSON_E_DIGEST,
+  ORT_JSON_E_LIMIT,       /* 数组超界（不截断——精确报）    */       /* digest 不是 sha256:<64 小写 hex>      */
 };
 
 struct ort_layer_s
@@ -98,6 +99,33 @@ int ort_manifest_parse(const char *s, size_t len,
 
 int ort_json_get_str(FAR const char *s, size_t len, FAR const char *key,
                      FAR char *dst, size_t cap);
+
+/* ── OCI image config（config blob）白名单提取 ────────────────────── *
+ *   architecture / os / config.{Entrypoint, Cmd, Env, WorkingDir}
+ * 数组有界：Entrypoint/Cmd ≤ ORT_CFG_MAX_ARG、Env ≤ ORT_CFG_MAX_ENV；
+ * **超界报 E_LIMIT 不静默截断**（"要跑什么"不允许丢件——截断会让运行时
+ * 跑出与镜像声明不同的东西）。Entrypoint 与 Cmd 至少有一个，否则
+ * E_REQUIRED（不可运行的镜像配置不是"合法但空"，是缺件）。 */
+
+#define ORT_CFG_MAX_ARG 8
+#define ORT_CFG_MAX_ENV 8
+
+struct ort_config_s
+{
+  char     arch[16];
+  char     os[16];
+  char     entrypoint[ORT_CFG_MAX_ARG][64];
+  uint32_t nentrypoint;
+  char     cmd[ORT_CFG_MAX_ARG][64];
+  uint32_t ncmd;
+  char     env[ORT_CFG_MAX_ENV][96];
+  uint32_t nenv;
+  char     workdir[64];
+  uint32_t ignored_fields;
+};
+
+int ort_config_parse(FAR const char *s, size_t len,
+                     FAR struct ort_config_s *out);
 
 /* OCI image index（manifest list）白名单提取。
  *   manifests[].{digest, platform{os,architecture[,variant]}}

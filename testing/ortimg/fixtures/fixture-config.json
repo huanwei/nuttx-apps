@@ -1,0 +1,12 @@
+{
+  "architecture": "arm",
+  "os": "linux",
+  "config": {
+    "Env": ["PATH=/bin", "ORT_FIXTURE=1"],
+    "Entrypoint": ["/bin/orthello"],
+    "Cmd": ["/etc/hello.txt"],
+    "WorkingDir": "/tmp/ort/wd"
+  },
+  "rootfs": {"type": "layers", "diff_ids": ["sha256:3fa8597587caedc2825f626c8f96750db8395b4ff08e91e63427cb86ea0f9ba2"]},
+  "history": [{"created_by": "ort-fixture-gen"}]
+}
