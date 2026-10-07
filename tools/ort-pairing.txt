@@ -9,9 +9,9 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-07 ORT（§76 并发判别 + 内核修复：sig_dispatch ISR
-#               跨核投信号守卫（第 4 处上游缺陷本地修复）fd227fd1c0；
-#               apps 侧 orting 改动，夹具未动）。
+# 最近配对事件：2026-10-07 ORT（§77 长驻守护：`supd` 旁路观测——监督者
+#               与派生者解耦；apps 侧 orting 改动，内核未动，nuttx= 仍为
+#               fd227fd1c0）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
