@@ -9,6 +9,8 @@
  *   orting manifest <path>       —— 解析一份真实 manifest 并打印字段
  *   orting config <path>         —— 解析 OCI image config（⑧ 落盘件的独立复读）
  *   orting run <view> <config>   —— 照着 config 起进程（Entrypoint+Env+WorkingDir）
+ *   orting up <view> <host> <port> <repo> <tag>
+ *                                —— 自动动线：pull → 组装 → 挂载视图（一条命令）
  *   orting validate <path>       —— 通用 JSON 校验（只报错名）
  *
  * 目标机上 /system 是 hostfs（宿主 nuttx-apps 树），所以夹具直接用
@@ -27,6 +29,7 @@
 #include <sys/stat.h>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <sys/mount.h>
 
 #include "ort_json.h"
 #include "ortimg_battery.h"
@@ -899,6 +902,121 @@ static int do_run(FAR const char *view, FAR const char *path)
   return 1;
 }
 
+/* ── 自动动线：一条命令 = pull → 组装 → 挂载视图（A2 增量②）───────── *
+ *
+ * （do_pull 定义在本文件后段 —— 前向声明。） */
+
+static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
+                   FAR const char *tag);
+
+/* 流程（`orting up <view> <host> <port> <repo> <tag>`）：
+ *   ① mkdir 视图 + **派生**中转挂载点（<view>_ro 下层 / <view>_up 上层
+ *      —— 派生名避免多实例/与手工装置互踩）
+ *   ② 用户态 mount tmpfs ×2（mount 有系统调用槽；nsh 语义同款：
+ *      mount(NULL, target, fstype, 0, data)）
+ *   ③ 复用 do_pull（下载+内容寻址校验+落盘+rootfs 组装，打印照旧）
+ *   ④ 两层 untar 到下层挂载点（复用 do_tar_apply）
+ *   ⑤ mount unionfs（fspath1=<view>_up,fspath2=<view>_ro → <view>）
+ *
+ * fail-closed：任一步失败即精确报错并返回 1。**重复 up 的实测语义**
+ * （2026-10-07）：NuttX 允许 tmpfs **叠挂**（挂点判据放行）——重试会
+ * 一路走到 ⑤，被 unionfs 的目标判据拒绝（`/v` 已是挂载点、其 inode
+ * 非 PSEUDODIR ⇒ ENOTDIR）；整体 fail-closed，但**不在 ② 早退**。
+ * 挂载目标是**根伪文件系统下的一级目录**（fs_mount.c 只认 PSEUDODIR；
+ * /tmp 下必 ENOTDIR —— §65 实证）。早退预检列后续。
+ */
+
+static int do_up(FAR const char *view, FAR const char *host, unsigned port,
+                 FAR const char *repo, FAR const char *tag)
+{
+  static char ro[300];
+  static char upsf[300];
+  static char data[384];
+  struct stat vst;
+  uint32_t i;
+  int ret;
+
+  /* ① 视图 + 派生中转点 */
+
+  if (snprintf(ro,   sizeof(ro),   "%s_ro", view) >= (int)sizeof(ro) ||
+      snprintf(upsf, sizeof(upsf), "%s_up", view) >= (int)sizeof(upsf))
+    {
+      printf("[up] 视图名过长: %s\n", view);
+      return 1;
+    }
+
+  if (mkdir_p(view) != 0 || mkdir_p(ro) != 0 || mkdir_p(upsf) != 0)
+    {
+      printf("[up] 建目录失败（view=%s errno=%d）\n", view, errno);
+      return 1;
+    }
+
+  if (stat(view, &vst) != 0 || !S_ISDIR(vst.st_mode))
+    {
+      printf("[up] 视图不是目录: %s\n", view);
+      return 1;
+    }
+
+  /* ② tmpfs ×2（用户态 mount；EBUSY=重复 up 的 fail-closed 见证） */
+
+  if (mount(NULL, ro, "tmpfs", 0, NULL) != 0)
+    {
+      printf("[up] tmpfs 挂载失败（下层）: %s（errno=%d）\n", ro, errno);
+      return 1;
+    }
+
+  if (mount(NULL, upsf, "tmpfs", 0, NULL) != 0)
+    {
+      printf("[up] tmpfs 挂载失败（上层）: %s（errno=%d）\n", upsf, errno);
+      return 1;
+    }
+
+  /* ③ pull（下载 + 校验 + 落盘 + rootfs；复用全链） */
+
+  ret = do_pull(host, port, repo, tag);
+  if (ret != 0)
+    {
+      printf("[up] pull 未过（r=%d）→ up 中止\n", ret);
+      return 1;
+    }
+
+  /* ④ 两层 → 下层挂载点 */
+
+  for (i = 0; i < g_mf.nlayers && i < 8; i++)
+    {
+      static char lp[300];
+      FAR const char *hex = g_mf.layers[i].digest;
+
+      if (strncmp(hex, "sha256:", 7) == 0)
+        {
+          hex += 7;
+        }
+
+      snprintf(lp, sizeof(lp),
+               ORT_STORE_ROOT "/images/sha256/%s/layer.tar", hex);
+
+      printf("[up] 铺层[%u] → %s\n", (unsigned)i, ro);
+      if (do_tar_apply(lp, ro) != 0)
+        {
+          printf("[up] 层[%u]铺入失败 → up 中止\n", (unsigned)i);
+          return 1;
+        }
+    }
+
+  /* ⑤ unionfs：上层可写 + 下层只读 → 视图 */
+
+  snprintf(data, sizeof(data), "fspath1=%s,fspath2=%s", upsf, ro);
+
+  if (mount(NULL, view, "unionfs", 0, data) != 0)
+    {
+      printf("[up] union 挂载失败: %s（errno=%d）\n", view, errno);
+      return 1;
+    }
+
+  printf("[up] 视图就绪: %s（下层 %s + 上层 %s）\n", view, ro, upsf);
+  return 0;
+}
+
 static int do_validate(FAR const char *path)
 {
   size_t len = 0;
@@ -1518,6 +1636,15 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
+  if (argc >= 7 && strcmp(argv[1], "up") == 0)
+    {
+      /* up <view> <host> <port> <repo> <tag> —— pull+组装+挂载 一条命令 */
+      int r = do_up(argv[2], argv[3], (unsigned)atoi(argv[4]), argv[5],
+                    argv[6]);
+      free(g_buf);
+      return r;
+    }
+
   if (argc >= 3 && strcmp(argv[1], "validate") == 0)
     {
       int r = do_validate(argv[2]);
@@ -1562,6 +1689,7 @@ int main(int argc, FAR char *argv[])
          "      manifest <path> | config <path> | validate <path> |\n"
          "      sha <path> | untar <archive> <destdir> | lsroot <dir> |\n"
          "      run <view> <config> |\n"
+         "      up <view> <host> <port> <repo> <tag> |\n"
          "      httpget <host> <port> <path> | pull <host> <port> <repo> <tag>\n");
   free(g_buf);
   return 2;
