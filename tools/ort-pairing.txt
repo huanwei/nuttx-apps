@@ -9,8 +9,8 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-07 ORT（§70 起进程：`orting run`——Entrypoint+
-#               Env+WorkingDir(PWD 通道)；apps 侧 orting/orthello/夹具改动，
+# 最近配对事件：2026-10-07 ORT（§71 自动动线：`orting up`——pull+组装+
+#               挂载（用户态 mount）一条命令；apps 侧 orting 改动，
 #               内核未动，nuttx= 仍为 05874dbd16）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
