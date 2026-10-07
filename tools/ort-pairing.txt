@@ -9,10 +9,9 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-06 orting（§67 补记·四：微 ELF 复现器资产）
-#               —— apps 侧仅 .gitignore（生成物不入库），内核未动
-#               （nuttx= 保持上轮 d7c05a5905；探针均回退零改动）。
+# 最近配对事件：2026-10-07 ORT（§67 缺口破案+修复：file_seek 返回值错位）
+#               —— nuttx 侧 2 文件修复 05874dbd16；apps 无代码改动。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=d7c05a5905defd3b53064e1332bdbf1bf9586a96
+nuttx=05874dbd16a069618b930af510da967eb0136a7c
