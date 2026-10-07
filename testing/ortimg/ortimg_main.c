@@ -896,14 +896,16 @@ static int do_run(FAR const char *view, FAR const char *path)
       return 1;
     }
 
-  if (WIFEXITED(st))
-    {
-      printf("[run] 退出码=%d\n", WEXITSTATUS(st));
-      return WEXITSTATUS(st) == 0 ? 0 : 1;
-    }
+  /* NuttX 的 wait 语义（§73 源码定案+实测）：status = exitcode << 8
+   * （task_exithook.c），且"异常终止"的默认动作**就是** _exit(EXIT_FAILURE)
+   * （sig_default.c）—— `WIFSIGNALED` 硬编码 false ⇒ **崩溃与 exit(1)
+   * 在 waitpid 层面不可分**。如实按"退出码"报；==1 时带注记。
+   * （容器崩溃的**可分**信号要另开通道 —— 见手册 §三·补七十三 边界。） */
 
-  printf("[run] 非正常退出（st=%d）\n", st);
-  return 1;
+  printf("[run] 退出码=%d%s\n", WEXITSTATUS(st),
+         WEXITSTATUS(st) == 1
+           ? "（=EXIT_FAILURE；NuttX 崩溃与 exit(1) 不可分——§73）" : "");
+  return WEXITSTATUS(st) == 0 ? 0 : 1;
 }
 
 /* ── 自动动线：一条命令 = pull → 组装 → 挂载视图（A2 增量②）───────── *

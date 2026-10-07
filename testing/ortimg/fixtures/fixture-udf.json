@@ -1,0 +1,9 @@
+{
+  "architecture": "arm",
+  "os": "linux",
+  "config": {
+    "Entrypoint": ["/bin/orthello"],
+    "Cmd": ["/etc/hello.txt", "udf"],
+    "WorkingDir": "/tmp/ort/wd"
+  }
+}
