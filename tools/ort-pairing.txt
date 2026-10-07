@@ -9,10 +9,10 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-07 ORT（§75 重启策略：崩溃容器按预算重启/恢复/
-#               放弃/汇总；apps 侧 orting/orthello/夹具改动，内核未动
-#               ——源码与配置均未动，nuttx= 仍为 05874dbd16）。
+# 最近配对事件：2026-10-07 ORT（§76 并发判别 + 内核修复：sig_dispatch ISR
+#               跨核投信号守卫（第 4 处上游缺陷本地修复）fd227fd1c0；
+#               apps 侧 orting 改动，夹具未动）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=05874dbd16a069618b930af510da967eb0136a7c
+nuttx=fd227fd1c0e65d10aaa140e16e173c7e2cefd9e1
