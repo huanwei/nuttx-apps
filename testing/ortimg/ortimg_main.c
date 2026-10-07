@@ -18,6 +18,8 @@
  *   orting par <view> <cfg1> [cfg2 ...]
  *                                —— 并发容器：事件队列逐条配对压力
  *   orting supd <秒>             —— 长驻监督者：与派生者解耦的旁路观测
+ *   orting orch <秒> <view> <cfg1> [cfg2 ...]
+ *                                —— 多服务编排环：wait-any + 个体策略
  *   orting down <view>           —— 卸载视图（生命周期收尾）
  *   orting validate <path>       —— 通用 JSON 校验（只报错名）
  *
@@ -1406,6 +1408,298 @@ static int do_supd(int secs)
   return 0;
 }
 
+/* ── orch：多服务编排环 —— wait-any 驱动的个体策略（A2 增量⑨，§78）── *
+ *
+ * 一个进程管一组服务：并发拉起全部（按 pid 绑域），然后进**编排环**：
+ *   轮询（抽事件队列 + waitpid(-1, WNOHANG) 把**已死的逐个捞出来**——
+ *   不按固定顺序等谁）→ 按 victim 归到各自服务 → 个体策略：
+ *     崩溃 → 预算未耗尽：重启（第 N 次）；耗尽：放弃（记降级）
+ *     正常退出 → 完成（服务语义：退出即终态，不热重启）
+ *     无事件   → 如实记（终态）
+ *   **全部服务落定**（完成/放弃）即提前退场；否则到 <秒> 兜底。
+ * 退场汇总：完成 / 放弃 / 重启次数 / 用时。
+ *
+ * 与 sup/par 的区别：sup=串行批量、par=同时崩只配对、orch=**异步死亡 +
+ * 个体策略环**（谁死处理谁，处理完还能继续管剩下的）。
+ *
+ * 用法：orting orch <秒> <view> <config1> [config2 ...]（上限 4）
+ */
+
+#define ORT_ORCH_MAX 4
+
+static int do_orch(int secs, FAR const char *view, int ncfg,
+                   FAR char * const *cfgs)
+{
+  struct
+  {
+    pid_t pid;
+    int   restarts;
+    int   done;          /* 终态：完成/放弃/无事件 */
+    int   dropped;
+    int   nf;            /* 记账：按**当前 pid** 归拢（死亡可乱序到达） */
+    int   nx;
+    uintptr_t pc;
+    uintptr_t addr;
+    uint32_t  faults;
+    int       code;
+  } svc[ORT_ORCH_MAX];
+
+  time_t start;
+  int    n = 0;
+  int    ret;
+  int    i;
+
+  if (secs <= 0)
+    {
+      secs = 10;
+    }
+
+  if (ncfg > ORT_ORCH_MAX)
+    {
+      ncfg = ORT_ORCH_MAX;
+    }
+
+  ret = prctl(PR_SET_ORT_SUPERVISOR);
+  if (ret < 0)
+    {
+      printf("[orch] 注册监督者失败: %d（errno=%d）→ orch 中止\n",
+             ret, errno);
+      return 1;
+    }
+
+  {
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = ort_sup_wake;
+    sigaction(ORT_SIGFAULT, &sa, NULL);
+  }
+
+  memset(svc, 0, sizeof(svc));
+
+  printf("[orch] 上任: pid=%d（服务 %d 个，上限 %d 秒）\n",
+         (int)getpid(), ncfg, secs);
+
+  /* 并发拉起全部服务（各自绑域） */
+
+  for (i = 0; i < ncfg; i++)
+    {
+      svc[i].pid = -1;
+
+      ret = run_spawn(view, cfgs[i], &svc[i].pid);
+      if (ret != 0)
+        {
+          printf("[orch] 服务[%d] 未拉起（r=%d）→ 放弃\n", i, ret);
+          svc[i].pid = -1;
+          svc[i].done = 1;
+          svc[i].dropped = 1;
+          continue;
+        }
+
+      n++;
+
+      ret = prctl(PR_SET_ORT_DOMAIN, i + 1, (pid_t)svc[i].pid);
+      if (ret < 0)
+        {
+          printf("[orch] 服务[%d] 绑域失败: %d（继续——FAULT 不依赖域）\n",
+                 i, ret);
+        }
+    }
+
+  start = time(NULL);
+
+  /* 编排环：谁死处理谁 */
+
+  for (;;)
+    {
+      int settled = 1;
+      int alive = 0;
+
+      /* ① 处理所有**已死**的服务（wait-any，WNOHANG 捞干）。
+       *
+       * ★ 每趟先**抽干事件队列做全量记账**：死亡是**乱序**到达的，
+       *   先死的服务的事件可能在后死的服务的趟里才被抽到。逐趟
+       *   "只认本 pid、其余丢弃"会把别家记录吃掉（实测：服务[0] 的
+       *   FAULT 被服务[1] 的趟吃掉 → 服务[0] 判成"无事件"）。按**各
+       *   自当前 pid** 归拢到各服务的记账槽；重启时清零（新世代新账）。
+       *   抽在 waitpid **之前**：记录一定先于"死亡可见"入队（入队在
+       *   终止路径上），趟首抽同时覆盖"记录已到、死亡未可见"的竞态。 */
+
+      for (;;)
+        {
+          struct ort_faultrec_s rec;
+          pid_t dead;
+          int   st = 0;
+          int   idx = -1;
+          int   j;
+
+          while ((ret = prctl(PR_GET_ORT_FAULT, &rec)) > 0)
+            {
+              for (j = 0; j < ncfg; j++)
+                {
+                  if (svc[j].pid == rec.victim)
+                    {
+                      if (rec.kind == 0)
+                        {
+                          svc[j].nf++;
+                          svc[j].pc = rec.pc;
+                          svc[j].addr = rec.addr;
+                          svc[j].faults = rec.faults;
+                        }
+                      else if (rec.kind == 1)
+                        {
+                          svc[j].nx++;
+                          svc[j].code = rec.code;
+                        }
+
+                      break;
+                    }
+                }
+
+              if (j >= ncfg)
+                {
+                  printf("[orch] （记录 victim=%d 不在编（旧世代？）——如实记）\n",
+                         rec.victim);
+                }
+            }
+
+          dead = waitpid(-1, &st, WNOHANG);
+          if (dead <= 0)
+            {
+              break;
+            }
+
+          for (j = 0; j < ncfg; j++)
+            {
+              if (svc[j].pid == dead)
+                {
+                  idx = j;
+                  break;
+                }
+            }
+
+          if (idx < 0)
+            {
+              printf("[orch] 未知子进程 %d 退出（如实记）\n", (int)dead);
+              continue;
+            }
+
+          printf("[orch] 服务[%d] pid=%d 退出码=%d 事件=%d（FAULT %d / EXIT %d）\n",
+                 idx, (int)dead, WEXITSTATUS(st),
+                 svc[idx].nf + svc[idx].nx, svc[idx].nf, svc[idx].nx);
+
+          if (svc[idx].nf > 0)
+            {
+              printf("[orch] 服务[%d] 判别: 崩溃（FAULT pc=0x%x addr=0x%x "
+                     "faults=%u）\n", idx, (unsigned)svc[idx].pc,
+                     (unsigned)svc[idx].addr, (unsigned)svc[idx].faults);
+
+              if (svc[idx].restarts < ORT_SUP_RESTARTS)
+                {
+                  svc[idx].restarts++;
+
+                  ret = run_spawn(view, cfgs[idx], &svc[idx].pid);
+                  if (ret != 0)
+                    {
+                      printf("[orch] 服务[%d] 重启未拉起（r=%d）→ 放弃\n",
+                             idx, ret);
+                      svc[idx].pid = -1;
+                      svc[idx].done = 1;
+                      svc[idx].dropped = 1;
+                      continue;
+                    }
+
+                  prctl(PR_SET_ORT_DOMAIN, idx + 1, (pid_t)svc[idx].pid);
+
+                  /* 新世代新账 */
+
+                  svc[idx].nf = 0;
+                  svc[idx].nx = 0;
+
+                  printf("[orch] 服务[%d] 崩溃 → 重启 %d/%d\n",
+                         idx, svc[idx].restarts, ORT_SUP_RESTARTS);
+                }
+              else
+                {
+                  printf("[orch] 服务[%d] 重启预算耗尽 → 放弃（记一次降级）\n",
+                         idx);
+                  svc[idx].pid = -1;
+                  svc[idx].done = 1;
+                  svc[idx].dropped = 1;
+                }
+            }
+          else if (svc[idx].nx > 0)
+            {
+              printf("[orch] 服务[%d] 正常退出（EXIT code=%d）→ 完成\n",
+                     idx, svc[idx].code);
+              svc[idx].pid = -1;
+              svc[idx].done = 1;
+            }
+          else
+            {
+              printf("[orch] 服务[%d] 无事件收尾（退出码=%d）→ 完成\n",
+                     idx, WEXITSTATUS(st));
+              svc[idx].pid = -1;
+              svc[idx].done = 1;
+            }
+        }
+
+      /* ② 落定检查 / 时间兜底（等待下一批死亡用 sleep；WNOHANG 不阻塞） */
+
+      for (i = 0; i < ncfg; i++)
+        {
+          if (!svc[i].done)
+            {
+              settled = 0;
+              alive++;
+            }
+        }
+
+      if (settled)
+        {
+          printf("[orch] 全部落定（用时约 %d 秒）\n",
+                 (int)(time(NULL) - start));
+          break;
+        }
+
+      if (time(NULL) - start >= (time_t)secs)
+        {
+          printf("[orch] 到时（%d 个服务仍在运行，放弃管理）\n", alive);
+          break;
+        }
+
+      sleep(1);
+    }
+
+  {
+    int done = 0;
+    int dropped = 0;
+    int restarts = 0;
+
+    for (i = 0; i < ncfg; i++)
+      {
+        if (svc[i].done && !svc[i].dropped)
+          {
+            done++;
+          }
+
+        if (svc[i].dropped)
+          {
+            dropped++;
+          }
+
+        restarts += svc[i].restarts;
+      }
+
+    printf("[orch] 汇总: 完成 %d / 放弃 %d / 重启 %d 次（用时 %d 秒）\n",
+           done, dropped, restarts, (int)(time(NULL) - start));
+  }
+
+  ret = prctl(PR_ORT_SUPERVISOR_RESET);
+  printf("[orch] 卸任: %s（槽释放）\n", ret == 0 ? "OK" : "失败");
+  return 0;
+}
+
 /* ── 自动动线：一条命令 = pull → 组装 → 挂载视图（A2 增量②）───────── *
  *
  * （do_pull 定义在本文件后段 —— 前向声明。） */
@@ -2278,6 +2572,14 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
+  if (argc >= 5 && strcmp(argv[1], "orch") == 0)
+    {
+      /* orch <秒> <view> <cfg1> [cfg2 ...] —— 多服务编排环 */
+      int r = do_orch(atoi(argv[2]), argv[3], argc - 4, &argv[4]);
+      free(g_buf);
+      return r;
+    }
+
   if (argc >= 3 && strcmp(argv[1], "validate") == 0)
     {
       int r = do_validate(argv[2]);
@@ -2326,7 +2628,7 @@ int main(int argc, FAR char *argv[])
          "      start <view> <host> <port> <repo> <tag> |\n"
          "      sup <view> <config1> [config2 ...] |\n"
          "      par <view> <config1> [config2 ...] |\n"
-         "      supd <秒> |\n"
+         "      supd <秒> | orch <秒> <view> <cfg1> [cfg2 ...] |\n"
          "      httpget <host> <port> <path> | pull <host> <port> <repo> <tag>\n");
   free(g_buf);
   return 2;
