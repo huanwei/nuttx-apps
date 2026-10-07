@@ -15,6 +15,8 @@
  *                                —— up + run：镜像到进程一条命令
  *   orting sup <view> <cfg1> [cfg2 ...]
  *                                —— 运行时兼任监督者：崩没崩的正面判别
+ *   orting par <view> <cfg1> [cfg2 ...]
+ *                                —— 并发容器：事件队列逐条配对压力
  *   orting down <view>           —— 卸载视图（生命周期收尾）
  *   orting validate <path>       —— 通用 JSON 校验（只报错名）
  *
@@ -1137,6 +1139,197 @@ static int do_sup(FAR const char *view, int ncfg, FAR char * const *cfgs)
   return rc;
 }
 
+/* ── par：并发判别 —— 事件队列的"逐条配对"压力（A2 增量⑦，§76）──── *
+ *
+ * N 个容器**同时**跑、同时崩，然后一次性抽干故障事件队列，按 victim
+ * （pid）逐条配对回各自的容器。压的是 §32 那套队列协议的运行时线：
+ * 并发入队的序号原子性（R1/R4）、生产者/消费者游标协议（R3/R5）——
+ * "A 的 pid 配 B 的详情"这类错配在这里现形。
+ *
+ * 打印纪律：par 自己的行**全部在子进程死光之后**打（记录/判别/汇总）——
+ * 控制台是逐字符写，活着的子进程打印会把我们的行劈开；死后再打就没有
+ * 竞争者（内核 syslog 行仍可能与子进程交错，判据用"平流计数"对付）。
+ *
+ * 用法：orting par <view> <config1> [config2 ...]（上限 8 个）
+ */
+
+#define ORT_PAR_MAX 8
+
+static int do_par(FAR const char *view, int ncfg, FAR char * const *cfgs)
+{
+  struct
+  {
+    int       nf;
+    int       nx;
+    uintptr_t pc;
+    uintptr_t addr;
+    uint32_t  faults;
+    int       code;
+  } tally[ORT_PAR_MAX];
+
+  pid_t pids[ORT_PAR_MAX];
+  int   st[ORT_PAR_MAX];
+  int   n = 0;
+  int   matched;
+  int   ret;
+  int   i;
+
+  if (ncfg > ORT_PAR_MAX)
+    {
+      ncfg = ORT_PAR_MAX;
+    }
+
+  ret = prctl(PR_SET_ORT_SUPERVISOR);
+  if (ret < 0)
+    {
+      printf("[par] 注册监督者失败: %d（errno=%d）→ par 中止\n", ret, errno);
+      return 1;
+    }
+
+  {
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = ort_sup_wake;
+    sigaction(ORT_SIGFAULT, &sa, NULL);
+  }
+
+  printf("[par] 上任: pid=%d（并发批次 %d 个）\n", (int)getpid(), ncfg);
+
+  memset(tally, 0, sizeof(tally));
+
+  /* ① 全部拉起（并发）：spawn + 按 pid 绑域 */
+
+  for (i = 0; i < ncfg; i++)
+    {
+      pids[i] = -1;
+      st[i] = 0;
+
+      ret = run_spawn(view, cfgs[i], &pids[i]);
+      if (ret != 0)
+        {
+          printf("[par] 容器[%d] 未拉起（r=%d）\n", i, ret);
+          pids[i] = -1;
+          continue;
+        }
+
+      n++;
+
+      ret = prctl(PR_SET_ORT_DOMAIN, i + 1, (pid_t)pids[i]);
+      if (ret < 0)
+        {
+          printf("[par] 容器[%d] 绑域失败: %d（继续——FAULT 不依赖域）\n",
+                 i, ret);
+        }
+    }
+
+  /* ② 全部等完（EINTR = 醒信号，重试） */
+
+  for (i = 0; i < ncfg; i++)
+    {
+      if (pids[i] < 0)
+        {
+          continue;
+        }
+
+      do
+        {
+          ret = waitpid(pids[i], &st[i], 0);
+        }
+      while (ret < 0 && errno == EINTR);
+
+      if (ret < 0)
+        {
+          printf("[par] 容器[%d] waitpid 失败（errno=%d）\n", i, errno);
+        }
+    }
+
+  /* ③ 一次抽干队列 → 逐条打印 + 按 victim 配对（此刻无子进程在打印） */
+
+  {
+    struct ort_faultrec_s rec;
+
+    while ((ret = prctl(PR_GET_ORT_FAULT, &rec)) > 0)
+      {
+        printf("[par] 记录 seq=%u victim=%d kind=%u pc=0x%x addr=0x%x "
+               "faults=%u\n", (unsigned)rec.seq, rec.victim,
+               (unsigned)rec.kind, (unsigned)rec.pc, (unsigned)rec.addr,
+               (unsigned)rec.faults);
+
+        matched = 0;
+
+        for (i = 0; i < ncfg; i++)
+          {
+            if (pids[i] == rec.victim)
+              {
+                matched = 1;
+
+                if (rec.kind == 0)
+                  {
+                    tally[i].nf++;
+                    tally[i].pc = rec.pc;
+                    tally[i].addr = rec.addr;
+                    tally[i].faults = rec.faults;
+                  }
+                else if (rec.kind == 1)
+                  {
+                    tally[i].nx++;
+                    tally[i].code = rec.code;
+                  }
+
+                break;
+              }
+          }
+
+        if (!matched)
+          {
+            printf("[par] （记录 victim=%d 不在本批——如实记）\n",
+                   rec.victim);
+          }
+      }
+
+    if (ret < 0)
+      {
+        printf("[par] 读事件失败: %d（errno=%d）\n", ret, errno);
+      }
+  }
+
+  /* ④ 逐容器判别（含 index/pid —— 配对证据在行内自带） */
+
+  for (i = 0; i < ncfg; i++)
+    {
+      if (pids[i] < 0)
+        {
+          continue;
+        }
+
+      printf("[par] 容器[%d] pid=%d 退出码=%d（FAULT %d / EXIT %d）\n",
+             i, (int)pids[i], WEXITSTATUS(st[i]), tally[i].nf, tally[i].nx);
+
+      if (tally[i].nf > 0)
+        {
+          printf("[par] 容器[%d] 判别: 崩溃（FAULT pc=0x%x addr=0x%x "
+                 "faults=%u）\n", i, (unsigned)tally[i].pc,
+                 (unsigned)tally[i].addr, (unsigned)tally[i].faults);
+        }
+      else if (tally[i].nx > 0)
+        {
+          printf("[par] 容器[%d] 判别: 正常退出（EXIT code=%d）\n",
+                 i, tally[i].code);
+        }
+      else
+        {
+          printf("[par] 容器[%d] 判别: 无事件\n", i);
+        }
+    }
+
+  printf("[par] 汇总: 批次 %d 个 / 记录逐条配对完\n", n);
+
+  ret = prctl(PR_ORT_SUPERVISOR_RESET);
+  printf("[par] 卸任: %s（槽释放）\n", ret == 0 ? "OK" : "失败");
+  return 0;
+}
+
 /* ── 自动动线：一条命令 = pull → 组装 → 挂载视图（A2 增量②）───────── *
  *
  * （do_pull 定义在本文件后段 —— 前向声明。） */
@@ -1993,6 +2186,14 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
+  if (argc >= 4 && strcmp(argv[1], "par") == 0)
+    {
+      /* par <view> <config1> [config2 ...] —— 并发判别（配对压力） */
+      int r = do_par(argv[2], argc - 3, &argv[3]);
+      free(g_buf);
+      return r;
+    }
+
   if (argc >= 3 && strcmp(argv[1], "validate") == 0)
     {
       int r = do_validate(argv[2]);
@@ -2040,6 +2241,7 @@ int main(int argc, FAR char *argv[])
          "      up <view> <host> <port> <repo> <tag> |\n"
          "      start <view> <host> <port> <repo> <tag> |\n"
          "      sup <view> <config1> [config2 ...] |\n"
+         "      par <view> <config1> [config2 ...] |\n"
          "      httpget <host> <port> <path> | pull <host> <port> <repo> <tag>\n");
   free(g_buf);
   return 2;
