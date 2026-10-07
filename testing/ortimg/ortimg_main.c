@@ -17,6 +17,7 @@
  *                                —— 运行时兼任监督者：崩没崩的正面判别
  *   orting par <view> <cfg1> [cfg2 ...]
  *                                —— 并发容器：事件队列逐条配对压力
+ *   orting supd <秒>             —— 长驻监督者：与派生者解耦的旁路观测
  *   orting down <view>           —— 卸载视图（生命周期收尾）
  *   orting validate <path>       —— 通用 JSON 校验（只报错名）
  *
@@ -40,6 +41,7 @@
 #include <sys/statfs.h>
 #include <sys/prctl.h>
 #include <signal.h>
+#include <time.h>
 
 #include "ort_json.h"
 #include "ortimg_battery.h"
@@ -1330,6 +1332,80 @@ static int do_par(FAR const char *view, int ncfg, FAR char * const *cfgs)
   return 0;
 }
 
+/* ── supd：长驻监督者 —— 与派生者解耦（A2 增量⑧，§77）────────────── *
+ *
+ * 前面几个模式的监督者是"派生者兼职"（自己拉的容器自己看）。产品形态
+ * 是**编排者常驻**：监督者 ≠ 派生者 —— 容器由别处拉起（nsh / 别的
+ * 进程），守护进程旁路观测整个系统。
+ *
+ * 形态：注册监督者 → 按**墙钟**巡检 secs 秒（睡 1 秒 → 抽干队列 →
+ * 立即打印；醒信号打断睡眠就是即时抽一次——尽力而为的延迟优化）→
+ * 到期打印退场汇总（条数 + 末序）→ 卸任。
+ *
+ * ⚠️ sleep 被信号打断会提前返回：循环用**时间**判退场，不用次数
+ * （否则每次唤醒都烧掉一轮，守护提前死）。
+ *
+ * 用法：orting supd <秒>（建议 nsh 后台：`orting supd 15 &`）
+ */
+
+static int do_supd(int secs)
+{
+  time_t start;
+  int    total = 0;
+  uint32_t last_seq = 0;
+  int    ret;
+
+  if (secs <= 0)
+    {
+      secs = 10;
+    }
+
+  ret = prctl(PR_SET_ORT_SUPERVISOR);
+  if (ret < 0)
+    {
+      printf("[supd] 注册监督者失败: %d（errno=%d）→ supd 中止\n",
+             ret, errno);
+      return 1;
+    }
+
+  {
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = ort_sup_wake;
+    sigaction(ORT_SIGFAULT, &sa, NULL);
+  }
+
+  printf("[supd] 上任: pid=%d（巡检 %d 秒，与派生者解耦）\n",
+         (int)getpid(), secs);
+
+  start = time(NULL);
+
+  while (time(NULL) - start < (time_t)secs)
+    {
+      struct ort_faultrec_s rec;
+
+      sleep(1);
+
+      while ((ret = prctl(PR_GET_ORT_FAULT, &rec)) > 0)
+        {
+          total++;
+          last_seq = rec.seq;
+          printf("[supd] 事件 seq=%u victim=%d kind=%u pc=0x%x addr=0x%x "
+                 "faults=%u\n", (unsigned)rec.seq, rec.victim,
+                 (unsigned)rec.kind, (unsigned)rec.pc, (unsigned)rec.addr,
+                 (unsigned)rec.faults);
+        }
+    }
+
+  printf("[supd] 退场: 共 %d 条（末序 seq=%u）\n", total,
+         (unsigned)last_seq);
+
+  ret = prctl(PR_ORT_SUPERVISOR_RESET);
+  printf("[supd] 卸任: %s（槽释放）\n", ret == 0 ? "OK" : "失败");
+  return 0;
+}
+
 /* ── 自动动线：一条命令 = pull → 组装 → 挂载视图（A2 增量②）───────── *
  *
  * （do_pull 定义在本文件后段 —— 前向声明。） */
@@ -2194,6 +2270,14 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
+  if (argc >= 3 && strcmp(argv[1], "supd") == 0)
+    {
+      /* supd <秒> —— 长驻监督者（与派生者解耦；建议后台 &） */
+      int r = do_supd(atoi(argv[2]));
+      free(g_buf);
+      return r;
+    }
+
   if (argc >= 3 && strcmp(argv[1], "validate") == 0)
     {
       int r = do_validate(argv[2]);
@@ -2242,6 +2326,7 @@ int main(int argc, FAR char *argv[])
          "      start <view> <host> <port> <repo> <tag> |\n"
          "      sup <view> <config1> [config2 ...] |\n"
          "      par <view> <config1> [config2 ...] |\n"
+         "      supd <秒> |\n"
          "      httpget <host> <port> <path> | pull <host> <port> <repo> <tag>\n");
   free(g_buf);
   return 2;
