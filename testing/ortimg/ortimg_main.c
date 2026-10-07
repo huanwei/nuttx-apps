@@ -11,6 +11,9 @@
  *   orting run <view> <config>   —— 照着 config 起进程（Entrypoint+Env+WorkingDir）
  *   orting up <view> <host> <port> <repo> <tag>
  *                                —— 自动动线：pull → 组装 → 挂载视图（一条命令）
+ *   orting start <view> <host> <port> <repo> <tag>
+ *                                —— up + run：镜像到进程一条命令
+ *   orting down <view>           —— 卸载视图（生命周期收尾）
  *   orting validate <path>       —— 通用 JSON 校验（只报错名）
  *
  * 目标机上 /system 是 hostfs（宿主 nuttx-apps 树），所以夹具直接用
@@ -30,6 +33,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
+#include <sys/statfs.h>
 
 #include "ort_json.h"
 #include "ortimg_battery.h"
@@ -609,7 +613,7 @@ static int do_lsroot(FAR const char *root)
 
   if (ret != 0)
     {
-      printf("[ortimg] LSROOT FAIL（%d）\n", ret);
+      printf("[ortimg] LSROOT FAIL（%d，errno=%d）: %s\n", ret, errno, root);
       return 1;
     }
 
@@ -918,12 +922,12 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
  *   ④ 两层 untar 到下层挂载点（复用 do_tar_apply）
  *   ⑤ mount unionfs（fspath1=<view>_up,fspath2=<view>_ro → <view>）
  *
- * fail-closed：任一步失败即精确报错并返回 1。**重复 up 的实测语义**
- * （2026-10-07）：NuttX 允许 tmpfs **叠挂**（挂点判据放行）——重试会
- * 一路走到 ⑤，被 unionfs 的目标判据拒绝（`/v` 已是挂载点、其 inode
- * 非 PSEUDODIR ⇒ ENOTDIR）；整体 fail-closed，但**不在 ② 早退**。
- * 挂载目标是**根伪文件系统下的一级目录**（fs_mount.c 只认 PSEUDODIR；
- * /tmp 下必 ENOTDIR —— §65 实证）。早退预检列后续。
+ * fail-closed：任一步失败即精确报错并返回 1。
+ * **重复 up 的收口（§71 实测 → §72 收紧）**：§71 实测 NuttX 允许 tmpfs
+ * 叠挂，重试要走到 ⑤ 才被 unionfs 目标判据拒（ENOTDIR，整体 fail-closed
+ * 但会重复下载）；§72 起入口加**形态闸 + statfs 预检**，同场景在 ⓪/②
+ * 早退。statfs 语义（源码定案）：unionfs 的 statfs **转发到上层** ⇒ 视图
+ * 上看到的是 TMPFS_MAGIC；root 伪 FS 目录 = PROC_SUPER_MAGIC。
  */
 
 static int do_up(FAR const char *view, FAR const char *host, unsigned port,
@@ -932,9 +936,20 @@ static int do_up(FAR const char *view, FAR const char *host, unsigned port,
   static char ro[300];
   static char upsf[300];
   static char data[384];
+  struct statfs fs;
   struct stat vst;
   uint32_t i;
   int ret;
+
+  /* ⓪ 形态闸：unionfs 目标必须是**根伪文件系统下的一级目录**
+   *    （fs_mount 只认 PSEUDODIR；/tmp 下的目录在 tmpfs 里、必被拒
+   *    —— §65 实证）——这里一次判掉，报错才说得清 */
+
+  if (view[0] != '/' || view[1] == '\0' || strchr(view + 1, '/') != NULL)
+    {
+      printf("[up] 视图须为根下一级目录（如 /v）: %s\n", view);
+      return 1;
+    }
 
   /* ① 视图 + 派生中转点 */
 
@@ -951,13 +966,34 @@ static int do_up(FAR const char *view, FAR const char *host, unsigned port,
       return 1;
     }
 
+  /* ② 挂载点预检：视图/中转点已是 tmpfs/union ⇒ 重复 up，pull 前早退 */
+
+  if (statfs(view, &fs) == 0 &&
+      (fs.f_type == TMPFS_MAGIC || fs.f_type == UNIONFS_MAGIC))
+    {
+      printf("[up] 视图已在用（重复 up？）: %s\n", view);
+      return 1;
+    }
+
+  if (statfs(ro, &fs) == 0 && fs.f_type == TMPFS_MAGIC)
+    {
+      printf("[up] 中转点已在用: %s\n", ro);
+      return 1;
+    }
+
+  if (statfs(upsf, &fs) == 0 && fs.f_type == TMPFS_MAGIC)
+    {
+      printf("[up] 中转点已在用: %s\n", upsf);
+      return 1;
+    }
+
   if (stat(view, &vst) != 0 || !S_ISDIR(vst.st_mode))
     {
       printf("[up] 视图不是目录: %s\n", view);
       return 1;
     }
 
-  /* ② tmpfs ×2（用户态 mount；EBUSY=重复 up 的 fail-closed 见证） */
+  /* ③ tmpfs ×2（用户态 mount；重复 up 已在 ② 预检拦住） */
 
   if (mount(NULL, ro, "tmpfs", 0, NULL) != 0)
     {
@@ -971,7 +1007,7 @@ static int do_up(FAR const char *view, FAR const char *host, unsigned port,
       return 1;
     }
 
-  /* ③ pull（下载 + 校验 + 落盘 + rootfs；复用全链） */
+  /* ④ pull（下载 + 校验 + 落盘 + rootfs；复用全链） */
 
   ret = do_pull(host, port, repo, tag);
   if (ret != 0)
@@ -980,7 +1016,7 @@ static int do_up(FAR const char *view, FAR const char *host, unsigned port,
       return 1;
     }
 
-  /* ④ 两层 → 下层挂载点 */
+  /* ⑤ 两层 → 下层挂载点 */
 
   for (i = 0; i < g_mf.nlayers && i < 8; i++)
     {
@@ -1003,7 +1039,7 @@ static int do_up(FAR const char *view, FAR const char *host, unsigned port,
         }
     }
 
-  /* ⑤ unionfs：上层可写 + 下层只读 → 视图 */
+  /* ⑥ unionfs：上层可写 + 下层只读 → 视图 */
 
   snprintf(data, sizeof(data), "fspath1=%s,fspath2=%s", upsf, ro);
 
@@ -1014,6 +1050,62 @@ static int do_up(FAR const char *view, FAR const char *host, unsigned port,
     }
 
   printf("[up] 视图就绪: %s（下层 %s + 上层 %s）\n", view, ro, upsf);
+  return 0;
+}
+
+/* ── start：up + run 一条命令（镜像到进程）──────────────────────────── *
+ *
+ * 比"up 再手动 run"多知道一件事：config 落盘路径（pull 里 g_mf 已解析
+ * 出 config_digest）——所以调用方不必再传。
+ */
+
+static int do_start(FAR const char *view, FAR const char *host, unsigned port,
+                    FAR const char *repo, FAR const char *tag)
+{
+  static char cfgp[320];
+  FAR const char *hex = g_mf.config_digest;
+  int ret;
+
+  ret = do_up(view, host, port, repo, tag);
+  if (ret != 0)
+    {
+      printf("[start] up 未过（r=%d）→ start 中止\n", ret);
+      return 1;
+    }
+
+  if (strncmp(hex, "sha256:", 7) == 0)
+    {
+      hex += 7;
+    }
+
+  snprintf(cfgp, sizeof(cfgp),
+           ORT_STORE_ROOT "/images/sha256/%s/config.json", hex);
+
+  ret = do_run(view, cfgp);
+  printf("[start] 完成: view=%s（r=%d，收尾: orting down %s）\n",
+         view, ret, view);
+  return ret;
+}
+
+/* ── down：卸载视图（生命周期收尾）─────────────────────────────────── *
+ *
+ * 实测语义（§72，源码对账）：umount2 成功后 **挂载点目录本身也被
+ * 从命名空间摘除**（fs_umount2.c：mountpt_inode->i_child 非空时
+ * inode_remove(target)）—— 卸载后 `<view>` 路径**不存在**（opendir
+ * ENOENT），不是"空目录"；重复 down 报 ENOENT，重建需 mkdir（各自
+ * 的行为都是 fail-closed 的判据）。两个中转点则早在 bind 时就被
+ * unionfs 摘除（inode_remove，§65），不可按路径回收。
+ */
+
+static int do_down(FAR const char *view)
+{
+  if (umount2(view, 0) != 0)
+    {
+      printf("[down] 卸载失败: %s（errno=%d）\n", view, errno);
+      return 1;
+    }
+
+  printf("[down] 视图已卸载: %s\n", view);
   return 0;
 }
 
@@ -1645,6 +1737,23 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
+  if (argc >= 7 && strcmp(argv[1], "start") == 0)
+    {
+      /* start <view> <host> <port> <repo> <tag> —— up+run 一条命令 */
+      int r = do_start(argv[2], argv[3], (unsigned)atoi(argv[4]), argv[5],
+                       argv[6]);
+      free(g_buf);
+      return r;
+    }
+
+  if (argc >= 3 && strcmp(argv[1], "down") == 0)
+    {
+      /* down <view> —— 卸载视图 */
+      int r = do_down(argv[2]);
+      free(g_buf);
+      return r;
+    }
+
   if (argc >= 3 && strcmp(argv[1], "validate") == 0)
     {
       int r = do_validate(argv[2]);
@@ -1688,8 +1797,9 @@ int main(int argc, FAR char *argv[])
   printf("用法: orting jsontest | shatest | tartest |\n"
          "      manifest <path> | config <path> | validate <path> |\n"
          "      sha <path> | untar <archive> <destdir> | lsroot <dir> |\n"
-         "      run <view> <config> |\n"
+         "      run <view> <config> | down <view> |\n"
          "      up <view> <host> <port> <repo> <tag> |\n"
+         "      start <view> <host> <port> <repo> <tag> |\n"
          "      httpget <host> <port> <path> | pull <host> <port> <repo> <tag>\n");
   free(g_buf);
   return 2;
