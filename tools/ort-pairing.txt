@@ -9,10 +9,10 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-08 ORT（§81 内存限额：PR_SET_ORT_MEMCAP + 派生者
-#               组消费 + arena 判据；附压出"用户堆耗尽=断言"边界（待核）；
-#               apps 侧 orting/orthello/夹具改动，内核 dac5b87527）。
+# 最近配对事件：2026-10-08 ORT（§82 堆耗尽破案：第 7 处 arm_pgalloc 契约
+#               修复（耗尽=优雅 NULL）+ 限额增长闸门（pgalloc，双副本盲区
+#               入册）；apps 侧 orthello/夹具改动，内核 86c55b44b7）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=dac5b875273a98807b119540556ff8ef5429d0fd
+nuttx=86c55b44b79328a01505a6745b001064925a92ec
