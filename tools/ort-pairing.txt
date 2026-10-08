@@ -9,10 +9,11 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-08 ORT（§79 上半场：panic 双缺陷拆分 —— ①NULL 帧
-#               延迟投递已修（异步臂装载，= 第 4 处修正版）；②活任务投递
-#               SP 未收口；apps 侧未动，内核 b474325cfb）。
+# 最近配对事件：2026-10-08 ORT（§79 全程收口：①NULL 帧延迟投递→异步臂
+#               装载；②投递帧被臂装载→帧形态守卫 + sigdeliver 清零点后移
+#               （第 5 处上游缺陷）；50 风暴 0 复现、e2e ×2 全绿；apps 侧
+#               未动，内核 324a99ce07）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=b474325cfb744ecdd3f49f895b4ca11bbfde1402
+nuttx=324a99ce07ab430ca09e513fd5f59f8c89fbd101
