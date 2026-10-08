@@ -20,6 +20,8 @@
  *   orting supd <秒>             —— 长驻监督者：与派生者解耦的旁路观测
  *   orting orch <秒> <view> <cfg1> [cfg2 ...]
  *                                —— 多服务编排环：wait-any + 个体策略
+ *   orting lim <view> <cpu-list> <prio> <cfg1> [cfg2 ...]
+ *                                —— 资源限制：核集 + 优先级（fail-closed）
  *   orting down <view>           —— 卸载视图（生命周期收尾）
  *   orting validate <path>       —— 通用 JSON 校验（只报错名）
  *
@@ -43,6 +45,7 @@
 #include <sys/statfs.h>
 #include <sys/prctl.h>
 #include <signal.h>
+#include <sched.h>
 #include <time.h>
 
 #include "ort_json.h"
@@ -772,10 +775,12 @@ static int map_path(FAR const char *view, FAR const char *in,
 
 /* run 的"派生半"：视图先验 → 配置解析 → argv/环境/工作目录 → spawn。
  * do_run（wait + 报退出码）与 do_sup（绑域 + 抽事件队列 + 判别）共用
- * —— §74 拆分，行为不变。 */
+ * —— §74 拆分，行为不变。§80 起带 attr 变体（lim 用：优先级经
+ * posix_spawnattr 施加）。 */
 
-static int run_spawn(FAR const char *view, FAR const char *path,
-                     FAR pid_t *outpid)
+static int run_spawn_ex(FAR const char *view, FAR const char *path,
+                        FAR const posix_spawnattr_t *attr,
+                        FAR pid_t *outpid)
 {
   struct stat vst;
   size_t len = 0;
@@ -895,7 +900,7 @@ static int run_spawn(FAR const char *view, FAR const char *path,
   printf("[run] 环境 %d 条，PWD=%s\n", ne,
          g_cfg.workdir[0] ? g_pwdbuf + 4 : "(未设)");
 
-  ret = posix_spawn(&pid, g_argv[0], NULL, NULL, g_argv, g_envp);
+  ret = posix_spawn(&pid, g_argv[0], NULL, attr, g_argv, g_envp);
   if (ret != 0)
     {
       printf("[run] spawn 失败 rc=%d errno=%d\n", ret, errno);
@@ -905,6 +910,12 @@ static int run_spawn(FAR const char *view, FAR const char *path,
   printf("[run] spawned pid=%d\n", (int)pid);
   *outpid = pid;
   return 0;
+}
+
+static int run_spawn(FAR const char *view, FAR const char *path,
+                     FAR pid_t *outpid)
+{
+  return run_spawn_ex(view, path, NULL, outpid);
 }
 
 static int do_run(FAR const char *view, FAR const char *path)
@@ -1903,6 +1914,144 @@ static int do_down(FAR const char *view)
   return 0;
 }
 
+/* ── lim：资源限制第一刀 —— 核集 + 优先级（A2 增量⑩，§80）──────────── *
+ *
+ * 架构注：OCI 的 CPU 限制属 **host 侧配置**（Docker 的 HostConfig），
+ * 不在镜像 config 里 —— 所以资源限制由**运行时在派生前施加**（CLI），
+ * 而不是塞进 image config；与"编排者分配资源"的形态一致。
+ *
+ * 施加两条：优先级走 posix_spawnattr（spawn 前）；**核集注意**——
+ * spawnattr 没有亲和项，走 spawn 后 sched_setaffinity（按 pid）。
+ * 绑核失败 = **fail-closed**：不许"带着默认全核"继续跑（那就是没
+ * 限制的容器）—— 终止该容器并报错。
+ *
+ * 用法：orting lim <view> <cpu-list> <prio> <cfg1> [cfg2 ...]
+ *       （cpu-list 形如 "2" / "2,3"；越界的核号交给内核判 —— 正好
+ *        当"真闸门"的反证臂）
+ */
+
+static int do_lim(FAR const char *view, FAR const char *cpus, int prio,
+                  int ncfg, FAR char * const *cfgs)
+{
+  static cpu_set_t want;
+  posix_spawnattr_t attr;
+  uint32_t mask = 0;
+  int rc = 0;
+  int ret;
+  int i;
+
+  if (prio < 1 || prio > 255)
+    {
+      printf("[lim] 优先级非法: %d（1..255）\n", prio);
+      return 1;
+    }
+
+  /* 核集解析："2" / "2,3" / "0,1,2,3" */
+
+  CPU_ZERO(&want);
+
+  {
+    FAR const char *p = cpus;
+
+    while (*p != '\0')
+      {
+        FAR char *end;
+        long v = strtol(p, &end, 10);
+
+        if (end == p || v < 0 || v >= 32 ||
+            (*end != '\0' && *end != ','))
+          {
+            printf("[lim] cpu-list 非法: %s\n", cpus);
+            return 1;
+          }
+
+        CPU_SET((int)v, &want);
+        mask |= (1u << (int)v);
+        p = (*end == ',') ? end + 1 : end;
+      }
+  }
+
+  if (mask == 0)
+    {
+      printf("[lim] cpu-list 为空: %s\n", cpus);
+      return 1;
+    }
+
+  printf("[lim] 配置: cpus=%s mask=0x%x prio=%d\n", cpus, (unsigned)mask,
+         prio);
+
+  ret = posix_spawnattr_init(&attr);
+  if (ret == 0)
+    {
+      ret = posix_spawnattr_setpriority(&attr, prio);
+    }
+
+  if (ret == 0)
+    {
+      ret = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSCHEDPARAM);
+    }
+
+  if (ret != 0)
+    {
+      printf("[lim] attr 设置失败: %d\n", ret);
+      posix_spawnattr_destroy(&attr);
+      return 1;
+    }
+
+  for (i = 0; i < ncfg; i++)
+    {
+      pid_t pid = -1;
+      int   st = 0;
+
+      ret = run_spawn_ex(view, cfgs[i], &attr, &pid);
+      if (ret != 0)
+        {
+          printf("[lim] 容器[%d] 未拉起（r=%d）\n", i, ret);
+          rc = 1;
+          continue;
+        }
+
+      /* 绑核：后置施加；失败 = fail-closed（终止，不许无限制跑） */
+
+      if (sched_setaffinity(pid, sizeof(cpu_set_t), &want) != 0)
+        {
+          printf("[lim] 容器[%d] 设核集失败（errno=%d）→ fail-closed 终止\n",
+                 i, errno);
+          kill(pid, SIGKILL);
+
+          do
+            {
+              ret = waitpid(pid, &st, 0);
+            }
+          while (ret < 0 && errno == EINTR);
+
+          rc = 1;
+          continue;
+        }
+
+      printf("[lim] 容器[%d] 已施加: pid=%d mask=0x%x prio=%d\n",
+             i, (int)pid, (unsigned)mask, prio);
+
+      do
+        {
+          ret = waitpid(pid, &st, 0);
+        }
+      while (ret < 0 && errno == EINTR);
+
+      if (ret < 0)
+        {
+          printf("[lim] 容器[%d] waitpid 失败（errno=%d）\n", i, errno);
+          rc = 1;
+          continue;
+        }
+
+      printf("[lim] 容器[%d] 退出码=%d\n", i, WEXITSTATUS(st));
+    }
+
+  posix_spawnattr_destroy(&attr);
+  return rc;
+}
+
 static int do_validate(FAR const char *path)
 {
   size_t len = 0;
@@ -2548,6 +2697,14 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
+  if (argc >= 6 && strcmp(argv[1], "lim") == 0)
+    {
+      /* lim <view> <cpu-list> <prio> <cfg1> [cfg2 ...] —— 核集+优先级 */
+      int r = do_lim(argv[2], argv[3], atoi(argv[4]), argc - 5, &argv[5]);
+      free(g_buf);
+      return r;
+    }
+
   if (argc >= 4 && strcmp(argv[1], "sup") == 0)
     {
       /* sup <view> <config1> [config2 ...] —— 运行时兼任监督者 */
@@ -2624,6 +2781,7 @@ int main(int argc, FAR char *argv[])
          "      manifest <path> | config <path> | validate <path> |\n"
          "      sha <path> | untar <archive> <destdir> | lsroot <dir> |\n"
          "      run <view> <config> | down <view> |\n"
+         "      lim <view> <cpu-list> <prio> <cfg1> [cfg2 ...] |\n"
          "      up <view> <host> <port> <repo> <tag> |\n"
          "      start <view> <host> <port> <repo> <tag> |\n"
          "      sup <view> <config1> [config2 ...] |\n"

@@ -23,6 +23,10 @@
  *   .json，不走 digest 链）由 `orting run` 拉起，验证"容器崩、系统活"
  *   在镜像运行时路径上的闭环；§75 起 crash-once 供重启策略的恢复臂。
  *
+ * §80 起另印 `res` 回读行（核集/优先级/所在 CPU 采样）—— 资源限制
+ *   的判据面：`orting lim` 施加绑核+优先级后，这里回读核集掩码与
+ *   优先级；未施加时 = 默认态（aff=0xf prio=100）作对照臂。
+ *
  * 刻意极小：没有参数就读固定文件失败，有一参数读那一个文件。
  ****************************************************************************/
 
@@ -32,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sched.h>
 #ifndef CONFIG_DISABLE_SIGNALS
 #  include <signal.h>
 #endif
@@ -62,6 +67,44 @@ int main(int argc, FAR char *argv[])
 
     printf("ORTHELLO: env ORT_FIXTURE=%s\n", v ? v : "(无)");
     printf("ORTHELLO: cwd=%s\n", cwd ? cwd : "(无)");
+  }
+
+  /* §80（A2 资源限制）：**子进程看得见**的核集/优先级回读 + 所在 CPU
+   * 采样 —— 运行时施加（lim：绑核 + 优先级），这里给出判据面。
+   * 未施加时 = 默认态（aff=0xf 全核、prio=100）——天然对照臂。 */
+
+  {
+    cpu_set_t set;
+    struct sched_param sp;
+    uint32_t mask = 0;
+    int i;
+
+    if (sched_getaffinity(0, sizeof(set), &set) == 0)
+      {
+        for (i = 0; i < 32; i++)
+          {
+            if (CPU_ISSET(i, &set))
+              {
+                mask |= (1u << i);
+              }
+          }
+      }
+
+    if (sched_getparam(0, &sp) != 0)
+      {
+        sp.sched_priority = -1;
+      }
+
+    printf("ORTHELLO: res aff=0x%x prio=%d cpu=", (unsigned)mask,
+           (int)sp.sched_priority);
+
+    for (i = 0; i < 4; i++)
+      {
+        printf("%s%d", i ? "," : "", sched_getcpu());
+        usleep(1000);
+      }
+
+    printf("\n");
   }
 
   if (argc >= 2)
