@@ -1117,6 +1117,32 @@ static int do_sup(FAR const char *view, int ncfg, FAR char * const *cfgs)
               break;
             }
 
+          /* [ORT §83] EXIT 事件在 **group 收尾期**才入队 —— waitpid 可见
+           * 早于入队（实测签名：退出码=0 而事件=0）。判定"无事件"前稍候
+           * 重抽一次（FAULT 无需：abort 期入队、早于死亡）。 */
+
+          usleep(2000);
+
+          {
+            struct ort_faultrec_s rec2;
+
+            while ((ret = prctl(PR_GET_ORT_FAULT, &rec2)) > 0)
+              {
+                if (rec2.kind == 0 && rec2.victim == (int)pid)
+                  {
+                    nf++;
+                    last_pc = rec2.pc;
+                    last_addr = rec2.addr;
+                    last_faults = rec2.faults;
+                  }
+                else if (rec2.kind == 1 && rec2.victim == (int)pid)
+                  {
+                    nx++;
+                    last_code = rec2.code;
+                  }
+              }
+          }
+
           if (nx > 0)
             {
               printf("[sup] 判别: 正常退出（EXIT 事件 code=%d）\n", last_code);
@@ -1650,8 +1676,53 @@ static int do_orch(int secs, FAR const char *view, int ncfg,
             }
           else
             {
-              printf("[orch] 服务[%d] 无事件收尾（退出码=%d）→ 完成\n",
-                     idx, WEXITSTATUS(st));
+              /* [ORT §83] EXIT 事件在 **group 收尾期**才入队 —— waitpid
+               * 可见早于入队（实测签名：退出码=0 而事件=0，随后一趟才抽
+               * 到 victim 记录 → "不在编"）。判定"无事件"前稍候重抽一次
+               * （FAULT 无需：abort 期入队，早于死亡——§74 已鉴）。 */
+
+              usleep(2000);
+
+              {
+                struct ort_faultrec_s rec2;
+                int j2;
+
+                while ((ret = prctl(PR_GET_ORT_FAULT, &rec2)) > 0)
+                  {
+                    for (j2 = 0; j2 < ncfg; j2++)
+                      {
+                        if (svc[j2].pid == rec2.victim)
+                          {
+                            if (rec2.kind == 0)
+                              {
+                                svc[j2].nf++;
+                                svc[j2].pc = rec2.pc;
+                                svc[j2].addr = rec2.addr;
+                                svc[j2].faults = rec2.faults;
+                              }
+                            else if (rec2.kind == 1)
+                              {
+                                svc[j2].nx++;
+                                svc[j2].code = rec2.code;
+                              }
+
+                            break;
+                          }
+                      }
+                  }
+              }
+
+              if (svc[idx].nx > 0)
+                {
+                  printf("[orch] 服务[%d] 正常退出（EXIT code=%d）→ 完成\n",
+                         idx, svc[idx].code);
+                }
+              else
+                {
+                  printf("[orch] 服务[%d] 无事件收尾（退出码=%d）→ 完成\n",
+                         idx, WEXITSTATUS(st));
+                }
+
               svc[idx].pid = -1;
               svc[idx].done = 1;
             }
