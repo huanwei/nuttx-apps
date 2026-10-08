@@ -22,6 +22,8 @@
  *                                —— 多服务编排环：wait-any + 个体策略
  *   orting lim <view> <cpu-list> <prio> <cfg1> [cfg2 ...]
  *                                —— 资源限制：核集 + 优先级（fail-closed）
+ *   orting memcap <view> <KB> <cfg1> [cfg2 ...]
+ *                                —— 资源限制：派生进程堆上限（组级，无竞态）
  *   orting down <view>           —— 卸载视图（生命周期收尾）
  *   orting validate <path>       —— 通用 JSON 校验（只报错名）
  *
@@ -2052,6 +2054,70 @@ static int do_lim(FAR const char *view, FAR const char *cpus, int prio,
   return rc;
 }
 
+/* ── memcap：内存限额 —— 派生进程堆上限（A2 增量⑪，§81）────────────── *
+ *
+ * 语义：**本进程派生的进程**，用户堆不超过 X KB（ELF 装载跑在调用方
+ * 上下文，消费点在 libelf_addrenv_alloc —— 天然无竞态，不存在
+ * "生出来才补设"的窗口）。不随容器代际传递（拉起的进程要再派生自带
+ * 限额，除非它自己也设）。0 = 解除。
+ *
+ * 用法：orting memcap <view> <KB> <cfg1> [cfg2 ...]
+ */
+
+static int do_memcap(FAR const char *view, int kb, int ncfg,
+                     FAR char * const *cfgs)
+{
+  int rc = 0;
+  int ret;
+  int i;
+
+  if (kb <= 0)
+    {
+      printf("[memcap] 上限非法: %d KB\n", kb);
+      return 1;
+    }
+
+  ret = prctl(PR_SET_ORT_MEMCAP, kb * 1024);
+  if (ret < 0)
+    {
+      printf("[memcap] 设置失败: %d（errno=%d）\n", ret, errno);
+      return 1;
+    }
+
+  printf("[memcap] 配置: %d KB（本进程组；此后拉起的进程堆上限）\n", kb);
+
+  for (i = 0; i < ncfg; i++)
+    {
+      pid_t pid = -1;
+      int   st = 0;
+
+      ret = run_spawn(view, cfgs[i], &pid);
+      if (ret != 0)
+        {
+          printf("[memcap] 容器[%d] 未拉起（r=%d）\n", i, ret);
+          rc = 1;
+          continue;
+        }
+
+      do
+        {
+          ret = waitpid(pid, &st, 0);
+        }
+      while (ret < 0 && errno == EINTR);
+
+      if (ret < 0)
+        {
+          printf("[memcap] 容器[%d] waitpid 失败（errno=%d）\n", i, errno);
+          rc = 1;
+          continue;
+        }
+
+      printf("[memcap] 容器[%d] 退出码=%d\n", i, WEXITSTATUS(st));
+    }
+
+  return rc;
+}
+
 static int do_validate(FAR const char *path)
 {
   size_t len = 0;
@@ -2705,6 +2771,14 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
+  if (argc >= 5 && strcmp(argv[1], "memcap") == 0)
+    {
+      /* memcap <view> <KB> <cfg1> [cfg2 ...] —— 派生进程堆上限 */
+      int r = do_memcap(argv[2], atoi(argv[3]), argc - 4, &argv[4]);
+      free(g_buf);
+      return r;
+    }
+
   if (argc >= 4 && strcmp(argv[1], "sup") == 0)
     {
       /* sup <view> <config1> [config2 ...] —— 运行时兼任监督者 */
@@ -2782,6 +2856,7 @@ int main(int argc, FAR char *argv[])
          "      sha <path> | untar <archive> <destdir> | lsroot <dir> |\n"
          "      run <view> <config> | down <view> |\n"
          "      lim <view> <cpu-list> <prio> <cfg1> [cfg2 ...] |\n"
+         "      memcap <view> <KB> <cfg1> [cfg2 ...] |\n"
          "      up <view> <host> <port> <repo> <tag> |\n"
          "      start <view> <host> <port> <repo> <tag> |\n"
          "      sup <view> <config1> [config2 ...] |\n"

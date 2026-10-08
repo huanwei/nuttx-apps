@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <malloc.h>
 #include <sched.h>
 #ifndef CONFIG_DISABLE_SIGNALS
 #  include <signal.h>
@@ -156,6 +157,22 @@ int main(int argc, FAR char *argv[])
     {
       __asm__ volatile (".inst 0xde00");   /* Thumb UDF #0 */
       printf("ORTHELLO: udf 未发生（不该到这）\n");
+    }
+  else if (argc >= 3 && strcmp(argv[2], "mem") == 0)
+    {
+      /* §81：内存限额探针（**优雅版**）—— 报堆区大小（mallinfo().arena
+       * 直读），加一次 64KB 限内分配抽查证明可用。
+       * ★ 不要"malloc 到失败"：实测 knsh 用户堆耗尽不走 ENOMEM，而是
+       *   撞 sbrk/mm_extend 断言打停机（默认堆撞 arm_pgalloc.c:204、
+       *   小堆撞 mm_extend.c:89）——见手册 §三·补八十一 边界。 */
+
+      struct mallinfo mi = mallinfo();
+      FAR void *p = malloc(64 * 1024);
+
+      printf("ORTHELLO: mem arena=%u KB probe64=%s\n",
+             (unsigned)(mi.arena / 1024), p ? "ok" : "fail");
+      free(p);
+      return 0;
     }
   else if (argc >= 3 && strcmp(argv[2], "crash-once") == 0)
     {
