@@ -9,11 +9,12 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-09 ORT（§83 风暴段三标本：第 8 处 gran 锁-EINTR
-#               修复（mm_grancritical 文档 vs 实现——nxsem_wait_uninterruptible）；
-#               apps 侧 orting EXIT 事件判定前重抽；裁判侧 520s 装置余量 +
-#               并发段控制台计数 ≥4。内核 cc85cefd2f）。
+# 最近配对事件：2026-10-09 ORT（§84 unionfs copy-up：写面契约落地 ——
+#               写意图 open 先上移（父目录+文件）、mkdir 只落上层、
+#               下层破坏性操作 fail-closed、下层 fd 绊线；apps 侧无源码
+#               改动；裁判侧 e2e §65 缺口实证翻转为 copy-up 正判据。
+#               内核 fc310a458d）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=cc85cefd2f86330bee4119b20bb891c695afc443
+nuttx=fc310a458d468e637f0a644d3efaa08ec2f34a49
