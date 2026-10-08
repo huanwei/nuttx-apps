@@ -160,11 +160,14 @@ int main(int argc, FAR char *argv[])
     }
   else if (argc >= 3 && strcmp(argv[2], "mem") == 0)
     {
-      /* §81：内存限额探针（**优雅版**）—— 报堆区大小（mallinfo().arena
-       * 直读），加一次 64KB 限内分配抽查证明可用。
-       * ★ 不要"malloc 到失败"：实测 knsh 用户堆耗尽不走 ENOMEM，而是
-       *   撞 sbrk/mm_extend 断言打停机（默认堆撞 arm_pgalloc.c:204、
-       *   小堆撞 mm_extend.c:89）——见手册 §三·补八十一 边界。 */
+      /* §81/§82：内存限额探针 —— 报堆区大小（mallinfo().arena 直读）+
+       * 64KB 限内抽查 + **耗尽循环**（16KB 块 malloc 到失败）。
+       *
+       * ★ 耗尽循环曾是禁区：§81 实测 knsh 用户堆耗尽不走 ENOMEM 而撞
+       *   sbrk/mm_extend 断言打停机（默认堆撞 arm_pgalloc.c:204、小堆
+       *   撞 mm_extend.c:89）。§82 修 pgalloc（返回基地址契约 + 越界
+       *   走 return 0）后，耗尽循环**应该优雅返回 NULL** —— 本行即是
+       *   修复的验收判据。 */
 
       struct mallinfo mi = mallinfo();
       FAR void *p = malloc(64 * 1024);
@@ -172,6 +175,37 @@ int main(int argc, FAR char *argv[])
       printf("ORTHELLO: mem arena=%u KB probe64=%s\n",
              (unsigned)(mi.arena / 1024), p ? "ok" : "fail");
       free(p);
+
+      {
+        size_t total = 0;
+        int    chunks = 0;
+        FAR void *first = NULL;
+        FAR void *last = NULL;
+
+        for (;;)
+          {
+            FAR void *q = malloc(16 * 1024);
+
+            if (q == NULL || total > (8u * 1024 * 1024))
+              {
+                free(q);
+                break;
+              }
+
+            if (first == NULL)
+              {
+                first = q;
+              }
+
+            last = q;
+            total += 16 * 1024;
+            chunks++;
+          }
+
+        printf("ORTHELLO: mem exhausted at %u KB（chunks=%d first=%p "
+               "last=%p）\n", (unsigned)(total / 1024), chunks, first, last);
+      }
+
       return 0;
     }
   else if (argc >= 3 && strcmp(argv[2], "crash-once") == 0)
