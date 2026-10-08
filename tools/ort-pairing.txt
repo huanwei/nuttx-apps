@@ -9,10 +9,11 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-08 ORT（§82 堆耗尽破案：第 7 处 arm_pgalloc 契约
-#               修复（耗尽=优雅 NULL）+ 限额增长闸门（pgalloc，双副本盲区
-#               入册）；apps 侧 orthello/夹具改动，内核 86c55b44b7）。
+# 最近配对事件：2026-10-09 ORT（§83 风暴段三标本：第 8 处 gran 锁-EINTR
+#               修复（mm_grancritical 文档 vs 实现——nxsem_wait_uninterruptible）；
+#               apps 侧 orting EXIT 事件判定前重抽；裁判侧 520s 装置余量 +
+#               并发段控制台计数 ≥4。内核 cc85cefd2f）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=86c55b44b79328a01505a6745b001064925a92ec
+nuttx=cc85cefd2f86330bee4119b20bb891c695afc443
