@@ -9,10 +9,10 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-08 ORT（§80 资源限制第一刀：核集+优先级；反证
-#               压出上游缺陷第 6 处（sched_setaffinity 核号上界）并本地
-#               修复；apps 侧 orting/orthello/夹具改动，内核 96aa6dcf6b）。
+# 最近配对事件：2026-10-08 ORT（§81 内存限额：PR_SET_ORT_MEMCAP + 派生者
+#               组消费 + arena 判据；附压出"用户堆耗尽=断言"边界（待核）；
+#               apps 侧 orting/orthello/夹具改动，内核 dac5b87527）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=96aa6dcf6ba7b13b78f5886988318b8005a20ce0
+nuttx=dac5b875273a98807b119540556ff8ef5429d0fd
