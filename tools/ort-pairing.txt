@@ -9,11 +9,10 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-08 ORT（§79 全程收口：①NULL 帧延迟投递→异步臂
-#               装载；②投递帧被臂装载→帧形态守卫 + sigdeliver 清零点后移
-#               （第 5 处上游缺陷）；50 风暴 0 复现、e2e ×2 全绿；apps 侧
-#               未动，内核 324a99ce07）。
+# 最近配对事件：2026-10-08 ORT（§80 资源限制第一刀：核集+优先级；反证
+#               压出上游缺陷第 6 处（sched_setaffinity 核号上界）并本地
+#               修复；apps 侧 orting/orthello/夹具改动，内核 96aa6dcf6b）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=324a99ce07ab430ca09e513fd5f59f8c89fbd101
+nuttx=96aa6dcf6ba7b13b78f5886988318b8005a20ce0
