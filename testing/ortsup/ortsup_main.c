@@ -1484,6 +1484,37 @@ static void active_sig_handler(int signo)
 }
 
 /****************************************************************************
+ * [ORT §88/§89] /rt 幂等就绪：mkdir + 挂 tmpfs；**已挂过就复用**。
+ *   为什么要幂等：同一启动里先跑 `sigprobe` 再跑 `chroot` 时，第二次
+ *   mount 会踩"已挂载点再挂被拒"（ENOTDIR——§72 入册行为）。判据用
+ *   statfs 魔数预检（同 §72 装配预检配方）。
+ ****************************************************************************/
+
+#include <sys/statfs.h>
+
+static int ort_rt_ready(void)
+{
+  struct statfs sfs;
+
+  mkdir("/rt", 0777);
+
+  if (mount(NULL, "/rt", "tmpfs", 0, NULL) == 0)
+    {
+      return 0;
+    }
+
+  /* 挂不上：若已是 tmpfs 挂载点（先前跑过本装置）→ 幂等复用 */
+
+  if (statfs("/rt", &sfs) == 0 && sfs.f_type == TMPFS_MAGIC)
+    {
+      return 0;
+    }
+
+  printf("[ortsup] *** /rt 就绪失败（errno=%d）***\n", errno);
+  return -1;
+}
+
+/****************************************************************************
  * [ORT §88] 容器 root（chroot 族）自测 —— 双臂探针
  *   probe：root 自报 / "/marker.txt" 读 / "/dev/console" 逃逸 stat，
  *          三项全对才退 0；两臂**不同形**才说明探针有分辨力。
@@ -1572,13 +1603,10 @@ static int ort_chroot_driver(void)
   int rtd_st = 1;
   int ret;
 
-  /* 建根：tmpfs 挂到 /rt（用户态 mount 两 SKU 都实测可用） */
+  /* 建根：tmpfs 挂到 /rt（幂等——见 ort_rt_ready） */
 
-  mkdir("/rt", 0777);
-  ret = mount(NULL, "/rt", "tmpfs", 0, NULL);
-  if (ret != 0)
+  if (ort_rt_ready() != 0)
     {
-      printf("[chroot] *** 挂 tmpfs 失败: %d（errno=%d）***\n", ret, errno);
       return 1;
     }
 
@@ -1672,6 +1700,181 @@ static int ort_chroot_driver(void)
       return pass ? 0 : 1;
     }
   }
+}
+
+/****************************************************************************
+ * [ORT §89] 信号面隔离自测（三臂）—— 见 main 内注释
+ ****************************************************************************/
+
+static int ort_sigprobe_probe(int argc, FAR char *argv[])
+{
+  /* 锚点词扫 argv（task_create 会插程序名到 argv[0]，posix_spawn 不移） */
+
+  FAR const char *mode = "unbound";
+  FAR const char *sups = NULL;
+  char mbuf[16];
+  int k;
+
+  for (k = 0; k < argc; k++)
+    {
+      if (argv[k] != NULL && strcmp(argv[k], "sigprobe-probe") == 0)
+        {
+          break;
+        }
+    }
+
+  if (k + 1 < argc && argv[k + 1] != NULL)
+    {
+      strncpy(mbuf, argv[k + 1], sizeof(mbuf) - 1);
+      mbuf[sizeof(mbuf) - 1] = '\0';
+      mode = mbuf;
+    }
+
+  sups = (k + 2 < argc && argv[k + 2] != NULL) ? argv[k + 2] : NULL;
+
+  /* domain 臂：容器形态 = 先等监督者绑域（准入协议），再探。 */
+
+  if (strcmp(mode, "domain") == 0)
+    {
+      prctl(PR_ORT_WAIT_ADMISSION, 3000);
+    }
+
+  {
+    bool gated = (strcmp(mode, "unbound") != 0);
+    int  ri = kill(1, 0);
+    int  ei = errno;
+    int  rs = (sups != NULL) ? kill(atoi(sups), 0) : -4242;
+    int  es = errno;
+    int  rp = kill(getpid(), 0);
+    int  ep = errno;
+    int  ok_i = gated ? (ri < 0 && ei == EPERM) : (ri == 0);
+    int  ok_s = (rs == -4242) ? 1 : (gated ? (rs < 0 && es == EPERM)
+                                           : (rs == 0));
+    int  ok_p = (rp == 0);      /* 自己组：两态都必须放行 */
+
+    printf("[sigprobe] probe(%s): init=%s sup=%s self=%s\n", mode,
+           ri == 0 ? "OK" : (ri < 0 && ei == EPERM ? "EPERM" : "ERR"),
+           rs == -4242 ? "n/a"
+                       : (rs == 0 ? "OK"
+                                  : (rs < 0 && es == EPERM ? "EPERM" : "ERR")),
+           rp == 0 ? "OK" : (rp < 0 && ep == EPERM ? "EPERM" : "ERR"));
+
+    return (ok_i && ok_s && ok_p) ? 0 : 1;
+  }
+}
+
+#ifndef CONFIG_BUILD_KERNEL
+static int ort_sigprobe_probe_entry(int argc, FAR char *argv[])
+{
+  return ort_sigprobe_probe(argc, argv);
+}
+#endif
+
+static int ort_sigprobe_driver(void)
+{
+  FAR char *cargv[5];
+  char sup[16];
+  pid_t pids[3];
+  int   sts[3];
+  int   i;
+  int   ret;
+  int   pass = 1;
+
+  /* 根目录要存在（PR_SET_ORT_ROOT 有存在性预检）；幂等挂载 */
+
+  if (ort_rt_ready() != 0)
+    {
+      return 1;
+    }
+
+  snprintf(sup, sizeof(sup), "%d", (int)getpid());
+
+  cargv[0] = (FAR char *)"ortsup";
+  cargv[1] = (FAR char *)"sigprobe-probe";
+  cargv[3] = sup;
+  cargv[4] = NULL;
+
+  /* 臂①：unbound（无根、无域）→ init/sup 应 OK */
+
+  cargv[2] = (FAR char *)"unbound";
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pids[0], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[sigprobe] *** 臂① spawn 失败: %d ***\n", ret);
+                  return 1; }
+#else
+  pids[0] = task_create("sigprobe-unbound", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_sigprobe_probe_entry, cargv);
+  if (pids[0] < 0) { printf("[sigprobe] *** 臂① create 失败: %d ***\n",
+                            (int)pids[0]); return 1; }
+#endif
+
+  /* 臂②：rooted（设根标记）→ init/sup 应 EPERM */
+
+  ret = prctl(PR_SET_ORT_ROOT, "/rt");
+  if (ret != 0)
+    {
+      printf("[sigprobe] *** 设根失败: %d ***\n", ret);
+      return 1;
+    }
+
+  cargv[2] = (FAR char *)"rooted";
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pids[1], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[sigprobe] *** 臂② spawn 失败: %d ***\n", ret);
+                  return 1; }
+#else
+  pids[1] = task_create("sigprobe-rooted", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_sigprobe_probe_entry, cargv);
+  if (pids[1] < 0) { printf("[sigprobe] *** 臂② create 失败: %d ***\n",
+                            (int)pids[1]); return 1; }
+#endif
+
+  /* 臂③：domain（容器真实形态）——监督者注册 + 绑域 + 准入唤醒 */
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
+  if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
+    {
+      printf("[sigprobe] *** 注册监督者失败（臂③ 跳过）——如其它模式已注册过，需 RESET ***\n");
+      return 1;
+    }
+
+  cargv[2] = (FAR char *)"domain";
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pids[2], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[sigprobe] *** 臂③ spawn 失败: %d ***\n", ret);
+                  return 1; }
+#else
+  pids[2] = task_create("sigprobe-domain", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_sigprobe_probe_entry, cargv);
+  if (pids[2] < 0) { printf("[sigprobe] *** 臂③ create 失败: %d ***\n",
+                            (int)pids[2]); return 1; }
+#endif
+
+  ret = prctl(PR_SET_ORT_DOMAIN, 0, (int)pids[2]);
+  if (ret != 0)
+    {
+      printf("[sigprobe] *** 绑域失败: %d ***\n", ret);
+      return 1;
+    }
+
+  for (i = 0; i < 3; i++)
+    {
+      sts[i] = 1;
+      waitpid(pids[i], &sts[i], 0);
+      {
+        int ok = WIFEXITED(sts[i]) && WEXITSTATUS(sts[i]) == 0;
+        printf("[sigprobe] arm%s=%s\n",
+               i == 0 ? "(unbound)" : (i == 1 ? "(rooted)" : "(domain)"),
+               ok ? "PASS" : "FAIL");
+        if (!ok)
+          {
+            pass = 0;
+          }
+      }
+    }
+
+  printf("SIGPROBE RESULT: %s\n", pass ? "PASS" : "FAIL");
+  return pass ? 0 : 1;
 }
 
 static int ort_container_main(int argc, FAR char *argv[])
@@ -3346,6 +3549,16 @@ int main(int argc, FAR char *argv[])
   if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "chroot") == 0)
     {
       return ort_chroot_driver();
+    }
+
+  if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "sigprobe-probe") == 0)
+    {
+      return ort_sigprobe_probe(argc, argv);
+    }
+
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "sigprobe") == 0)
+    {
+      return ort_sigprobe_driver();
     }
 
   if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "waitadm") == 0)
