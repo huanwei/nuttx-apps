@@ -5,14 +5,18 @@
  *
  * [ORT-A / A1] 极简 HTTP/1.0 GET（registry 客户端的地基）。
  *
+ * §90（2026-10-09）起支持：
+ *   · **chunked 传编码**——解码后语义与定长一致（get/stream 两条都走
+ *     统一读取器）；畸形块头/短块 = fail-closed（负值错误）
+ *   · **重定向（301/302/303/307/308）**——上限 5 跳；Location 支持
+ *     "/abs" 与 "http://host[:port]/abs"；**跨主机时剥掉 Authorization**
+ *     （凭据卫生；同主机:端口保持）。超限 = fail-closed
+ *
  * 刻意不支持的东西（每一件都有明确的理由，不是"还没做"）：
- *   · chunked 传编码 —— 本增量先要求 Content-Length；registry 的
- *     manifest 响应都带长度。**如实标注**：真 Docker Hub 万一走
- *     chunked，增量二再补（判据：fixture 服务器无法覆盖真实行为）
  *   · HTTP/1.1 keep-alive —— 用 1.0 + Connection: close，读到 EOF 为止
  *   · TLS —— 增量二（mbedTLS）；本增量对 fixture 服务器走明文
- *   · 重定向（3xx）—— 真 Hub 的 blob 会 307 到 CDN；fixture 直给。
- *     未实现，见手册边界（跟着 TLS 一批做）
+ *   · 裸相对 Location（"foo" 无斜杠无 scheme）—— fail-closed，
+ *     真 Hub 不发这种，不猜
  *
  * 两个消费者：
  *   · ort_http_get         —— 定长读进内存（manifest/token 用，KB 级）
@@ -36,6 +40,9 @@ struct ort_http_resp_s
   int      body_truncated;     /* 1 = 超过 body_cap 被截断（仅 get） */
   long long content_len;       /* 头里的 Content-Length；-1 = 没有 */
   char     www_auth[256];      /* WWW-Authenticate 头（空串=无）*/
+  int      chunked;            /* [§90] 1 = Transfer-Encoding: chunked（已解码）*/
+  int      redirects;          /* [§90] 跟随的重定向跳数 */
+  char     location[256];      /* [§90] 最后一次的 Location 头（诊断） */
 };
 
 /* 流式回调：buf/len 是一块响应体；返回非 0 = 调用方要求中止（下载

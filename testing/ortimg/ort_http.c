@@ -268,9 +268,365 @@ static int http_open(FAR const char *host, unsigned port,
         {
           strlcpy(resp->www_auth, line + 17, sizeof(resp->www_auth));
         }
+      else if (str_starts_ci(line, "location:"))
+        {
+          /* [§90] 重定向目标（诊断 + 跟随用） */
+
+          FAR const char *v = line + 9;
+
+          while (*v == ' ')
+            {
+              v++;
+            }
+
+          strlcpy(resp->location, v, sizeof(resp->location));
+        }
+      else if (str_starts_ci(line, "transfer-encoding:"))
+        {
+          /* [§90] chunked：值与 content-length 互斥（RFC 7230） */
+
+          FAR const char *v = line + 18;
+
+          while (*v == ' ')
+            {
+              v++;
+            }
+
+          if (str_starts_ci(v, "chunked"))
+            {
+              resp->chunked = 1;
+            }
+        }
     }
 
   return fd;
+}
+
+
+/****************************************************************************
+ * [§90] 统一响应体读取器 —— 三种模式一视同仁：
+ *   ① chunked（已解码，畸形/短块 fail-closed）
+ *   ② Content-Length（读齐即停；短 = 断流 -7）
+ *   ③ 无长度（1.0 + Connection: close，读到 EOF）
+ * get 用内存写者适配；get_stream 用调用者 sink。
+ ****************************************************************************/
+
+#define ORT_HTTP_REDIRECT_MAX 5
+
+struct ort_http_writer_s
+{
+  FAR char *body;
+  size_t    cap;
+  size_t    stored;
+  int       trunc;
+};
+
+static int http_writer_sink(FAR void *arg, FAR const char *buf, size_t len)
+{
+  FAR struct ort_http_writer_s *w = arg;
+
+  if (w->stored < w->cap)
+    {
+      size_t room = w->cap - w->stored;
+      size_t n    = len < room ? len : room;
+
+      memcpy(w->body + w->stored, buf, n);
+    }
+
+  w->stored += len;
+
+  if (w->stored > w->cap)
+    {
+      w->trunc = 1;
+    }
+
+  return 0;                       /* 内存写者从不中止（溢出=截断标记） */
+}
+
+/* 读 want 字节喂 sink，再吃 chunk 尾 CRLF。返回 0 / -1（断流或截断）/
+ * -2（调用者 sink 中止）。 */
+
+static int http_take(int fd, FAR char *buf, size_t cap, unsigned long want,
+                     FAR ort_http_sink_t sink, FAR void *arg,
+                     FAR size_t *total)
+{
+  unsigned long got = 0;
+
+  while (got < want)
+    {
+      size_t  ask = cap;
+      ssize_t r;
+
+      if ((unsigned long)ask > want - got)
+        {
+          ask = (size_t)(want - got);
+        }
+
+      r = recv(fd, buf, ask, 0);
+      if (r <= 0)
+        {
+          return -1;
+        }
+
+      if (sink != NULL && sink(arg, buf, (size_t)r) != 0)
+        {
+          return -2;
+        }
+
+      got    += (unsigned long)r;
+      *total += (size_t)r;
+    }
+
+  {
+    char    crlf[2];
+    size_t  stored = 0;
+    int     trunc  = 0;
+
+    if (recv_exact(fd, crlf, 2, 0, &stored, &trunc) < 0 ||
+        crlf[0] != '\r' || crlf[1] != '\n')
+      {
+        return -1;
+      }
+  }
+
+  return 0;
+}
+
+static int http_read_body(int fd, FAR struct ort_http_resp_s *resp,
+                          FAR ort_http_sink_t sink, FAR void *arg,
+                          FAR size_t *out_total)
+{
+  static char buf[1024];
+  size_t total = 0;
+  int    ret   = 0;
+
+  if (resp->chunked)
+    {
+      for (;;)
+        {
+          char szline[64];
+          char *semi;
+          char *end;
+          unsigned long sz;
+
+          if (recv_line(fd, szline, sizeof(szline)) < 0)
+            {
+              ret = -9;            /* 块头读不到 */
+              break;
+            }
+
+          semi = strchr(szline, ';');     /* 块扩展：忽略 */
+          if (semi != NULL)
+            {
+              *semi = '\0';
+            }
+
+          sz = strtoul(szline, &end, 16);
+          if (end == szline)
+            {
+              ret = -9;            /* 畸形块头（非十六进制） */
+              break;
+            }
+
+          if (sz == 0)
+            {
+              /* 尾零块：trailer 行直到空行 */
+
+              for (;;)
+                {
+                  int lr = recv_line(fd, szline, sizeof(szline));
+
+                  if (lr == 0)
+                    {
+                      break;
+                    }
+
+                  if (lr < 0)
+                    {
+                      ret = -9;
+                      break;
+                    }
+                }
+
+              break;
+            }
+
+          ret = http_take(fd, buf, sizeof(buf), sz, sink, arg, &total);
+          if (ret != 0)
+            {
+              break;
+            }
+        }
+
+      if (ret == -2)
+        {
+          ret = -8;                /* 同 sink 中止的既有错误码 */
+        }
+    }
+  else if (resp->content_len >= 0)
+    {
+      unsigned long want = (unsigned long)resp->content_len;
+
+      while (want > 0)
+        {
+          size_t  ask = sizeof(buf);
+          ssize_t r;
+
+          if ((unsigned long)ask > want)
+            {
+              ask = (size_t)want;
+            }
+
+          r = recv(fd, buf, ask, 0);
+          if (r <= 0)
+            {
+              ret = -7;            /* 定长没读齐 = 断流 */
+              break;
+            }
+
+          if (sink != NULL && sink(arg, buf, (size_t)r) != 0)
+            {
+              ret = -8;
+              break;
+            }
+
+          want  -= (unsigned long)r;
+          total += (size_t)r;
+        }
+    }
+  else
+    {
+      for (;;)
+        {
+          ssize_t r = recv(fd, buf, sizeof(buf), 0);
+
+          if (r <= 0)
+            {
+              break;               /* EOF = 正常结束（1.0 close 语义） */
+            }
+
+          if (sink != NULL && sink(arg, buf, (size_t)r) != 0)
+            {
+              ret = -8;
+              break;
+            }
+
+          total += (size_t)r;
+        }
+    }
+
+  *out_total = total;
+  return ret;
+}
+
+static bool http_is_redirect(int st)
+{
+  return st == 301 || st == 302 || st == 303 || st == 307 || st == 308;
+}
+
+/* [§90] 连接 + 请求 + 响应头 + 重定向跟随。hostbuf/pathbuf 由调用者给
+ * 静态缓冲（目标机栈小）。跨主机:端口跳转时剥 Authorization（凭据
+ * 卫生——真 Hub 的 blob 会 307 去 CDN，凭据不该跟着走）。 */
+
+static int http_open_follow(FAR const char *host, unsigned port,
+                            FAR const char *path,
+                            FAR const char *bearer, FAR const char *accept,
+                            FAR struct ort_http_resp_s *resp,
+                            FAR char *hostbuf, size_t hostcap,
+                            FAR char *pathbuf, size_t pathcap)
+{
+  char newhost[128];
+  char lastloc[256];             /* 沿路最后一跳的 Location（见证用——
+                                  * 每次 http_open 会 memset resp，
+                                  * 不存就会被清掉） */
+  unsigned cur_port = port;
+  FAR const char *cur_bearer = bearer;
+  int hops;
+
+  if (strlen(path) + 1 > pathcap || strlen(host) + 1 > hostcap)
+    {
+      return -9;
+    }
+
+  strlcpy(hostbuf, host, hostcap);
+  strlcpy(pathbuf, path, pathcap);
+
+  for (hops = 0; ; hops++)
+    {
+      int fd;
+
+      fd = http_open(hostbuf, cur_port, pathbuf, cur_bearer, accept, resp);
+      if (fd < 0)
+        {
+          return fd;
+        }
+
+      if (!http_is_redirect(resp->status) || resp->location[0] == '\0')
+        {
+          resp->redirects = hops;
+
+          if (hops > 0)
+            {
+              /* 见证 = 沿路最后一跳（终跳 http_open 已把 resp 清零） */
+
+              strlcpy(resp->location, lastloc, sizeof(resp->location));
+            }
+
+          return fd;
+        }
+
+      strlcpy(lastloc, resp->location, sizeof(lastloc));
+      close(fd);
+
+      if (hops >= ORT_HTTP_REDIRECT_MAX)
+        {
+          return -10;              /* 重定向超限：fail-closed */
+        }
+
+      if (str_starts_ci(resp->location, "http://"))
+        {
+          FAR const char *p     = resp->location + 7;
+          FAR const char *slash = strchr(p, '/');
+          FAR const char *colon = strchr(p, ':');
+          size_t          hl;
+          unsigned        np    = 80;
+
+          if (colon != NULL && (slash == NULL || colon < slash))
+            {
+              hl = (size_t)(colon - p);
+              np = (unsigned)atoi(colon + 1);
+            }
+          else
+            {
+              hl = slash != NULL ? (size_t)(slash - p) : strlen(p);
+            }
+
+          if (hl == 0 || hl + 1 > sizeof(newhost))
+            {
+              return -9;
+            }
+
+          memcpy(newhost, p, hl);
+          newhost[hl] = '\0';
+
+          if (strcmp(newhost, hostbuf) != 0 || np != cur_port)
+            {
+              cur_bearer = NULL;   /* 跨主机:端口 → 剥凭据 */
+            }
+
+          strlcpy(hostbuf, newhost, hostcap);
+          cur_port = np;
+          strlcpy(pathbuf, slash != NULL ? slash : "/", pathcap);
+        }
+      else if (resp->location[0] == '/')
+        {
+          strlcpy(pathbuf, resp->location, pathcap);
+        }
+      else
+        {
+          return -9;               /* 裸相对 Location：不猜，fail-closed */
+        }
+    }
 }
 
 int ort_http_get(FAR const char *host, unsigned port, FAR const char *path,
@@ -278,82 +634,33 @@ int ort_http_get(FAR const char *host, unsigned port, FAR const char *path,
                  FAR char *body, size_t body_cap,
                  FAR struct ort_http_resp_s *resp)
 {
-  int    fd;
-  long long content_len;
-  size_t stored = 0;
+  static char hostbuf[128];      /* ★ 静态：重定向跟随要可变副本 */
+  static char pathbuf[512];
+  struct ort_http_writer_s w;
+  int fd;
+  int ret;
 
-  fd = http_open(host, port, path, bearer, accept, resp);
+  fd = http_open_follow(host, port, path, bearer, accept, resp,
+                        hostbuf, sizeof(hostbuf), pathbuf, sizeof(pathbuf));
   if (fd < 0)
     {
       return fd;
     }
 
-  content_len = resp->content_len;
+  memset(&w, 0, sizeof(w));
+  w.body = body;
+  w.cap  = body_cap;
 
-  /* body */
-
-  if (content_len >= 0)
-    {
-      size_t want = (size_t)content_len;
-
-      if (want <= body_cap)
-        {
-          if (recv_exact(fd, body, want, 0, &stored, &resp->body_truncated)
-              < 0)
-            {
-              close(fd);
-              return -7;
-            }
-        }
-      else
-        {
-          if (recv_exact(fd, NULL, want, 1, &stored, &resp->body_truncated)
-              < 0)
-            {
-              close(fd);
-              return -7;
-            }
-        }
-
-      resp->body_len = stored > body_cap ? body_cap : stored;
-    }
-  else
-    {
-      /* 没有 Content-Length：读到 EOF（HTTP/1.0 + Connection: close 语义）*/
-
-      for (;;)
-        {
-          ssize_t r;
-
-          if (stored < body_cap)
-            {
-              r = recv(fd, body + stored, body_cap - stored, 0);
-            }
-          else
-            {
-              char sink[256];
-
-              r = recv(fd, sink, sizeof(sink), 0);
-              if (r > 0)
-                {
-                  resp->body_truncated = 1;
-                  stored += (size_t)r;
-                  continue;
-                }
-            }
-
-          if (r <= 0)
-            {
-              break;
-            }
-
-          stored += (size_t)r;
-        }
-
-      resp->body_len = stored > body_cap ? body_cap : stored;
-    }
-
+  ret = http_read_body(fd, resp, http_writer_sink, &w, &w.stored);
   close(fd);
+
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  resp->body_truncated |= w.trunc;
+  resp->body_len = w.stored > body_cap ? body_cap : w.stored;
 
   if (resp->body_len < body_cap)
     {
@@ -373,65 +680,22 @@ int ort_http_get_stream(FAR const char *host, unsigned port,
                         FAR ort_http_sink_t sink, FAR void *arg,
                         FAR struct ort_http_resp_s *resp)
 {
-  static char chunk[1024];       /* ★ 静态：目标机 app 栈不见大件 */
-  int fd;
-  long long want;
+  static char hostbuf[128];
+  static char pathbuf[512];
+  int    fd;
+  int    ret;
   size_t total = 0;
 
-  fd = http_open(host, port, path, bearer, accept, resp);
+  fd = http_open_follow(host, port, path, bearer, accept, resp,
+                        hostbuf, sizeof(hostbuf), pathbuf, sizeof(pathbuf));
   if (fd < 0)
     {
       return fd;
     }
 
-  want = resp->content_len;
-
-  for (;;)
-    {
-      size_t ask = sizeof(chunk);
-      ssize_t r;
-
-      if (want >= 0)
-        {
-          if ((long long)total >= want)
-            {
-              break;                 /* 定长：读齐即停（多出的留给 close） */
-            }
-
-          if ((long long)ask > want - (long long)total)
-            {
-              ask = (size_t)(want - (long long)total);
-            }
-        }
-
-      r = recv(fd, chunk, ask, 0);
-      if (r < 0)
-        {
-          close(fd);
-          return -7;
-        }
-
-      if (r == 0)
-        {
-          break;                     /* 对端关闭 */
-        }
-
-      if (sink != NULL && sink(arg, chunk, (size_t)r) != 0)
-        {
-          close(fd);
-          return -8;                 /* sink 主动中止（如落盘失败） */
-        }
-
-      total += (size_t)r;
-    }
-
+  ret = http_read_body(fd, resp, sink, arg, &total);
   close(fd);
+
   resp->body_len = total;
-
-  if (want >= 0 && (long long)total < want)
-    {
-      return -7;                     /* 定长没读齐 = 断流 */
-    }
-
-  return 0;
+  return ret;          /* 定长短读 -7 / sink 中止 -8 / 畸形 chunk -9 */
 }

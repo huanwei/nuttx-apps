@@ -2387,7 +2387,9 @@ static int blob_download(FAR const char *host, unsigned port,
   ort_sha256_final(&d.sha, raw);
   ort_sha256_hex(raw, got);
 
-  printf("[pull]    收到 %zu 字节，算得 sha256:%s\n", d.n, got);
+  printf("[pull]    收到 %zu 字节%s%s，算得 sha256:%s\n", d.n,
+         r.chunked ? "（chunked 已解码）" : "",
+         r.redirects ? "（经重定向）" : "", got);
 
   if (strcmp(got, hex) != 0)
     {
@@ -2510,7 +2512,20 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
       return 2;
     }
 
-  printf("[pull] ③ %s → %d（%zu 字节）\n", path, r.status, r.body_len);
+  printf("[pull] ③ %s → %d（%zu 字节%s%s）\n", path, r.status, r.body_len,
+         r.chunked ? "，chunked 已解码" : "",
+         r.redirects ? "，经重定向" : "");
+
+  /* [§90] 大响应 fail-closed：此前超缓冲**静默截断**喂给解析器
+   * （症状 = 没头没脑的解析错）；现在显式拒绝并报边界。 */
+
+  if (r.body_truncated)
+    {
+      printf("[pull] *** manifest 响应超过缓冲（%zu 字节封顶）—— 拒绝继续 ***\n",
+             sizeof(g_http_body));
+      return 1;
+    }
+
   if (r.status != 200)
     {
       printf("[pull]    拒绝: %s\n", g_http_body);
@@ -2559,7 +2574,16 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
           return 2;
         }
 
-      printf("[pull] ④ digest manifest → 200（%zu 字节）\n", r.body_len);
+      if (r.body_truncated)
+        {
+          printf("[pull] *** manifest 响应超过缓冲（%zu 字节封顶）—— 拒绝继续 ***\n",
+                 sizeof(g_http_body2));
+          return 1;
+        }
+
+      printf("[pull] ④ digest manifest → 200（%zu 字节%s%s）\n", r.body_len,
+             r.chunked ? "，chunked 已解码" : "",
+             r.redirects ? "，经重定向" : "");
       step = 1;
     }
   else if (ret == ORT_JSON_E_REQUIRED)
@@ -2916,11 +2940,31 @@ int main(int argc, FAR char *argv[])
           return 2;
         }
 
-      printf("[ortimg] httpget → %d（体 %zu 字节%s）\n", r.status,
-             r.body_len, r.body_truncated ? "，截断" : "");
+      printf("[ortimg] httpget → %d（体 %zu 字节%s%s）\n", r.status,
+             r.body_len, r.body_truncated ? "，截断" : "",
+             r.chunked ? "，chunked 已解码" : "");
+      if (r.redirects)
+        {
+          printf("[ortimg] 重定向 %d 跳 → %s\n", r.redirects, r.location);
+        }
       if (r.www_auth[0])
         {
           printf("[ortimg] WWW-Authenticate: %s\n", r.www_auth);
+        }
+      if (r.status == 200 && r.body_len > 0 && !r.body_truncated)
+        {
+          /* [§90] 体摘要见证：chunked/重定向解码正确的**逐字节判据**
+           * （与宿主侧对同一文件算的摘要直接比） */
+
+          uint8_t raw[32];
+          char    hex[65];
+          struct ort_sha256_s ctx;
+
+          ort_sha256_init(&ctx);
+          ort_sha256_update(&ctx, g_http_body, r.body_len);
+          ort_sha256_final(&ctx, raw);
+          ort_sha256_hex(raw, hex);
+          printf("[ortimg] body sha256=%s\n", hex);
         }
       free(g_buf);
       return 0;
