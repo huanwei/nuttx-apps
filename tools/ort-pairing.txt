@@ -9,13 +9,12 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-09 ORT（§86 容器 root（chroot 族，A2 fs 隔离
-#               本体）—— inode_search 唯一咽喉重挂 + binfmt 派生传播 +
-#               PR_SET/GET_ORT_ROOT；apps 侧 orting run 设根、argv/PWD
-#               自然路径、orthello 自报/逃逸探针 + 夹具重生成；
-#               同时修 §79 遗留的 M 编译面（sig_dispatch SMP 守卫）。
-#               内核 262807bbe6）。
+# 最近配对事件：2026-10-09 ORT（§87 信号面隔离 —— ort_sig_gate：容器
+#               只准向自己组投信号（kill 含存在性探针/tgkill/sigqueue
+#               三入口全闸）；nxsig_queue_kernel 内核通道分叉（故障唤醒
+#               承重路径保持）；apps 侧 orthello sigprobe 探针 +
+#               orting 注入 ORT_SUP_PID + 夹具重生成。内核 76b4f7d654）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=262807bbe618fdeb8d7b03922549b4cb7d77fcba
+nuttx=76b4f7d65411a3bed391548f59ff98f171f5b554
