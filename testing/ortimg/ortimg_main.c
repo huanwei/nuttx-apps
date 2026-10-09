@@ -751,7 +751,8 @@ static int do_config(FAR const char *path)
 static char g_spawnpath[ORT_RUN_MAP_MAX];   /* [§86] exec 文件路径（视图映射） */
 static FAR char *g_argv[2 * ORT_CFG_MAX_ARG + 1];
 static char g_pwdbuf[ORT_RUN_MAP_MAX + 64];
-static FAR char *g_envp[ORT_CFG_MAX_ENV + 2];
+static char g_supbuf[64];                   /* [§87] ORT_SUP_PID=… */
+static FAR char *g_envp[ORT_CFG_MAX_ENV + 3];
 
 static int map_path(FAR const char *view, FAR const char *in,
                     FAR char *out, size_t cap)
@@ -883,6 +884,12 @@ static int run_spawn_ex(FAR const char *view, FAR const char *path,
       snprintf(g_pwdbuf, sizeof(g_pwdbuf), "PWD=%s", g_cfg.workdir);
       g_envp[ne++] = g_pwdbuf;
     }
+
+  /* [ORT §87] 监督者 pid 注入（信号面判据用）：容器闸生效后它也只能
+   * "看"这个 pid —— 注入不扩大权限面。 */
+
+  snprintf(g_supbuf, sizeof(g_supbuf), "ORT_SUP_PID=%d", (int)getpid());
+  g_envp[ne++] = g_supbuf;
 
   g_envp[ne] = NULL;
 

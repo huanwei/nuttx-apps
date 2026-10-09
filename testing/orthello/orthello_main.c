@@ -39,6 +39,7 @@
 #include <malloc.h>
 #include <sched.h>
 #include <sys/prctl.h>
+#include <errno.h>
 #ifndef CONFIG_DISABLE_SIGNALS
 #  include <signal.h>
 #endif
@@ -284,6 +285,33 @@ int main(int argc, FAR char *argv[])
       }
 
       printf("ORTHELLO: handler 逃法后未被打死（不该到这）\n");
+    }
+  else if (argc >= 3 && strcmp(argv[2], "sigprobe") == 0)
+    {
+      /* §87 信号面隔离探针：三条 `kill(pid, 0)`（**不发真信号**的
+       * 存在性/权限探针）——
+       *   init：pid 1（恒存在，内核静态任务）；
+       *   sup ：监督者 pid，经 env ORT_SUP_PID 注入（`orting run` 加）；
+       *   self：getpid()（自己组 —— 闸必须放行的正臂）。
+       * 判据 = **两臂不同形**：容器（rooted）⇒ init/sup 应为 EPERM、
+       * self OK；未 root（nsh 直 exec 对照臂）⇒ init OK。
+       * 权限判定读 errno —— 每次 kill 后**立刻**取。 */
+
+      FAR const char *sup = getenv("ORT_SUP_PID");
+      int ri = kill(1, 0);
+      int ei = errno;
+      int rs = sup != NULL ? kill(atoi(sup), 0) : -4242;
+      int es = errno;
+      int rp = kill(getpid(), 0);
+      int ep = errno;
+
+      printf("ORTHELLO: sigprobe init=%s sup=%s self=%s\n",
+             ri == 0 ? "OK" : (ri < 0 && ei == EPERM ? "EPERM" : "ERR"),
+             rs == -4242 ? "n/a"
+                         : (rs == 0 ? "OK"
+                                    : (rs < 0 && es == EPERM ? "EPERM"
+                                                             : "ERR")),
+             rp == 0 ? "OK" : (rp < 0 && ep == EPERM ? "EPERM" : "ERR"));
     }
 #endif
 
