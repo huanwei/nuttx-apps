@@ -9,12 +9,13 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-09 ORT（§85 unionfs whiteout：删除语义落地（路线①）
-#               —— unlink/rmdir/rename/mkdir/chstat 真实语义 + 读侧全闸
-#               + 逐级祖先遮蔽（lowerhidden）+ opq 重建；apps 侧无源码
-#               改动；裁判侧 §65 拒删判据翻转为删除语义判据组。
-#               内核 51b819a710）。
+# 最近配对事件：2026-10-09 ORT（§86 容器 root（chroot 族，A2 fs 隔离
+#               本体）—— inode_search 唯一咽喉重挂 + binfmt 派生传播 +
+#               PR_SET/GET_ORT_ROOT；apps 侧 orting run 设根、argv/PWD
+#               自然路径、orthello 自报/逃逸探针 + 夹具重生成；
+#               同时修 §79 遗留的 M 编译面（sig_dispatch SMP 守卫）。
+#               内核 262807bbe6）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=51b819a710788aa61a06214a77722598fff0527c
+nuttx=262807bbe618fdeb8d7b03922549b4cb7d77fcba
