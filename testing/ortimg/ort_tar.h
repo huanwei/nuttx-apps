@@ -14,16 +14,20 @@
  *     ISIZE 校验，损坏/截断 → E_GZIP）；否则按未压缩 tar 直读
  *   · ustar 头（POSIX magic "ustar\0"；GNU "ustar " 也收），checksum 必验
  *   · 成员类型：普通文件（'0'/'\0'，含"名字以 / 结尾当目录"的老式写法）、
- *     目录（'5'）。prefix 字段（155B）与 name（100B）拼接
+ *     目录（'5'）、**[§94] 符号链接（'2'）/硬链接（'1'）** —— 交付给
+ *     sink（含 linkname；size 记 0），落盘语义由 sink 及其下层判定
+ *   · **[§94] pax 扩展头（'x'=下一成员）**：解析 path/linkpath/size 覆盖，
+ *     扩展头本身不交付；'g'（全局）收下跳过。linkpath **不过路径规范化**
+ *     （真镜像的链接目标常是绝对路径 /bin/busybox —— 它只是字符串）
+ *   · prefix 字段（155B）与 name（100B）拼接
  *   · 名字规范化：跳过 "." 与空组件（"a/./b"→"a/b"、"./x"→"x"）；其余原样
  *
  * 明确拒绝（各给专属错误码，不混成一句"格式错"）：
  *   · 路径逃逸：绝对路径（前导 /）、任一 ".." 组件 → E_PATH
  *       （解包器最经典的安全事故面；这里在**解析层**就断掉）
- *   · symlink('2')/hardlink('1')/设备/FIFO → E_TYPE（逃逸与权限语义
- *     要成对设计，未做前不放行）
- *   · pax 扩展头（'x'/'g'）→ E_TYPE（长名/扩展属性当普通项跳过会**静默
- *     丢语义**，宁可不收）；GNU longname('L'/'K') 同
+ *   · 设备/FIFO('3'/'4'/'6')/GNU 长名('L'/'K') → E_TYPE（未做前不放行）
+ *   · pax 记录畸形（长度字段/记录格式）→ E_PAX（宁可不收，不静默丢语义；
+ *     链接目标字符串本身除外——见上）
  *   · 单成员 > 64MB、条目数 > 4096 → E_LIMIT（防跑飞，同下载侧防线）
  *   · size/checksum 非八进制、头截断 → E_SYNTAX / E_BADSUM / E_SHORT
  *
@@ -55,6 +59,7 @@ enum ort_tar_err_e
   ORT_TAR_E_PATH,       /* 绝对路径 / ".." / 名字超长 */
   ORT_TAR_E_TYPE,       /* 未支持的成员类型（含 pax/GNU 扩展头） */
   ORT_TAR_E_SYNTAX,     /* 数字字段非八进制等 */
+  ORT_TAR_E_PAX,        /* [§94] pax 扩展头畸形（长度/记录格式） */
   ORT_TAR_E_GZIP,       /* gzip 数据损坏/截断/解压失败（含内存不足） */
   ORT_TAR_E_LIMIT,      /* 超单成员尺寸/条目数上限 */
   ORT_TAR_E_IO,
@@ -66,7 +71,10 @@ struct ort_tar_entry_s
   char     name[256];   /* 规范化后的相对路径（无前导 /，无 "."/"..") */
   uint64_t size;
   uint32_t mode;        /* 八进制 mode 解析结果（低 12 位） */
-  char     typeflag;    /* '0'=文件（含 '\0'），'5'=目录 */
+  char     typeflag;    /* '0'=文件（含 '\0'），'5'=目录，'1'=硬链接，
+                         * '2'=符号链接（[§94] 真实镜像拉取需要） */
+  char     linkname[256]; /* [§94] '1'/'2' 的链接目标（pax linkpath 或头内
+                           * linkname，**原样**；真镜像常为绝对路径） */
 };
 
 /* 读源：read 返回读到的字节数；0 = 流末；<0 = 错误（如解压失败） */

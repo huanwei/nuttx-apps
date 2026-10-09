@@ -796,6 +796,22 @@ static void timg_data(FAR const void *data, size_t len)
   g_tlen += (len + 511) & ~(size_t)511;
 }
 
+/* [§94] 给**上一个头**写 linkname（'1'/'2' 用例）并修校验和 */
+
+static void timg_link(FAR const char *target)
+{
+  uint8_t *h = g_timg + g_tlen - 512;
+  size_t l = strlen(target);
+
+  if (l > 100)
+    {
+      l = 100;
+    }
+
+  memcpy(h + 157, target, l);
+  timg_fixsum(h);
+}
+
 static void timg_end(void)
 {
   g_tlen += 1024;                 /* 两个零块（reset 后本就全 0） */
@@ -807,6 +823,7 @@ struct tcollect_s
   char     name[8][80];
   uint64_t size[8];
   char     type[8];
+  char     link[8][80];           /* [§94] '1'/'2' 的 linkname */
   char     data[8][32];
   size_t   dlen[8];
 };
@@ -831,6 +848,16 @@ static int tcollect_sink(FAR void *arg,
       c->name[i][l] = '\0';
       c->size[i] = e->size;
       c->type[i] = e->typeflag;
+
+      l = strlen(e->linkname);
+      if (l > sizeof(c->link[0]) - 1)
+        {
+          l = sizeof(c->link[0]) - 1;
+        }
+
+      memcpy(c->link[i], e->linkname, l);
+      c->link[i][l] = '\0';
+
       c->data[i][0] = '\0';
       c->dlen[i] = 0;
 
@@ -910,9 +937,9 @@ static int tar_run_bytes(FAR FILE *out, FAR const char *name,
   return ret;
 }
 
-/* 用例数（T1-T18；tar 用例是命令式写的，没有表可数 —— 增删必须同步） */
+/* 用例数（T1-T20；tar 用例是命令式写的，没有表可数 —— 增删必须同步） */
 
-#define ORT_NTARCASES 18
+#define ORT_NTARCASES 20
 
 static int ort_tar_battery_run(FAR FILE *out)
 {
@@ -1071,38 +1098,46 @@ static int ort_tar_battery_run(FAR FILE *out)
       fprintf(out, "[ttest] ok   T8 \"..\" 逃逸 → PATH\n");
     }
 
-  /* T9 symlink 不收 */
+  /* T9 symlink 交付（§94：真镜像里 bin 下的命令全是指向 busybox 的
+   * 链接；本层只解析交付，逃逸/落盘语义归 sink 与其下层判定） */
 
   timg_reset();
   timg_hdr("lnk", 0, '2', NULL);
+  timg_link("bin/busybox");
   timg_end();
   ret = tar_run(out, "T9", &nent, &c);
-  if (ret != ORT_TAR_E_TYPE)
+  if (ret != ORT_TAR_OK || nent != 1 || c.type[0] != '2' ||
+      c.size[0] != 0 || strcmp(c.link[0], "bin/busybox") != 0)
     {
-      fprintf(out, "[ttest] FAIL T9 symlink: got=%s expect=TYPE\n",
-              ort_tar_strerror(ret));
+      fprintf(out, "[ttest] FAIL T9 symlink: ret=%s n=%u type=%c link=%s\n",
+              ort_tar_strerror(ret), (unsigned)nent, c.type[0], c.link[0]);
       fails++;
     }
   else
     {
-      fprintf(out, "[ttest] ok   T9 symlink → TYPE（明确不收）\n");
+      fprintf(out, "[ttest] ok   T9 symlink 交付（type='2' linkname 保留）\n");
     }
 
-  /* T10 pax 扩展头不收 */
+  /* T10 pax 'x' path 覆盖（§94：长名/改名靠它；扩展头本身不交付） */
 
   timg_reset();
-  timg_hdr("PaxHead", 0, 'x', NULL);
+  timg_hdr("PaxHead", 25, 'x', NULL);
+  timg_data("25 path=deep/renamed.txt\n", 25);
+  timg_hdr("orig.txt", 2, '0', NULL);
+  timg_data("ok", 2);
   timg_end();
   ret = tar_run(out, "T10", &nent, &c);
-  if (ret != ORT_TAR_E_TYPE)
+  if (ret != ORT_TAR_OK || nent != 1 ||
+      strcmp(c.name[0], "deep/renamed.txt") != 0 ||
+      strcmp(c.data[0], "ok") != 0)
     {
-      fprintf(out, "[ttest] FAIL T10 pax: got=%s expect=TYPE\n",
-              ort_tar_strerror(ret));
+      fprintf(out, "[ttest] FAIL T10 pax: ret=%s n=%u n0=%s\n",
+              ort_tar_strerror(ret), (unsigned)nent, c.name[0]);
       fails++;
     }
   else
     {
-      fprintf(out, "[ttest] ok   T10 pax 扩展头 → TYPE（不静默丢语义）\n");
+      fprintf(out, "[ttest] ok   T10 pax path 覆盖（扩展头不交付）\n");
     }
 
   /* T11 数据截断（声明 100B，实体只有一个头） */
@@ -1263,6 +1298,43 @@ static int ort_tar_battery_run(FAR FILE *out)
         }
     }
   }
+
+  /* T19 hardlink 交付（§94：type '1'，linkname 保留） */
+
+  timg_reset();
+  timg_hdr("hl", 0, '1', NULL);
+  timg_link("target.txt");
+  timg_end();
+  ret = tar_run(out, "T19", &nent, &c);
+  if (ret != ORT_TAR_OK || nent != 1 || c.type[0] != '1' ||
+      c.size[0] != 0 || strcmp(c.link[0], "target.txt") != 0)
+    {
+      fprintf(out, "[ttest] FAIL T19 hardlink: ret=%s n=%u type=%c link=%s\n",
+              ort_tar_strerror(ret), (unsigned)nent, c.type[0], c.link[0]);
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T19 hardlink 交付（type='1' linkname 保留）\n");
+    }
+
+  /* T20 pax 畸形记录 → E_PAX（fail-closed，绝不静默丢语义） */
+
+  timg_reset();
+  timg_hdr("PaxHead", 6, 'x', NULL);
+  timg_data("oops\n\n", 6);
+  timg_end();
+  ret = tar_run(out, "T20", &nent, &c);
+  if (ret != ORT_TAR_E_PAX)
+    {
+      fprintf(out, "[ttest] FAIL T20 pax 畸形: got=%s expect=PAX\n",
+              ort_tar_strerror(ret));
+      fails++;
+    }
+  else
+    {
+      fprintf(out, "[ttest] ok   T20 pax 畸形记录 → PAX\n");
+    }
 
   return fails;
 }

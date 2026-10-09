@@ -29,6 +29,8 @@
 #define TAR_CHKSUM_OFF   148
 #define TAR_CHKSUM_LEN   8
 #define TAR_TYPE_OFF     156
+#define TAR_LINK_OFF     157
+#define TAR_LINK_LEN     100
 #define TAR_MAGIC_OFF    257
 #define TAR_PREFIX_OFF   345
 #define TAR_PREFIX_LEN   155
@@ -55,9 +57,26 @@ FAR const char *ort_tar_strerror(int err)
       case ORT_TAR_E_GZIP:      return "GZIP（解压/校验失败）";
       case ORT_TAR_E_LIMIT:     return "LIMIT";
       case ORT_TAR_E_IO:        return "IO";
+      case ORT_TAR_E_PAX:       return "PAX（扩展头畸形）";
       case ORT_TAR_E_CB:        return "CB(中止)";
       default:                  return "?";
     }
+}
+
+/* 本文件宿主电池与目标机**共用**（host/hosttest.c 直编）⇒ 不能用
+ * NuttX libc 的 strlcpy（glibc 没有，链接期才炸）。语义同 strlcpy。 */
+
+static void tar_strlcpy(FAR char *dst, FAR const char *src, size_t n)
+{
+  size_t l = strlen(src);
+
+  if (l >= n)
+    {
+      l = n - 1;
+    }
+
+  memcpy(dst, src, l);
+  dst[l] = '\0';
 }
 
 /* ── 未压缩文件源 ─────────────────────────────────────────────────── */
@@ -409,6 +428,12 @@ int ort_tar_walk_src(FAR struct ort_tar_src_s *src,
       char     typeflag;
       int      raw_dir;
       int      ret;
+      static char pax_path[256];    /* [§94] pax 覆盖：path/linkpath/size */
+      static char pax_link[256];
+      static int64_t pax_size;
+      static int  pax_have_path;
+      static int  pax_have_link;
+      static int  pax_have_size;
 
       for (;;)
         {
@@ -489,6 +514,149 @@ int ort_tar_walk_src(FAR struct ort_tar_src_s *src,
           return ret;
         }
 
+      /* [§94] pax 扩展头（'x'=下一成员 / 'g'=全局）：收数据、解析
+       * path/linkpath/size 覆盖，**本身不作为成员交付**。 */
+
+      if (typeflag == 'x' || typeflag == 'g')
+        {
+          static char paxbuf[4096];
+          uint64_t left = size;
+          uint64_t off  = 0;
+
+          if (size > sizeof(paxbuf))
+            {
+              return ORT_TAR_E_LIMIT;
+            }
+
+          while (left > 0)
+            {
+              r = src->read(src->arg, paxbuf + off, (size_t)left);
+              if (r == TAR_RD_GZ)
+                {
+                  return ORT_TAR_E_GZIP;
+                }
+
+              if (r <= 0)
+                {
+                  return ORT_TAR_E_IO;
+                }
+
+              off  += (uint64_t)r;
+              left -= (uint64_t)r;
+            }
+
+          /* 跳过块对齐填充 */
+
+          {
+            uint64_t pad = (TAR_BLOCK - (size % TAR_BLOCK)) % TAR_BLOCK;
+
+            while (pad > 0)
+              {
+                r = src->read(src->arg, scratch, (size_t)pad);
+                if (r <= 0)
+                  {
+                    return ORT_TAR_E_IO;
+                  }
+
+                pad -= (uint64_t)r;
+              }
+          }
+
+          if (typeflag == 'x')
+            {
+              /* 解析 "<len> <key>=<value>\n" 记录 */
+
+              uint64_t pos = 0;
+
+              while (pos < off)
+                {
+                  uint64_t rlen = 0;
+
+                  while (pos < off && paxbuf[pos] >= '0' &&
+                         paxbuf[pos] <= '9')
+                    {
+                      rlen = rlen * 10 + (uint64_t)(paxbuf[pos] - '0');
+                      pos++;
+                    }
+
+                  if (pos >= off || paxbuf[pos] != ' ')
+                    {
+                      return ORT_TAR_E_PAX;   /* 畸形记录 */
+                    }
+
+                  pos++;
+
+                  /* 记录体到 '\n'（长度含长度字段本身） */
+
+                  {
+                    uint64_t bodyend = pos;   /* pos 现指向 key */
+
+                    while (bodyend < off && paxbuf[bodyend] != '\n')
+                      {
+                        bodyend++;
+                      }
+
+                    if (bodyend >= off)
+                      {
+                        return ORT_TAR_E_PAX;
+                      }
+
+                    /* rlen 必须与 实际到 '\n' 的长度一致 */
+
+                    if (rlen != bodyend + 1)
+                      {
+                        return ORT_TAR_E_PAX;
+                      }
+
+                    paxbuf[bodyend] = '\0';
+
+                    {
+                      FAR char *eq = strchr(paxbuf + pos, '=');
+
+                      if (eq != NULL)
+                        {
+                          *eq = '\0';
+
+                          if (strcmp(paxbuf + pos, "path") == 0)
+                            {
+                              if (tar_join_normalize(
+                                      (FAR const uint8_t *)(eq + 1),
+                                      strlen(eq + 1),
+                                      (FAR const uint8_t *)"", 0,
+                                      pax_path, sizeof(pax_path))
+                                  != ORT_TAR_OK)
+                                {
+                                  return ORT_TAR_E_PAX;
+                                }
+
+                              pax_have_path = 1;
+                            }
+                          else if (strcmp(paxbuf + pos, "linkpath") == 0)
+                            {
+                              /* ★ 链接目标**不过路径规范化**：真镜像的
+                               * 符号链接目标常是绝对路径（/bin/busybox）——
+                               * 它只是字符串，不做成员路径策略。 */
+
+                              tar_strlcpy(pax_link, eq + 1,
+                                      sizeof(pax_link));
+                              pax_have_link = 1;
+                            }
+                          else if (strcmp(paxbuf + pos, "size") == 0)
+                            {
+                              pax_size      = atoll(eq + 1);
+                              pax_have_size = 1;
+                            }
+                        }
+                    }
+
+                    pos = bodyend + 1;
+                  }
+                }
+            }
+
+          continue;                     /* 扩展头不交付 */
+        }
+
       switch (typeflag)
         {
           case '0':
@@ -502,15 +670,16 @@ int ort_tar_walk_src(FAR struct ort_tar_src_s *src,
 
           case '1':
           case '2':
+            e.typeflag = typeflag;              /* 硬链接/符号链接 */
+            break;
+
           case '3':
           case '4':
           case '6':
-          case 'x':
-          case 'g':
           case 'L':
           case 'K':
 
-            /* 链接/设备/pax/GNU 扩展：都明确不收（见头注） */
+            /* 设备/FIFO/GNU 长名扩展：仍明确不收（见头注） */
 
             return ORT_TAR_E_TYPE;
 
@@ -518,7 +687,44 @@ int ort_tar_walk_src(FAR struct ort_tar_src_s *src,
             return ORT_TAR_E_TYPE;
         }
 
-      e.size = (e.typeflag == '5') ? 0 : size;
+      /* pax 覆盖应用（一次性） */
+
+      if (pax_have_path)
+        {
+          tar_strlcpy(e.name, pax_path, sizeof(e.name));
+          pax_have_path = 0;
+        }
+
+      if (pax_have_size)
+        {
+          size = (uint64_t)pax_size;
+          pax_have_size = 0;
+        }
+
+      if (pax_have_link)
+        {
+          tar_strlcpy(e.linkname, pax_link, sizeof(e.linkname));
+          pax_have_link = 0;
+        }
+      else if (e.typeflag == '1' || e.typeflag == '2')
+        {
+          /* 头内 linkname（相对本成员所在目录的古老语义：tar 头里的
+           * linkname 是相对归档根的路径，现代实现按原样用） */
+
+          size_t ll = strnlen((FAR const char *)(h + TAR_LINK_OFF),
+                              TAR_LINK_LEN);
+
+          if (ll >= sizeof(e.linkname))
+            {
+              ll = sizeof(e.linkname) - 1;
+            }
+
+          memcpy(e.linkname, h + TAR_LINK_OFF, ll);
+          e.linkname[ll] = '\0';
+        }
+
+      e.size = (e.typeflag == '5' || e.typeflag == '1' ||
+                e.typeflag == '2') ? 0 : size;
 
       ret = tar_octal(h + TAR_MODE_OFF, TAR_MODE_LEN, &tmp);
       if (ret != ORT_TAR_OK)

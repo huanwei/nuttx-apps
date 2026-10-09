@@ -49,6 +49,9 @@
 #include <signal.h>
 #include <sched.h>
 #include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
 
 #include "ort_json.h"
 #include "ortimg_battery.h"
@@ -386,6 +389,52 @@ static int apply_sink(FAR void *arg, FAR const struct ort_tar_entry_s *e,
           a->errmsg = "建父目录失败";
           return -1;
         }
+    }
+
+  /* [§94] 链接成员：符号链接按原样目标建（真镜像常见绝对目标
+   * /bin/busybox）；硬链接目标按**归档根相对**拼 dest。 */
+
+  if (e->typeflag == '2' || e->typeflag == '1')
+    {
+      static char tpath[384];
+
+      unlink(path);
+
+      if (e->linkname[0] == '\0')
+        {
+          a->err = 7;
+          a->errmsg = "链接成员缺目标";
+          return -1;
+        }
+
+      if (e->typeflag == '2')
+        {
+          if (symlink(e->linkname, path) != 0)
+            {
+              a->err = 7;
+              a->errmsg = "建符号链接失败";
+              return -1;
+            }
+        }
+      else
+        {
+          if (snprintf(tpath, sizeof(tpath), "%s/%s", a->dest,
+                       e->linkname) >= (int)sizeof(tpath))
+            {
+              a->err = 8;
+              a->errmsg = "硬链接目标过长";
+              return -1;
+            }
+
+          if (link(tpath, path) != 0)
+            {
+              a->err = 8;
+              a->errmsg = "建硬链接失败";
+              return -1;
+            }
+        }
+
+      return 0;
     }
 
   fd = open(path, O_WRONLY | O_CREAT | O_TRUNC,
@@ -1811,7 +1860,7 @@ static int do_orch(int secs, FAR const char *view, int ncfg,
  * （do_pull 定义在本文件后段 —— 前向声明。） */
 
 static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
-                   FAR const char *tag);
+                   FAR const char *tag, FAR const char *capath);
 
 /* 流程（`orting up <view> <host> <port> <repo> <tag>`）：
  *   ① mkdir 视图 + **派生**中转挂载点（<view>_ro 下层 / <view>_up 上层
@@ -1909,7 +1958,7 @@ static int do_up(FAR const char *view, FAR const char *host, unsigned port,
 
   /* ④ pull（下载 + 校验 + 落盘 + rootfs；复用全链） */
 
-  ret = do_pull(host, port, repo, tag);
+  ret = do_pull(host, port, repo, tag, NULL);
   if (ret != 0)
     {
       printf("[up] pull 未过（r=%d）→ up 中止\n", ret);
@@ -2233,9 +2282,16 @@ static int url_split(FAR const char *url, FAR char *host, size_t hostcap,
 {
   FAR const char *p = url;
 
+  unsigned defport = 80;
+
   if (strncmp(p, "http://", 7) == 0)
     {
       p += 7;
+    }
+  else if (strncmp(p, "https://", 8) == 0)
+    {
+      p += 8;
+      defport = 443;               /* [§94] 真 Hub 的 auth.docker.io */
     }
 
   {
@@ -2256,7 +2312,7 @@ static int url_split(FAR const char *url, FAR char *host, size_t hostcap,
     else
       {
         hlen = (size_t)(slash - p);
-        *port = 80;
+        *port = defport;
       }
 
     if (hlen == 0 || hlen >= hostcap)
@@ -2371,28 +2427,96 @@ static int blob_download(FAR const char *host, unsigned port,
       return 2;
     }
 
-  fd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (fd < 0)
-    {
-      printf("[pull]    建文件失败: %s（errno=%d）\n", part, errno);
-      return 2;
-    }
+  /* [§94] 断点续传：.part 存在且有内容 ⇒ 先哈希已收段，Range 续收 */
 
-  memset(&d, 0, sizeof(d));
-  d.fd = fd;
-  ort_sha256_init(&d.sha);
+  {
+    struct stat pst;
+    long long from = 0;
 
-  ret = ort_http_get_stream(host, port, path, bearer, NULL,
-                            dl_sink, &d, &r);
-  close(fd);
+    if (stat(part, &pst) == 0 && pst.st_size > 0 &&
+        (uint64_t)pst.st_size < msize)
+      {
+        from = (long long)pst.st_size;
+      }
 
-  if (ret != 0 || r.status != 200)
-    {
-      printf("[pull]    blob 下载失败（ret=%d status=%d errno=%d）\n",
-             ret, r.status, errno);
-      unlink(part);
-      return 2;
-    }
+    memset(&d, 0, sizeof(d));
+    d.fd = -1;                    /* 预哈希阶段不写盘 */
+
+    if (from > 0)
+      {
+        FAR FILE *pf = fopen(part, "rb");
+        static char hbuf[512];
+
+        if (pf != NULL)
+          {
+            size_t n;
+
+            ort_sha256_init(&d.sha);
+            while ((n = fread(hbuf, 1, sizeof(hbuf), pf)) > 0)
+              {
+                ort_sha256_update(&d.sha, hbuf, n);
+                d.n += n;
+              }
+
+            fclose(pf);
+            printf("[pull]    断点续传：已收 %lld 字节\n", from);
+          }
+        else
+          {
+            from = 0;
+          }
+      }
+
+    fd = open(part, from > 0 ? O_WRONLY
+                             : (O_WRONLY | O_CREAT | O_TRUNC), 0644);
+    if (fd < 0)
+      {
+        printf("[pull]    建文件失败: %s（errno=%d）\n", part, errno);
+        return 2;
+      }
+
+    if (from > 0)
+      {
+        lseek(fd, 0, SEEK_END);
+        d.fd = fd;                 /* sha/n 已是已收段 */
+      }
+    else
+      {
+        d.fd = fd;
+        ort_sha256_init(&d.sha);
+      }
+
+    ret = ort_http_get_stream_from(host, port, path, bearer, NULL,
+                                   dl_sink, &d, &r, from);
+    if (from > 0 && ret == 0 && r.status == 200)
+      {
+        /* 服务端忽略 Range：截断从头重收 */
+
+        printf("[pull]    服务端未续传（200），从头重收\n");
+        if (ftruncate(fd, 0) == 0 && lseek(fd, 0, SEEK_SET) >= 0)
+          {
+            memset(&d, 0, sizeof(d));
+            d.fd = fd;
+            ort_sha256_init(&d.sha);
+            ret = ort_http_get_stream_from(host, port, path, bearer, NULL,
+                                           dl_sink, &d, &r, 0);
+          }
+      }
+    else if (from > 0 && ret == 0 && r.status == 206)
+      {
+        printf("[pull]    续传成立（206，从 %lld 起）\n",
+               r.content_range_from);
+      }
+
+    close(fd);
+
+    if (ret != 0 || (r.status != 200 && r.status != 206))
+      {
+        printf("[pull]    blob 下载失败（ret=%d status=%d errno=%d）"
+               " —— .part 保留（可续传）\n", ret, r.status, errno);
+        return 2;
+      }
+  }
 
   ort_sha256_final(&d.sha, raw);
   ort_sha256_hex(raw, got);
@@ -2428,13 +2552,27 @@ static int blob_download(FAR const char *host, unsigned port,
 }
 
 static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
-                   FAR const char *tag)
+                   FAR const char *tag, FAR const char *capath)
 {
   static struct ort_http_resp_s r;         /* ★ 全静态：目标机 app 栈 ~2KB */
   static char   path[320];
   static char   realm[256], service[64], scope[160];
   int    ret;
   int    step = 0;
+
+  /* [§94] 给了 CA ⇒ 全流程 TLS（含 token 跨主机与 CDN 重定向） */
+
+  if (capath != NULL)
+    {
+      ret = ort_http_set_tls(capath);
+      if (ret != 0)
+        {
+          printf("[pull] *** TLS 初始化失败: %d ***\n", ret);
+          return 2;
+        }
+
+      printf("[pull] TLS 已启用（CA=%s）\n", capath);
+    }
 
   /* 1) /v2/：拿 401 挑战（或 200 = 开放仓库） */
 
@@ -3292,6 +3430,115 @@ int main(int argc, FAR char *argv[])
       return r;
     }
 
+  if (argc >= 2 && strcmp(argv[1], "ntp") == 0)
+    {
+      /* [ORT §94] 内嵌最小 SNTP：UDP 123 → 取 transmit timestamp →
+       * clock_settime。为什么不用现成 ntpclient：它在 knsh 下踩
+       * task_create 缺位（§17 同类），补上游不值当——自含更稳。 */
+
+      FAR const char *srv = argc >= 3 ? argv[2] : "pool.ntp.org";
+      struct addrinfo hints;
+      FAR struct addrinfo *ai = NULL;
+      struct timeval tv = { 5, 0 };
+      unsigned char req[48], resp[48];
+      int fd;
+      int r;
+      int att;
+      int hret;
+      uint32_t secs;
+      time_t t;
+
+      memset(&hints, 0, sizeof(hints));
+      hints.ai_family   = AF_INET;
+      hints.ai_socktype = SOCK_DGRAM;
+
+      hret = getaddrinfo(srv, "123", &hints, &ai);
+      if (hret != 0 || ai == NULL)
+        {
+          printf("[ntp] *** 解析失败: %s（%d）***\n", srv, hret);
+          free(g_buf);
+          return 2;
+        }
+
+      fd = socket(ai->ai_family, ai->ai_socktype, 0);
+      if (fd < 0 || connect(fd, ai->ai_addr, ai->ai_addrlen) != 0)
+        {
+          printf("[ntp] *** 连接失败（errno=%d）***\n", errno);
+          freeaddrinfo(ai);
+          free(g_buf);
+          return 2;
+        }
+
+      freeaddrinfo(ai);
+      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+      memset(req, 0, sizeof(req));
+      req[0] = 0x23;              /* LI=0 VN=4 Mode=3（客户端） */
+
+      r = send(fd, req, sizeof(req), 0);
+      if (r != (int)sizeof(req))
+        {
+          printf("[ntp] *** 请求发送失败（%d）***\n", r);
+          close(fd);
+          free(g_buf);
+          return 2;
+        }
+
+      /* 重发一次（§94 活体首跑实证：pool 成员偶发单发不回 ——
+       * 只发一发时，丢一包 = 时钟停在 1970 = 后面全部 TLS
+       * FAIL 未来期。重发是最小代价的加固）。 */
+
+      for (att = 0; att < 2; att++)
+        {
+          if (att > 0)
+            {
+              r = send(fd, req, sizeof(req), 0);
+              if (r != (int)sizeof(req))
+                {
+                  break;
+                }
+            }
+
+          r = recv(fd, resp, sizeof(resp), 0);
+          if (r >= 48 && (resp[0] & 0x07) == 4)
+            {
+              break;
+            }
+        }
+
+      close(fd);
+
+      if (r < 48 || (resp[0] & 0x07) != 4)
+        {
+          printf("[ntp] *** 响应无效（r=%d mode=%d errno=%d）***\n", r,
+                 r >= 1 ? (resp[0] & 0x07) : -1, errno);
+          free(g_buf);
+          return 2;
+        }
+
+      /* transmit timestamp：字节 40..43（1900 纪元，需 −2208988800） */
+
+      secs = ((uint32_t)resp[40] << 24) | ((uint32_t)resp[41] << 16) |
+             ((uint32_t)resp[42] << 8)  | (uint32_t)resp[43];
+      t = (time_t)secs - (time_t)2208988800;
+
+      {
+        struct timespec ts;
+
+        ts.tv_sec  = t;
+        ts.tv_nsec = 0;
+
+        {
+          int cr = clock_settime(CLOCK_REALTIME, &ts);
+
+          printf("[ntp] 同步: %s → epoch=%lld（clock_settime=%d）\n",
+                 srv, (long long)t, cr);
+          free(g_buf);
+          return cr == 0 ? 0 : 2;
+        }
+      }
+    }
+
   if (argc >= 3 && strcmp(argv[1], "settime") == 0)
     {
       /* [ORT §92] settime <epoch 秒> —— 对时（nsh 的 date 被裁；
@@ -3314,8 +3561,21 @@ int main(int argc, FAR char *argv[])
 
   if (argc >= 5 && strcmp(argv[1], "httpget") == 0)
     {
-      /* httpget <host> <port> <path> —— 连通性诊断 */
+      /* httpget <host> <port> <path> [ca] —— 连通性诊断（给 CA 即 TLS） */
       struct ort_http_resp_s r;
+
+      if (argc >= 6)
+        {
+          int tr = ort_http_set_tls(argv[5]);
+
+          if (tr != 0)
+            {
+              printf("[ortimg] TLS 初始化失败: %d\n", tr);
+              free(g_buf);
+              return 2;
+            }
+        }
+
       int rret = ort_http_get(argv[2], (unsigned)atoi(argv[3]), argv[4],
                               NULL, NULL, g_http_body, sizeof(g_http_body),
                               &r);
@@ -3359,8 +3619,9 @@ int main(int argc, FAR char *argv[])
 
   if (argc >= 6 && strcmp(argv[1], "pull") == 0)
     {
-      /* pull <host> <port> <repo> <tag> */
-      int r = do_pull(argv[2], (unsigned)atoi(argv[3]), argv[4], argv[5]);
+      /* pull <host> <port> <repo> <tag> [ca] */
+      int r = do_pull(argv[2], (unsigned)atoi(argv[3]), argv[4], argv[5],
+                      argc >= 7 ? argv[6] : NULL);
       free(g_buf);
       return r;
     }
