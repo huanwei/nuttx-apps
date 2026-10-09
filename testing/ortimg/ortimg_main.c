@@ -2771,6 +2771,7 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
 #define ORT_TLS_CA_MAX 4096
 static char     g_tls_ca_buf[ORT_TLS_CA_MAX];
 static uint32_t g_tls_verify_flags;
+static char     g_tls_wwwauth[256];   /* [§93] 真 Hub 挑战头见证 */
 
 static int httpsget_verify_cb(FAR void *data,
                               FAR mbedtls_x509_crt *crt, int depth,
@@ -2906,6 +2907,7 @@ static int do_httpsget(FAR const char *host, unsigned port,
   mbedtls_ssl_set_bio(&ssl, &srv, mbedtls_net_send, mbedtls_net_recv, NULL);
 
   g_tls_verify_flags = 0;        /* 握手前清零（配合回调的 OR） */
+  g_tls_wwwauth[0]    = '\0';
 
   for (;;)
     {
@@ -2974,7 +2976,7 @@ static int do_httpsget(FAR const char *host, unsigned port,
 
   {
     uint32_t h4   = 0;            /* 4 字节移位寄存器：扫 "\r\n\r\n" */
-    char     stbuf[48];
+    char     stbuf[256];
     size_t   stlen = 0;
     bool     stline_done = false;
 
@@ -3008,7 +3010,10 @@ static int do_httpsget(FAR const char *host, unsigned port,
 
               if (!hdr_done)
                 {
-                  /* 首行收集（状态行；到 \n 为止） */
+                  /* 首行收集（状态行；到 \n 为止）；
+
+                   * [§93] 顺带把 WWW-Authenticate 头收下来（真 Hub 的
+                   * 挑战头是"对接成功"的一等见证）。 */
 
                   if (!stline_done)
                     {
@@ -3029,6 +3034,31 @@ static int do_httpsget(FAR const char *host, unsigned port,
 
                           stline_done = true;
                         }
+                    }
+                  else if (c == '\n' || stlen >= sizeof(stbuf) - 1)
+                    {
+                      /* 一行收齐：行末处理（复用 stbuf 收头行） */
+
+                      stbuf[stlen] = '\0';
+
+                      if (strncasecmp(stbuf, "WWW-Authenticate:", 17) == 0)
+                        {
+                          FAR const char *v = stbuf + 17;
+
+                          while (*v == ' ')
+                            {
+                              v++;
+                            }
+
+                          strlcpy(g_tls_wwwauth, v,
+                                  sizeof(g_tls_wwwauth));
+                        }
+
+                      stlen = 0;
+                    }
+                  else if (c != '\r')
+                    {
+                      stbuf[stlen++] = c;
                     }
 
                   h4 = (h4 << 8) | (unsigned char)c;
@@ -3058,6 +3088,11 @@ static int do_httpsget(FAR const char *host, unsigned port,
   ort_sha256_hex(raw, hex);
 
   printf("[httpsget] → %d（体 %zu 字节）\n", status, total);
+  if (g_tls_wwwauth[0])
+    {
+      printf("[httpsget] WWW-Authenticate: %s\n", g_tls_wwwauth);
+    }
+
   if (status == 200 && total > 0)
     {
       printf("[httpsget] body sha256=%s\n", hex);
