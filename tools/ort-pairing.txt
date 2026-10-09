@@ -9,12 +9,11 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-09 ORT（§89 信号面隔离放开到 M —— 容器标记
-#               扩展为"设根或绑域"（A 设根 / M CG 绑域）；M run5 标准
-#               场景逐字同形（监督链全走内核通道）；apps 侧 ortsup
-#               sigprobe 三臂 + /rt 幂等就绪。信号面三 SKU 收口。
-#               内核 3798a3f9c7）。
+# 最近配对事件：2026-10-09 ORT（§90 A1 客户端硬化 —— ort_http chunked
+#               解码/重定向跟随（跨主机剥凭据）/大响应 fail-closed；
+#               注册表替身 §90 端点与 repo 模式；nx_bringup 永久诊断
+#               （当场破了三次"首启偶发"= cwd 错误）。内核 ea97bb611b）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=3798a3f9c7681034c2349ce6b7ec4d2b8fe7bb80
+nuttx=ea97bb611b3e35e9613beefca29e254294cfb6b6
