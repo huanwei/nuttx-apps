@@ -748,7 +748,7 @@ static int do_config(FAR const char *path)
 
 #define ORT_RUN_MAP_MAX 320
 
-static char g_avbuf[2 * ORT_CFG_MAX_ARG][ORT_RUN_MAP_MAX];
+static char g_spawnpath[ORT_RUN_MAP_MAX];   /* [§86] exec 文件路径（视图映射） */
 static FAR char *g_argv[2 * ORT_CFG_MAX_ARG + 1];
 static char g_pwdbuf[ORT_RUN_MAP_MAX + 64];
 static FAR char *g_envp[ORT_CFG_MAX_ENV + 2];
@@ -818,32 +818,18 @@ static int run_spawn_ex(FAR const char *view, FAR const char *path,
       return 1;
     }
 
-  /* argv := entrypoint + cmd（OCI 语义），绝对路径按视图映射 */
+  /* argv := entrypoint + cmd（OCI 语义）。[§86] argv **原样**（自然
+   * 路径）—— 绝对路径由内核按容器 root（下方 PR_SET_ORT_ROOT）重挂；
+   * 只有 exec 文件路径（= 视图映射的 entrypoint[0]）留给 spawn。 */
 
   for (i = 0; i < g_cfg.nentrypoint; i++)
     {
-      if (map_path(view, g_cfg.entrypoint[i], g_avbuf[na],
-                   sizeof(g_avbuf[0])) != 0)
-        {
-          printf("[run] argv 映射超界（entrypoint[%u]）\n", (unsigned)i);
-          return 1;
-        }
-
-      g_argv[na] = g_avbuf[na];
-      na++;
+      g_argv[na++] = g_cfg.entrypoint[i];
     }
 
   for (i = 0; i < g_cfg.ncmd; i++)
     {
-      if (map_path(view, g_cfg.cmd[i], g_avbuf[na],
-                   sizeof(g_avbuf[0])) != 0)
-        {
-          printf("[run] argv 映射超界（cmd[%u]）\n", (unsigned)i);
-          return 1;
-        }
-
-      g_argv[na] = g_avbuf[na];
-      na++;
+      g_argv[na++] = g_cfg.cmd[i];
     }
 
   if (na == 0)
@@ -853,6 +839,13 @@ static int run_spawn_ex(FAR const char *view, FAR const char *path,
     }
 
   g_argv[na] = NULL;
+
+  if (map_path(view, g_cfg.entrypoint[0], g_spawnpath,
+               sizeof(g_spawnpath)) != 0)
+    {
+      printf("[run] exec 路径映射超界（entrypoint[0]）\n");
+      return 1;
+    }
 
   /* 环境：config Env（滤掉 PWD=）+ 运行时 PWD */
 
@@ -884,7 +877,10 @@ static int run_spawn_ex(FAR const char *view, FAR const char *path,
 
       printf("[run] workdir 就绪: %s\n", wdbuf);
 
-      snprintf(g_pwdbuf, sizeof(g_pwdbuf), "PWD=%s", wdbuf);
+      /* [§86] PWD 给**自然路径**：子进程（容器 root 已挂）自己解析；
+       * 落点建目录仍用上面的映射路径（本进程未重挂）。 */
+
+      snprintf(g_pwdbuf, sizeof(g_pwdbuf), "PWD=%s", g_cfg.workdir);
       g_envp[ne++] = g_pwdbuf;
     }
 
@@ -902,7 +898,16 @@ static int run_spawn_ex(FAR const char *view, FAR const char *path,
   printf("[run] 环境 %d 条，PWD=%s\n", ne,
          g_cfg.workdir[0] ? g_pwdbuf + 4 : "(未设)");
 
-  ret = posix_spawn(&pid, g_argv[0], NULL, attr, g_argv, g_envp);
+  /* [ORT §86] 容器 root：视图设为**此后派生进程**的根（本进程自己
+   * 不重挂）。失败 fail-closed —— 隔离不成立就不许起容器。 */
+
+  if (prctl(PR_SET_ORT_ROOT, view) != 0)
+    {
+      printf("[run] 设根失败: %s（errno=%d）\n", view, errno);
+      return 1;
+    }
+
+  ret = posix_spawn(&pid, g_spawnpath, NULL, attr, g_argv, g_envp);
   if (ret != 0)
     {
       printf("[run] spawn 失败 rc=%d errno=%d\n", ret, errno);

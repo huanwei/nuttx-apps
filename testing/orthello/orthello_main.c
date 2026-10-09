@@ -38,6 +38,7 @@
 #include <unistd.h>
 #include <malloc.h>
 #include <sched.h>
+#include <sys/prctl.h>
 #ifndef CONFIG_DISABLE_SIGNALS
 #  include <signal.h>
 #endif
@@ -68,6 +69,32 @@ int main(int argc, FAR char *argv[])
 
     printf("ORTHELLO: env ORT_FIXTURE=%s\n", v ? v : "(无)");
     printf("ORTHELLO: cwd=%s\n", cwd ? cwd : "(无)");
+  }
+
+  /* §86（A2 隔离）：容器 root 自报 + 逃逸探针 —— "隔离成立"的第一手
+   * 判据（两行对两臂**不同形**才说明有分辨力）。
+   *   root：经 `orting run` = 视图路径（内核按它重挂绝对路径）；
+   *         直接跑（对照臂）=(无)。
+   *   escape：/system/bin/init 是**宿主侧**文件（hostfs），容器视图里
+   *         没有 —— rooted ⇒ 打不开；未 root ⇒ 读得到。 */
+
+  {
+    char rbuf[80];
+    int rn = prctl(PR_GET_ORT_ROOT, rbuf, sizeof(rbuf));
+
+    printf("ORTHELLO: root=%s\n", rn > 0 ? rbuf : "(无)");
+
+    {
+      FAR FILE *ef = fopen("/system/bin/init", "r");
+
+      printf("ORTHELLO: escape=/system/bin/init:%s\n",
+             ef != NULL ? "OK" : "打不开");
+
+      if (ef != NULL)
+        {
+          fclose(ef);
+        }
+    }
   }
 
   /* §80（A2 资源限制）：**子进程看得见**的核集/优先级回读 + 所在 CPU
