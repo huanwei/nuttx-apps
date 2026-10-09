@@ -9,12 +9,12 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-09 ORT（§84 unionfs copy-up：写面契约落地 ——
-#               写意图 open 先上移（父目录+文件）、mkdir 只落上层、
-#               下层破坏性操作 fail-closed、下层 fd 绊线；apps 侧无源码
-#               改动；裁判侧 e2e §65 缺口实证翻转为 copy-up 正判据。
-#               内核 fc310a458d）。
+# 最近配对事件：2026-10-09 ORT（§85 unionfs whiteout：删除语义落地（路线①）
+#               —— unlink/rmdir/rename/mkdir/chstat 真实语义 + 读侧全闸
+#               + 逐级祖先遮蔽（lowerhidden）+ opq 重建；apps 侧无源码
+#               改动；裁判侧 §65 拒删判据翻转为删除语义判据组。
+#               内核 51b819a710）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=fc310a458d468e637f0a644d3efaa08ec2f34a49
+nuttx=51b819a710788aa61a06214a77722598fff0527c
