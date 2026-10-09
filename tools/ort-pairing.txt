@@ -9,10 +9,9 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-09 ORT（§91 TLS 起步 —— mbedTLS 3.6.2 集成、
-#               orting httpsget（TLSv1.3 握手 + 体摘要逐字节 + 明文
-#               端口 fail-closed）；A 配置补 DEV_URANDOM（熵源链）；
-#               顺带 arm_undefinedinsn 隐式声明清零。内核 8834bd6891）。
+# 最近配对事件：2026-10-09 ORT（§92 TLS 正验：证书链 VERIFY_REQUIRED
+#               + 时钟校验（MBEDTLS_HAVE_TIME_DATE + orting settime）+
+#               flags 四臂判别；**无内核源码改动**，维持 8834bd6891）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
