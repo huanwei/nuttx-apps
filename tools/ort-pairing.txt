@@ -9,10 +9,14 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-09 ORT（§93 **真 Docker Hub 首次对接** ——
-#               真 DNS（slirp 10.0.2.3）+ TLSv1.3 + 真链校验（Amazon
-#               Root CA 1 锚）+ 真 401 Bearer 挑战头；内核含
-#               arm_undefinedinsn include 修正。内核 bcc3f04052）。
+# 最近配对事件：2026-10-10 ORT（§94 **真 Docker Hub 全流程拉取 + TLS
+#               续项四件套** —— 官方根三根（+ISRG Root X2）+ NTP 自取
+#               时钟 + 真 token/manifest/blob 至内容寻址通过（经
+#               307→CloudFront）+ chunked-over-TLS + 断点续传。
+#               **无内核源码改动**，维持 bcc3f04052；平台内存布局调整在
+#               配置层（RAM 32MB + 页池 0x41000000 + PSEUDOFS_SOFTLINKS，
+#               见 proposals/scripts/ort-a-knsh_smp.config）。夹具随内核
+#               配置重烤（syscall 表位移，见 §94）。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
