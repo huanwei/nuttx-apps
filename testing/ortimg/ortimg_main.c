@@ -56,6 +56,16 @@
 #include "ort_sha256.h"
 #include "ort_tar.h"
 
+/* [ORT §91] TLS 起步：mbedTLS 客户端（apps/crypto/mbedtls；熵源经其
+ * getrandom 补丁，X509 CRT 池补丁随源就位——链校验本轮**未开**，
+ * 见 do_httpsget 的边界注） */
+#include <mbedtls/ssl.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/error.h>
+#include <mbedtls/version.h>
+
 #define ORTIMG_MAX_FILE  (ORT_JSON_MAX_INPUT + 1)
 
 /* 镜像存储根：设计文档写 /var/ort/images —— 本板 /var 无挂载，tmpfs 在
@@ -2754,6 +2764,239 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
   return 0;
 }
 
+/****************************************************************************
+ * [ORT §91] httpsget <host> <port> <path> —— TLS 客户端（mbedTLS）
+ *
+ *   判据面：握手见证（TLS 版本/密码套件，mbedtls 自报）+ 响应体
+ *   **边读边算 sha256**（与宿主对同一文件算的摘要逐字比——TLS 录音
+ *   解密错一字节就露）。
+ *
+ *   ⚠️ 边界（如实）：`MBEDTLS_SSL_VERIFY_NONE` —— 自签测试服务器；
+ *   证书链校验与时间校验**未开**（真 Hub 需要 CA 池 + 有效时钟，
+ *   两个补丁已随源就位、留待对接轮）。本子命令证明的是**传输层**：
+ *   真加密会话能建、数据能解、字节不差。
+ ****************************************************************************/
+
+static int do_httpsget(FAR const char *host, unsigned port,
+                       FAR const char *path)
+{
+  /* ★ 全部静态：目标机 app 栈 ~2KB，TLS 上下文放栈上必炸 */
+
+  static mbedtls_ssl_context      ssl;
+  static mbedtls_ssl_config       conf;
+  static mbedtls_entropy_context  entropy;
+  static mbedtls_ctr_drbg_context drbg;
+  static mbedtls_net_context      srv;
+  static char rbuf[1024];
+  char portstr[8];
+  char req[512];
+  struct ort_sha256_s ctx;
+  uint8_t raw[32];
+  char    hex[65];
+  size_t  total = 0;
+  int     status = 0;
+  int     hdr_done = 0;         /* 头已结束（其后都是体） */
+  int     ret;
+
+  mbedtls_ssl_init(&ssl);
+  mbedtls_ssl_config_init(&conf);
+  mbedtls_entropy_init(&entropy);
+  mbedtls_ctr_drbg_init(&drbg);
+  mbedtls_net_init(&srv);
+
+  snprintf(portstr, sizeof(portstr), "%u", port);
+
+  ret = mbedtls_ctr_drbg_seed(&drbg, mbedtls_entropy_func, &entropy,
+                              (FAR const unsigned char *)"orting", 6);
+  if (ret != 0)
+    {
+      printf("[httpsget] *** drbg seed 失败: -0x%04x ***\n", -ret);
+      goto out;
+    }
+
+  ret = mbedtls_net_connect(&srv, host, portstr, MBEDTLS_NET_PROTO_TCP);
+  if (ret != 0)
+    {
+      printf("[httpsget] *** 连接失败: -0x%04x ***\n", -ret);
+      goto out;
+    }
+
+  ret = mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT,
+                                    MBEDTLS_SSL_TRANSPORT_STREAM,
+                                    MBEDTLS_SSL_PRESET_DEFAULT);
+  if (ret != 0)
+    {
+      printf("[httpsget] *** ssl 默认配置失败: -0x%04x ***\n", -ret);
+      goto out;
+    }
+
+  mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
+  mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);   /* 边界注 */
+  mbedtls_ssl_conf_min_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
+
+  ret = mbedtls_ssl_setup(&ssl, &conf);
+  if (ret != 0)
+    {
+      printf("[httpsget] *** ssl setup 失败: -0x%04x ***\n", -ret);
+      goto out;
+    }
+
+  mbedtls_ssl_set_hostname(&ssl, host);
+  mbedtls_ssl_set_bio(&ssl, &srv, mbedtls_net_send, mbedtls_net_recv, NULL);
+
+  for (;;)
+    {
+      ret = mbedtls_ssl_handshake(&ssl);
+      if (ret == 0)
+        {
+          break;
+        }
+
+      if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+          ret != MBEDTLS_ERR_SSL_WANT_WRITE)
+        {
+          char ebuf[96];
+
+          mbedtls_strerror(ret, ebuf, sizeof(ebuf));
+          printf("[httpsget] *** 握手失败: -0x%04x（%s）***\n", -ret, ebuf);
+          goto out;
+        }
+    }
+
+  printf("[httpsget] TLS 握手完成: %s / %s\n",
+         mbedtls_ssl_get_version(&ssl), mbedtls_ssl_get_ciphersuite(&ssl));
+
+  snprintf(req, sizeof(req),
+           "GET %s HTTP/1.0\r\n"
+           "Host: %s:%u\r\n"
+           "Connection: close\r\n"
+           "\r\n", path, host, port);
+
+  {
+    size_t off = 0;
+
+    while (off < strlen(req))
+      {
+        ret = mbedtls_ssl_write(&ssl, (FAR const unsigned char *)req + off,
+                                strlen(req) - off);
+        if (ret > 0)
+          {
+            off += (size_t)ret;
+          }
+        else if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+                 ret != MBEDTLS_ERR_SSL_WANT_WRITE)
+          {
+            printf("[httpsget] *** 请求发送失败: -0x%04x ***\n", -ret);
+            goto out;
+          }
+      }
+  }
+
+  ort_sha256_init(&ctx);
+
+  {
+    uint32_t h4   = 0;            /* 4 字节移位寄存器：扫 "\r\n\r\n" */
+    char     stbuf[48];
+    size_t   stlen = 0;
+    bool     stline_done = false;
+
+    for (;;)
+      {
+        ret = mbedtls_ssl_read(&ssl, (FAR unsigned char *)rbuf, sizeof(rbuf));
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+            ret == MBEDTLS_ERR_SSL_WANT_WRITE)
+          {
+            continue;
+          }
+
+        if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || ret == 0)
+          {
+            break;                 /* close_notify / EOF = 正常收尾 */
+          }
+
+        if (ret < 0)
+          {
+            printf("[httpsget] *** 读取失败: -0x%04x ***\n", -ret);
+            goto out;
+          }
+
+        {
+          size_t n = (size_t)ret;
+          size_t i = 0;
+
+          while (i < n)
+            {
+              char c = rbuf[i++];
+
+              if (!hdr_done)
+                {
+                  /* 首行收集（状态行；到 \n 为止） */
+
+                  if (!stline_done)
+                    {
+                      if (c != '\n' && stlen < sizeof(stbuf) - 1)
+                        {
+                          stbuf[stlen++] = c;
+                        }
+                      else
+                        {
+                          FAR const char *sp;
+
+                          stbuf[stlen] = '\0';
+                          sp = strchr(stbuf, ' ');
+                          if (sp != NULL)
+                            {
+                              status = atoi(sp + 1);
+                            }
+
+                          stline_done = true;
+                        }
+                    }
+
+                  h4 = (h4 << 8) | (unsigned char)c;
+                  if (h4 == 0x0d0a0d0au)
+                    {
+                      hdr_done = true;   /* 头结束：其后都是体 */
+                      break;             /* i 已越过结尾 \n */
+                    }
+                }
+              else
+                {
+                  i--;                   /* 归位：整块余下都是体 */
+                  break;
+                }
+            }
+
+          if (hdr_done && i < n)
+            {
+              ort_sha256_update(&ctx, rbuf + i, n - i);
+              total += n - i;
+            }
+        }
+      }
+  }
+
+  ort_sha256_final(&ctx, raw);
+  ort_sha256_hex(raw, hex);
+
+  printf("[httpsget] → %d（体 %zu 字节）\n", status, total);
+  if (status == 200 && total > 0)
+    {
+      printf("[httpsget] body sha256=%s\n", hex);
+    }
+
+  ret = 0;
+
+out:
+  mbedtls_ssl_close_notify(&ssl);
+  mbedtls_net_free(&srv);
+  mbedtls_ssl_free(&ssl);
+  mbedtls_ssl_config_free(&conf);
+  mbedtls_ctr_drbg_free(&drbg);
+  mbedtls_entropy_free(&entropy);
+  return ret == 0 ? 0 : 2;
+}
+
 int main(int argc, FAR char *argv[])
 {
 
@@ -2921,6 +3164,15 @@ int main(int argc, FAR char *argv[])
   if (argc >= 3 && strcmp(argv[1], "validate") == 0)
     {
       int r = do_validate(argv[2]);
+      free(g_buf);
+      return r;
+    }
+
+  if (argc >= 5 && strcmp(argv[1], "httpsget") == 0)
+    {
+      /* httpsget <host> <port> <path> —— TLS 客户端（§91） */
+      int r = do_httpsget(argv[2], (unsigned)atoi(argv[3]), argv[4]);
+
       free(g_buf);
       return r;
     }
