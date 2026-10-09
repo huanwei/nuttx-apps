@@ -2764,6 +2764,28 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
   return 0;
 }
 
+/* [ORT §92] 证书验证 flags：回调里记下（错 CA / 未生效 / 过期可
+ * 判别——负臂判据的关键细节；mbedtls 默认把 X509 细节吞成一句
+ * "verification failed"）。 */
+
+#define ORT_TLS_CA_MAX 4096
+static char     g_tls_ca_buf[ORT_TLS_CA_MAX];
+static uint32_t g_tls_verify_flags;
+
+static int httpsget_verify_cb(FAR void *data,
+                              FAR mbedtls_x509_crt *crt, int depth,
+                              uint32_t *flags)
+{
+  (void)data;
+  (void)crt;
+  (void)depth;
+
+  g_tls_verify_flags |= *flags;  /* ★ OR 累积：回调按证书逐个调用，
+                                  * 直接赋值会被后一次的 0 覆盖
+                                  * （rogue-CA 臂实测踩过） */
+  return 0;                      /* 让 mbedtls 按 flags 决断 */
+}
+
 /****************************************************************************
  * [ORT §91] httpsget <host> <port> <path> —— TLS 客户端（mbedTLS）
  *
@@ -2778,7 +2800,7 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
  ****************************************************************************/
 
 static int do_httpsget(FAR const char *host, unsigned port,
-                       FAR const char *path)
+                       FAR const char *path, FAR const char *capath)
 {
   /* ★ 全部静态：目标机 app 栈 ~2KB，TLS 上下文放栈上必炸 */
 
@@ -2787,6 +2809,7 @@ static int do_httpsget(FAR const char *host, unsigned port,
   static mbedtls_entropy_context  entropy;
   static mbedtls_ctr_drbg_context drbg;
   static mbedtls_net_context      srv;
+  static mbedtls_x509_crt         ca;
   static char rbuf[1024];
   char portstr[8];
   char req[512];
@@ -2803,6 +2826,7 @@ static int do_httpsget(FAR const char *host, unsigned port,
   mbedtls_entropy_init(&entropy);
   mbedtls_ctr_drbg_init(&drbg);
   mbedtls_net_init(&srv);
+  mbedtls_x509_crt_init(&ca);
 
   snprintf(portstr, sizeof(portstr), "%u", port);
 
@@ -2831,8 +2855,45 @@ static int do_httpsget(FAR const char *host, unsigned port,
     }
 
   mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
-  mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);   /* 边界注 */
   mbedtls_ssl_conf_min_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
+
+  /* [ORT §92] 给了 CA 路径 ⇒ 正验：VERIFY_REQUIRED + CA 链 + 回调记
+   * flags；没给 ⇒ 维持 §91 的 VERIFY_NONE（过渡臂，如实标注）。 */
+
+  if (capath != NULL)
+    {
+      FAR FILE *cf = fopen(capath, "rb");
+      size_t    n;
+
+      if (cf == NULL)
+        {
+          printf("[httpsget] *** 打不开 CA 文件: %s（errno=%d）***\n",
+                 capath, errno);
+          ret = -1;
+          goto out;
+        }
+
+      n = fread(g_tls_ca_buf, 1, sizeof(g_tls_ca_buf) - 1, cf);
+      fclose(cf);
+      g_tls_ca_buf[n] = '\0';
+
+      ret = mbedtls_x509_crt_parse(&ca,
+                                   (FAR const unsigned char *)g_tls_ca_buf,
+                                   n + 1);
+      if (ret != 0)
+        {
+          printf("[httpsget] *** CA 解析失败: -0x%04x ***\n", -ret);
+          goto out;
+        }
+
+      mbedtls_ssl_conf_ca_chain(&conf, &ca, NULL);
+      mbedtls_ssl_conf_verify(&conf, httpsget_verify_cb, NULL);
+      mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    }
+  else
+    {
+      mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    }
 
   ret = mbedtls_ssl_setup(&ssl, &conf);
   if (ret != 0)
@@ -2843,6 +2904,8 @@ static int do_httpsget(FAR const char *host, unsigned port,
 
   mbedtls_ssl_set_hostname(&ssl, host);
   mbedtls_ssl_set_bio(&ssl, &srv, mbedtls_net_send, mbedtls_net_recv, NULL);
+
+  g_tls_verify_flags = 0;        /* 握手前清零（配合回调的 OR） */
 
   for (;;)
     {
@@ -2858,13 +2921,28 @@ static int do_httpsget(FAR const char *host, unsigned port,
           char ebuf[96];
 
           mbedtls_strerror(ret, ebuf, sizeof(ebuf));
-          printf("[httpsget] *** 握手失败: -0x%04x（%s）***\n", -ret, ebuf);
+
+          if (capath != NULL && ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED)
+            {
+              printf("[httpsget] *** 认证失败: -0x%04x（flags=0x%02x %s）***\n",
+                     -ret, (unsigned)g_tls_verify_flags, ebuf);
+            }
+          else
+            {
+              printf("[httpsget] *** 握手失败: -0x%04x（%s）***\n",
+                     -ret, ebuf);
+            }
+
           goto out;
         }
     }
 
   printf("[httpsget] TLS 握手完成: %s / %s\n",
          mbedtls_ssl_get_version(&ssl), mbedtls_ssl_get_ciphersuite(&ssl));
+  if (capath != NULL)
+    {
+      printf("[httpsget] 认证: OK（CA 链校验通过）\n");
+    }
 
   snprintf(req, sizeof(req),
            "GET %s HTTP/1.0\r\n"
@@ -2989,6 +3067,7 @@ static int do_httpsget(FAR const char *host, unsigned port,
 
 out:
   mbedtls_ssl_close_notify(&ssl);
+  mbedtls_x509_crt_free(&ca);
   mbedtls_net_free(&srv);
   mbedtls_ssl_free(&ssl);
   mbedtls_ssl_config_free(&conf);
@@ -3171,10 +3250,31 @@ int main(int argc, FAR char *argv[])
   if (argc >= 5 && strcmp(argv[1], "httpsget") == 0)
     {
       /* httpsget <host> <port> <path> —— TLS 客户端（§91） */
-      int r = do_httpsget(argv[2], (unsigned)atoi(argv[3]), argv[4]);
+      int r = do_httpsget(argv[2], (unsigned)atoi(argv[3]), argv[4],
+                          argc >= 6 ? argv[5] : NULL);
 
       free(g_buf);
       return r;
+    }
+
+  if (argc >= 3 && strcmp(argv[1], "settime") == 0)
+    {
+      /* [ORT §92] settime <epoch 秒> —— 对时（nsh 的 date 被裁；
+       * 证书有效期校验要有有效时钟才活着）。 */
+
+      struct timespec ts;
+
+      ts.tv_sec  = (time_t)atoll(argv[2]);
+      ts.tv_nsec = 0;
+
+      {
+        int r = clock_settime(CLOCK_REALTIME, &ts);
+
+        printf("[settime] 时钟 → %lld（clock_settime=%d）\n",
+               (long long)ts.tv_sec, r);
+        free(g_buf);
+        return r == 0 ? 0 : 2;
+      }
     }
 
   if (argc >= 5 && strcmp(argv[1], "httpget") == 0)
