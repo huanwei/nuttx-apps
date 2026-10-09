@@ -9,11 +9,11 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-09 ORT（§90 A1 客户端硬化 —— ort_http chunked
-#               解码/重定向跟随（跨主机剥凭据）/大响应 fail-closed；
-#               注册表替身 §90 端点与 repo 模式；nx_bringup 永久诊断
-#               （当场破了三次"首启偶发"= cwd 错误）。内核 ea97bb611b）。
+# 最近配对事件：2026-10-09 ORT（§91 TLS 起步 —— mbedTLS 3.6.2 集成、
+#               orting httpsget（TLSv1.3 握手 + 体摘要逐字节 + 明文
+#               端口 fail-closed）；A 配置补 DEV_URANDOM（熵源链）；
+#               顺带 arm_undefinedinsn 隐式声明清零。内核 8834bd6891）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=ea97bb611b3e35e9613beefca29e254294cfb6b6
+nuttx=8834bd689146880b8e520fec28c95f60882cb97c
