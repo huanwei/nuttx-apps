@@ -84,6 +84,8 @@
 #include <errno.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
 #include <spawn.h>
 #include <nuttx/sched.h>
 
@@ -1479,6 +1481,197 @@ static void active_sig_handler(int signo)
 {
   (void)signo;
   priv_self()[PRIV_ACTIVE] = (uint32_t)getpid();
+}
+
+/****************************************************************************
+ * [ORT §88] 容器 root（chroot 族）自测 —— 双臂探针
+ *   probe：root 自报 / "/marker.txt" 读 / "/dev/console" 逃逸 stat，
+ *          三项全对才退 0；两臂**不同形**才说明探针有分辨力。
+ *   driver：建 tmpfs 根 → 先派生未 root 对照臂 → 对自己设根（设根者
+ *          自身不重挂，作用面是派生方向）→ 派生 rooted 臂 → 判 PASS。
+ ****************************************************************************/
+
+static int ort_chroot_probe(int argc, FAR char *argv[])
+{
+  /* ★ 锚点词扫 argv，**不按固定下标**：task_create 的内核会把程序名插到
+   *   argv[0]（全体右移一位，见 ort_container_main 的同款说明），
+   *   posix_spawn 路径则不移 —— 两种形态都要能读对。 */
+
+  bool expect_rooted = false;
+  FAR const char *rootpath = "";
+  int k;
+
+  char rb[64];
+  char content[32] = "";
+  struct stat st;
+  int  rr;
+  int  ok_root;
+  int  ok_mark;
+  int  ok_esc;
+  FAR FILE *f;
+
+  for (k = 0; k < argc; k++)
+    {
+      if (argv[k] != NULL && strcmp(argv[k], "chroot-probe") == 0)
+        {
+          break;
+        }
+    }
+
+  expect_rooted = (k + 1 < argc && argv[k + 1] != NULL &&
+                   strcmp(argv[k + 1], "rooted") == 0);
+  rootpath = (k + 2 < argc && argv[k + 2] != NULL) ? argv[k + 2] : "";
+
+  rr = prctl(PR_GET_ORT_ROOT, rb, sizeof(rb));
+  ok_root = expect_rooted ? (rr > 0 && strcmp(rb, rootpath) == 0)
+                          : (rr == -ENOENT);
+
+  f = fopen("/marker.txt", "r");
+  if (f != NULL)
+    {
+      size_t n = fread(content, 1, sizeof(content) - 1, f);
+      content[n] = '\0';
+      while (n > 0 && (content[n - 1] == '\n' || content[n - 1] == '\r'))
+        {
+          content[--n] = '\0';
+        }
+
+      fclose(f);
+    }
+
+  ok_mark = expect_rooted ? (strcmp(content, "rooted-ok") == 0)
+                          : (f == NULL);
+
+  ok_esc = expect_rooted ? (stat("/dev/console", &st) != 0)
+                         : (stat("/dev/console", &st) == 0);
+
+  printf("[chroot] probe(%s): root=%s marker=%s escape=%s\n",
+         expect_rooted ? "rooted" : "unrooted",
+         ok_root ? "OK" : "BAD",
+         ok_mark ? "OK" : "BAD",
+         ok_esc  ? "OK" : "BAD");
+
+  return (ok_root && ok_mark && ok_esc) ? 0 : 1;
+}
+
+#ifndef CONFIG_BUILD_KERNEL
+/* M 侧 task_create 要**函数入口**（容器与监督者同镜像），薄壳转探针本体。 */
+
+static int ort_chroot_probe_entry(int argc, FAR char *argv[])
+{
+  return ort_chroot_probe(argc, argv);
+}
+#endif
+
+static int ort_chroot_driver(void)
+{
+  FAR char *cargv[5];
+  pid_t ctl_pid = -1;
+  pid_t rtd_pid = -1;
+  int ctl_st = 1;
+  int rtd_st = 1;
+  int ret;
+
+  /* 建根：tmpfs 挂到 /rt（用户态 mount 两 SKU 都实测可用） */
+
+  mkdir("/rt", 0777);
+  ret = mount(NULL, "/rt", "tmpfs", 0, NULL);
+  if (ret != 0)
+    {
+      printf("[chroot] *** 挂 tmpfs 失败: %d（errno=%d）***\n", ret, errno);
+      return 1;
+    }
+
+  {
+    FAR FILE *f = fopen("/rt/marker.txt", "w");
+
+    if (f == NULL)
+      {
+        printf("[chroot] *** 写 marker 失败（errno=%d）***\n", errno);
+        return 1;
+      }
+
+    fputs("rooted-ok\n", f);
+    fclose(f);
+  }
+
+  cargv[0] = (FAR char *)"ortsup";
+  cargv[1] = (FAR char *)"chroot-probe";
+  cargv[4] = NULL;
+
+  /* 对照臂：root 未设时派生（子组不继承根） */
+
+  cargv[2] = (FAR char *)"unrooted";
+  cargv[3] = (FAR char *)"/rt";
+
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&ctl_pid, "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0)
+    {
+      printf("[chroot] *** 对照臂 spawn 失败: %d ***\n", ret);
+      return 1;
+    }
+#else
+  ctl_pid = task_create("chroot-ctl", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_chroot_probe_entry, cargv);
+  if (ctl_pid < 0)
+    {
+      printf("[chroot] *** 对照臂 task_create 失败: %d ***\n", (int)ctl_pid);
+      return 1;
+    }
+#endif
+
+  /* 设根（本进程自己不重挂）→ rooted 臂 */
+
+  ret = prctl(PR_SET_ORT_ROOT, "/rt");
+  if (ret != 0)
+    {
+      printf("[chroot] *** 设根失败: %d（errno=%d）***\n", ret, errno);
+      return 1;
+    }
+
+  cargv[2] = (FAR char *)"rooted";
+
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&rtd_pid, "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0)
+    {
+      printf("[chroot] *** rooted 臂 spawn 失败: %d ***\n", ret);
+      return 1;
+    }
+#else
+  rtd_pid = task_create("chroot-rooted", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_chroot_probe_entry, cargv);
+  if (rtd_pid < 0)
+    {
+      printf("[chroot] *** rooted 臂 task_create 失败: %d ***\n",
+             (int)rtd_pid);
+      return 1;
+    }
+#endif
+
+  {
+    int r1 = waitpid(ctl_pid, &ctl_st, 0);
+    int r2 = waitpid(rtd_pid, &rtd_st, 0);
+
+    printf("[chroot] raw: ctl(ret=%d st=0x%x) rooted(ret=%d st=0x%x)\n",
+           r1, (unsigned)ctl_st, r2, (unsigned)rtd_st);
+  }
+
+  {
+    int ctl_ok = (WIFEXITED(ctl_st) && WEXITSTATUS(ctl_st) == 0);
+    int rtd_ok = (WIFEXITED(rtd_st) && WEXITSTATUS(rtd_st) == 0);
+
+    printf("[chroot] ctl=%s rooted=%s\n",
+           ctl_ok ? "PASS" : "FAIL", rtd_ok ? "PASS" : "FAIL");
+
+    {
+      int pass = ctl_ok && rtd_ok;
+
+      printf("CHROOT RESULT: %s\n", pass ? "PASS" : "FAIL");
+      return pass ? 0 : 1;
+    }
+  }
 }
 
 static int ort_container_main(int argc, FAR char *argv[])
@@ -3130,6 +3323,30 @@ int main(int argc, FAR char *argv[])
    *   本任务（NSH 内建或独立运行）没有、也不会有监督者来绑域 ——
    *   判据 = 在**指定时间内**返回 -ETIMEDOUT，且期间 CPU 不空转
    *   （内核信号量等待）。 */
+
+  /* [ORT §88] 容器 root（chroot 族）自测 —— 双臂探针：
+   *
+   *   `ortsup chroot`       驱动器：建 tmpfs 根 /rt + 写 marker，
+   *                         **先**派生未 root 的对照臂子进程，再对
+   *                         自己设根（设根者自身不重挂）派生 rooted
+   *                         臂；看两臂退出码判 PASS/FAIL。
+   *   `ortsup chroot-probe <rooted|unrooted> <rootpath>`
+   *                         子探针：root 自报 / "/marker.txt" 读 /
+   *                         "/dev/console" 逃逸 stat —— 三项全对
+   *                         才退 0。两臂**不同形**才说明探针有分辨力。
+   *
+   *   为什么是"驱动器 + 子进程"而不是单进程自测：root 的作用面是
+   *   **派生方向**（设根者自己不重挂，见 §86 语义）——同组自测测不到。 */
+
+  if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "chroot-probe") == 0)
+    {
+      return ort_chroot_probe(argc, argv);
+    }
+
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "chroot") == 0)
+    {
+      return ort_chroot_driver();
+    }
 
   if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "waitadm") == 0)
     {
