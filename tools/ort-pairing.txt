@@ -9,12 +9,12 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-09 ORT（§88 容器 root 放开到 M（chroot 族）
-#               —— 去 BUILD_KERNEL 守卫、传播点收敛到 nxtask_init；
-#               M 配置补 SCHED_HAVE_PARENT+CHILD_STATUS（waitpid 语义
-#               与 A 对齐）；apps 侧 ortsup chroot 双臂自测装置。
-#               三 SKU 同命令同结果。内核 37940e858e）。
+# 最近配对事件：2026-10-09 ORT（§89 信号面隔离放开到 M —— 容器标记
+#               扩展为"设根或绑域"（A 设根 / M CG 绑域）；M run5 标准
+#               场景逐字同形（监督链全走内核通道）；apps 侧 ortsup
+#               sigprobe 三臂 + /rt 幂等就绪。信号面三 SKU 收口。
+#               内核 3798a3f9c7）。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=37940e858ee53d3a6241f2474d489dc165d724f4
+nuttx=3798a3f9c7681034c2349ce6b7ec4d2b8fe7bb80
