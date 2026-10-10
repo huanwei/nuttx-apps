@@ -9,14 +9,12 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-10 ORT（§96 **链接跟随（解析）+ pid 面闸（调度面）**
-#               —— VFS 咽喉重驱动 + FS resolve op（真 alpine 335 条绝对
-#               applet 链接上经链接起容器读回真数据）；ort_sig_gate 复用
-#               到 4 个调度入口（跨组 EPERM）；NAME_MAX 32→128（readdir
-#               静默截断长名——alpine keys 51 字符让 lsroot"走不完"）。
-#               内核 8ce7ff60e6。apps 侧 §96 = map_path_resolved 视图
-#               解链 + schedprobe + 夹具三件。）
+# 最近配对事件：2026-10-10 ORT（§97 **持久存储** —— virtio-blk + FAT：
+#               OCI 内容（层体+配置）跨重启存活；存储根自动探测 + 已在库
+#               快检；**第 9 处本地修复**：上游 bc9e1ffb01 的 SFN 回退
+#               漏失败路径（≤11 字符小写名建出全空格无名条目）。
+#               内核 58d656f053。apps 侧 §97 = 存储根/快检/⑧⑦次序。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=8ce7ff60e6a3ef47aade4d83879401a58c52c063
+nuttx=58d656f0536f546a831abf906594756925c4b2c3
