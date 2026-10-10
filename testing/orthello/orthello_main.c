@@ -335,17 +335,26 @@ int main(int argc, FAR char *argv[])
        * CPU-locked 特殊任务，施加面本身就会 EINVAL（第一版踩过，
        * 对照臂假 ERR）。 */
 
-      if (sched_getaffinity(getppid(), sizeof(set), &set) == 0)
-        {
-          ra = sched_setaffinity(getppid(), sizeof(set), &set);
-          ea = errno;
-        }
+      /* [§98] 跨组目标：容器臂用 ORT_SUP_PID 注入的**全局**监督者号
+       * （getppid 在容器内已按 pid 视图返回 0=自指的坑，§98 踩过）；
+       * 对照臂（nsh 直 exec）无注入 → getppid()=nsh（普通任务）✓。 */
 
-      if (sched_getparam(getppid(), &sp) == 0)
-        {
-          rp2 = sched_setparam(getppid(), &sp);
-          ep2 = errno;
-        }
+      {
+        FAR const char *sup = getenv("ORT_SUP_PID");
+        pid_t tgt = sup != NULL ? (pid_t)atoi(sup) : getppid();
+
+        if (sched_getaffinity(tgt, sizeof(set), &set) == 0)
+          {
+            ra = sched_setaffinity(tgt, sizeof(set), &set);
+            ea = errno;
+          }
+
+        if (sched_getparam(tgt, &sp) == 0)
+          {
+            rp2 = sched_setparam(tgt, &sp);
+            ep2 = errno;
+          }
+      }
 
       if (sched_getaffinity(getpid(), sizeof(set), &set) == 0)
         {
@@ -357,6 +366,27 @@ int main(int argc, FAR char *argv[])
              ra == 0 ? "OK" : (ra < 0 && ea == EPERM ? "EPERM" : "ERR"),
              rp2 == 0 ? "OK" : (rp2 < 0 && ep2 == EPERM ? "EPERM" : "ERR"),
              rsf == 0 ? "OK" : (rsf < 0 && esf == EPERM ? "EPERM" : "ERR"));
+    }
+
+
+  else if (argc >= 3 && strcmp(argv[2], "pidprobe") == 0)
+    {
+      /* §98 pid 视图第一刀（自省面）：容器内 getpid/getppid 应为
+       * **本地号**（entrypoint=1；父在命名空间外 ⇒ 0）；kill(1,0)
+       * 按**本地号优先**解析（= 本地 1 = 自己）应 OK。对照臂（nsh
+       * 直 exec）全全局语义（me/pp 都是全局号；kill(1,0)=真 init）。 */
+
+      pid_t me = getpid();
+      pid_t pp = getppid();
+      int k1 = kill(1, 0);
+      int e1 = errno;
+      int ks = kill(me, 0);
+      int es = errno;
+
+      printf("ORTHELLO: pidprobe me=%d pp=%d k1=%s kself=%s\n",
+             (int)me, (int)pp,
+             k1 == 0 ? "OK" : (k1 < 0 && e1 == EPERM ? "EPERM" : "ERR"),
+             ks == 0 ? "OK" : (ks < 0 && es == EPERM ? "EPERM" : "ERR"));
     }
 
   return 0;
