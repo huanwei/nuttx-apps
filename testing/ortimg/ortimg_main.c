@@ -98,7 +98,7 @@ static int read_file(FAR const char *path, FAR size_t *out_len)
 
   if (f == NULL)
     {
-      printf("[ortimg] 打不开 %s\n", path);
+      printf("[ortimg] 打不开 %s（errno=%d）\n", path, errno);
       return -1;
     }
 
@@ -166,7 +166,7 @@ static int do_sha(FAR const char *path)
 
   if (f == NULL)
     {
-      printf("[ortimg] 打不开 %s\n", path);
+      printf("[ortimg] 打不开 %s（errno=%d）\n", path, errno);
       return 2;
     }
 
@@ -650,7 +650,10 @@ static int lsroot_walk(FAR FILE *out, FAR const char *full, FAR const char *rel,
             snprintf(rel2, sizeof(g_prel[0]), "%s", best);
           }
 
-        if (stat(full2, &st) != 0)
+        /* [§96①] 用 lstat：链接行要**链接本身**的信息（stat 现在
+         * 会跟随 —— 用 stat 会把链接行变成目标文件行，清单语义塌） */
+
+        if (lstat(full2, &st) != 0)
           {
             return -1;
           }
@@ -854,6 +857,73 @@ static int map_path(FAR const char *view, FAR const char *in,
   return 0;
 }
 
+/* [ORT §96①] exec 路径的**视图内链接解链**（§86 映射的补全）：
+ * spawn 的二进制加载发生在**未设根的监督者上下文** —— 视图路径里的
+ * 链接若带绝对目标（真镜像 /bin/* 全如此），内核跟随会按全局根解析
+ * 而出界。这里在视图坐标系里手动解链：绝对目标映射到 view 之下、
+ * 相对目标按链接所在目录拼；链长以 8 为界。**不做 ".." 文本归一** ——
+ * 真镜像的 applet 链接全是不带 ".." 的绝对目标（如实边界；内核侧
+ * 的 resolve 才是通用解）。解链失败/不是链接都交 spawn 原样报错。 */
+
+static int map_path_resolved(FAR const char *view, FAR const char *entry,
+                             FAR char *out, size_t cap)
+{
+  static char rbuf[256];
+  static char nbuf[ORT_RUN_MAP_MAX];
+  int hops;
+
+  if (map_path(view, entry, out, cap) != 0)
+    {
+      return -1;
+    }
+
+  for (hops = 0; hops < 8; hops++)
+    {
+      ssize_t n = readlink(out, rbuf, sizeof(rbuf) - 1);
+
+      if (n < 0)
+        {
+          return 0;                     /* 不是链接（或不存在） */
+        }
+
+      rbuf[n] = '\0';
+
+      if (rbuf[0] == '/')
+        {
+          if (map_path(view, rbuf, nbuf, sizeof(nbuf)) != 0)
+            {
+              return -1;
+            }
+
+          strlcpy(out, nbuf, cap);
+        }
+      else
+        {
+          FAR char *slash = strrchr(out, '/');
+          int m2;
+
+          if (slash != NULL)
+            {
+              m2 = snprintf(nbuf, sizeof(nbuf), "%.*s/%s",
+                            (int)(slash - out), out, rbuf);
+            }
+          else
+            {
+              m2 = snprintf(nbuf, sizeof(nbuf), "%s", rbuf);
+            }
+
+          if (m2 < 0 || m2 >= (int)sizeof(nbuf))
+            {
+              return -1;
+            }
+
+          strlcpy(out, nbuf, cap);
+        }
+    }
+
+  return 0;   /* 链太长：交给 spawn 报错（fail-closed） */
+}
+
 /* run 的"派生半"：视图先验 → 配置解析 → argv/环境/工作目录 → spawn。
  * do_run（wait + 报退出码）与 do_sup（绑域 + 抽事件队列 + 判别）共用
  * —— §74 拆分，行为不变。§80 起带 attr 变体（lim 用：优先级经
@@ -919,8 +989,8 @@ static int run_spawn_ex(FAR const char *view, FAR const char *path,
 
   g_argv[na] = NULL;
 
-  if (map_path(view, g_cfg.entrypoint[0], g_spawnpath,
-               sizeof(g_spawnpath)) != 0)
+  if (map_path_resolved(view, g_cfg.entrypoint[0], g_spawnpath,
+                        sizeof(g_spawnpath)) != 0)
     {
       printf("[run] exec 路径映射超界（entrypoint[0]）\n");
       return 1;

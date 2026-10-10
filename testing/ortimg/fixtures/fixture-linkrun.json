@@ -1,0 +1,9 @@
+{
+  "architecture": "arm",
+  "os": "linux",
+  "config": {
+    "Entrypoint": ["/bin/ortlink"],
+    "Cmd": ["/etc/hello.txt"],
+    "WorkingDir": "/tmp/ort/wd"
+  }
+}

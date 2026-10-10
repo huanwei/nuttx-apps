@@ -1,0 +1,9 @@
+{
+  "architecture": "arm",
+  "os": "linux",
+  "config": {
+    "Entrypoint": ["/bin/alpine-link"],
+    "Cmd": ["/etc/alpine-release"],
+    "WorkingDir": "/tmp/ort/wd"
+  }
+}

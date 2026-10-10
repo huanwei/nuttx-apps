@@ -315,5 +315,49 @@ int main(int argc, FAR char *argv[])
     }
 #endif
 
+  else if (argc >= 3 && strcmp(argv[2], "schedprobe") == 0)
+    {
+      /* §96③ pid 面隔离探针：调度面两条**回写原值**的定向探针
+       * （即便闸漏了也不改变局面 —— 零副作用）：
+       *   aff1：sched_setaffinity(1, 读回的当前核集) —— 跨组应 EPERM
+       *   par1：sched_setparam(1, 读回的当前优先级)   —— 跨组应 EPERM
+       *   self：sched_setaffinity(getpid(), 读回核集) —— 正臂应 OK
+       * 判据 = 两臂不同形：容器（rooted）⇒ aff1/par1 EPERM；
+       * 未 root（nsh 直 exec 对照臂）⇒ 全 OK（施加面确实在别处可用，
+       * 闸才有分辨力）。权限判定读 errno —— 每次调用后立刻取。 */
+
+      cpu_set_t set;
+      struct sched_param sp;
+      int ra = -1, ea = 0, rp2 = -1, ep2 = 0, rsf = -1, esf = 0;
+
+      /* 跨组目标 = getppid()：容器臂里是 orting（监督者，别组）；
+       * 对照臂里是 nsh（普通任务）。**不用 pid 1** —— init 是
+       * CPU-locked 特殊任务，施加面本身就会 EINVAL（第一版踩过，
+       * 对照臂假 ERR）。 */
+
+      if (sched_getaffinity(getppid(), sizeof(set), &set) == 0)
+        {
+          ra = sched_setaffinity(getppid(), sizeof(set), &set);
+          ea = errno;
+        }
+
+      if (sched_getparam(getppid(), &sp) == 0)
+        {
+          rp2 = sched_setparam(getppid(), &sp);
+          ep2 = errno;
+        }
+
+      if (sched_getaffinity(getpid(), sizeof(set), &set) == 0)
+        {
+          rsf = sched_setaffinity(getpid(), sizeof(set), &set);
+          esf = errno;
+        }
+
+      printf("ORTHELLO: schedprobe affp=%s parp=%s self=%s\n",
+             ra == 0 ? "OK" : (ra < 0 && ea == EPERM ? "EPERM" : "ERR"),
+             rp2 == 0 ? "OK" : (rp2 < 0 && ep2 == EPERM ? "EPERM" : "ERR"),
+             rsf == 0 ? "OK" : (rsf < 0 && esf == EPERM ? "EPERM" : "ERR"));
+    }
+
   return 0;
 }
