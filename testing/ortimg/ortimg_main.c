@@ -664,6 +664,25 @@ static int lsroot_walk(FAR FILE *out, FAR const char *full, FAR const char *rel,
                 return rr;
               }
           }
+        else if (S_ISLNK(st.st_mode))
+          {
+            /* [ORT §95] 链接行：`<路径> -> <目标>`（与宿主参考脚本
+             * ort-rootfs-ref.py 的 walk 逐字同形；不哈希内容 ——
+             * 链接没有"内容"，目标是它的全部）。跟随（解析）不在
+             * 本轮范围，如实见手册 §95。 */
+
+            char lbuf[256];
+            ssize_t ln = readlink(full2, lbuf, sizeof(lbuf) - 1);
+
+            if (ln < 0)
+              {
+                return -1;
+              }
+
+            lbuf[ln] = '\0';
+            fprintf(out, "%s -> %s\n", rel2, lbuf);
+            (*nfiles)++;
+          }
         else
           {
             if (file_hash_print(out, full2, rel2) != 0)
@@ -2958,6 +2977,7 @@ static int do_httpsget(FAR const char *host, unsigned port,
   size_t  total = 0;
   int     status = 0;
   int     hdr_done = 0;         /* 头已结束（其后都是体） */
+  int     retries = 0;          /* [§95] 握手记录层错重试一次 */
   int     ret;
 
   mbedtls_ssl_init(&ssl);
@@ -3058,20 +3078,48 @@ static int do_httpsget(FAR const char *host, unsigned port,
       if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
           ret != MBEDTLS_ERR_SSL_WANT_WRITE)
         {
-          char ebuf[96];
+          /* ★ [§95] 记录层错重试一次（链路抖动容忍，与 ort_http 侧
+           * 同一策略）：快速重连同 host:port 偶发首 flight 乱字节
+           * ⇒ -0x7200。重试在验证之前；验证类错误不重试。 */
 
-          mbedtls_strerror(ret, ebuf, sizeof(ebuf));
+          if (ret == MBEDTLS_ERR_SSL_INVALID_RECORD && retries == 0)
+            {
+              retries++;
 
-          if (capath != NULL && ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED)
-            {
-              printf("[httpsget] *** 认证失败: -0x%04x（flags=0x%02x %s）***\n",
-                     -ret, (unsigned)g_tls_verify_flags, ebuf);
+              mbedtls_net_free(&srv);
+              mbedtls_net_init(&srv);
+              mbedtls_ssl_session_reset(&ssl);
+
+              if (mbedtls_net_connect(&srv, host, portstr,
+                                      MBEDTLS_NET_PROTO_TCP) == 0 &&
+                  mbedtls_ssl_set_hostname(&ssl, host) == 0)
+                {
+                  mbedtls_ssl_set_bio(&ssl, &srv, mbedtls_net_send,
+                                      mbedtls_net_recv, NULL);
+                  continue;      /* 重打一轮握手 */
+                }
+
+              goto out;
             }
-          else
-            {
-              printf("[httpsget] *** 握手失败: -0x%04x（%s）***\n",
-                     -ret, ebuf);
-            }
+
+          {
+            char ebuf[96];
+
+            mbedtls_strerror(ret, ebuf, sizeof(ebuf));
+
+            if (capath != NULL &&
+                ret == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED)
+              {
+                printf("[httpsget] *** 认证失败: -0x%04x"
+                       "（flags=0x%02x %s）***\n",
+                       -ret, (unsigned)g_tls_verify_flags, ebuf);
+              }
+            else
+              {
+                printf("[httpsget] *** 握手失败: -0x%04x（%s）***\n",
+                       -ret, ebuf);
+              }
+          }
 
           goto out;
         }
@@ -3315,6 +3363,48 @@ int main(int argc, FAR char *argv[])
 
       free(g_buf);
       return r;
+    }
+
+  if (argc >= 4 && strcmp(argv[1], "symlink") == 0)
+    {
+      /* [ORT §95] symlink <target> <path> —— 建链接探针（挂载点内容
+       * 路由的另一半；经视图创建应 fail-closed，作定向负臂） */
+
+      int sr = symlink(argv[2], argv[3]);
+
+      free(g_buf);
+
+      if (sr != 0)
+        {
+          printf("[ortimg] symlink %s -> %s: 失败（errno=%d）\n",
+                 argv[3], argv[2], errno);
+          return 1;
+        }
+
+      printf("[ortimg] symlink %s -> %s: OK\n", argv[3], argv[2]);
+      return 0;
+    }
+
+  if (argc >= 3 && strcmp(argv[1], "readlink") == 0)
+    {
+      /* [ORT §95] readlink <path> —— 读符号链接目标（挂载点内容路由
+       * 的定向探针：经视图/经挂载各打一发，与 lsroot 行互为见证）。 */
+
+      char lbuf[256];
+      ssize_t ln = readlink(argv[2], lbuf, sizeof(lbuf) - 1);
+
+      free(g_buf);
+
+      if (ln < 0)
+        {
+          printf("[ortimg] readlink %s: 不是链接或失败（errno=%d）\n",
+                 argv[2], errno);
+          return 1;
+        }
+
+      lbuf[ln] = '\0';
+      printf("[ortimg] readlink %s -> %s\n", argv[2], lbuf);
+      return 0;
     }
 
   if (argc >= 3 && strcmp(argv[1], "manifest") == 0)

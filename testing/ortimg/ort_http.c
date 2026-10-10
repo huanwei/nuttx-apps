@@ -340,21 +340,55 @@ static int http_open(FAR const char *host, unsigned port,
       mbedtls_ssl_set_bio(&g_conn.ssl, &g_conn.net, mbedtls_net_send,
                           mbedtls_net_recv, NULL);
 
-      for (;;)
-        {
-          ret = mbedtls_ssl_handshake(&g_conn.ssl);
-          if (ret == 0)
-            {
-              break;
-            }
+      /* ★ [§95] 握手重试一次（链路抖动容忍；与明文路径的 3×2s 连接
+       * 重试同级）：**快速重连同 host:port** 偶发在首个 flight 收到
+       * 乱字节 ⇒ -0x7200（SSL invalid record；NuttX TCP 连接池
+       * TIME_WAIT 早回收 × slirp 时序的组合，未见更深根因 —— 手册
+       * §95 如实）。重试在**证书验证之前**发生，安全语义不变；
+       * 验证类/协议类错误（-0x2700/-0x2180/…）一律不重试。 */
 
-          if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
-              ret != MBEDTLS_ERR_SSL_WANT_WRITE)
-            {
-              hx_close();
-              return ret;          /* mbedtls 负码可读 */
-            }
-        }
+      {
+        int hretries = 0;
+
+retry_handshake:
+        for (;;)
+          {
+            ret = mbedtls_ssl_handshake(&g_conn.ssl);
+            if (ret == 0)
+              {
+                break;
+              }
+
+            if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+                ret != MBEDTLS_ERR_SSL_WANT_WRITE)
+              {
+                if (ret == MBEDTLS_ERR_SSL_INVALID_RECORD &&
+                    hretries == 0)
+                  {
+                    hretries++;
+                    mbedtls_ssl_session_reset(&g_conn.ssl);
+                    mbedtls_net_free(&g_conn.net);
+                    mbedtls_net_init(&g_conn.net);
+
+                    if (mbedtls_net_connect(&g_conn.net, host, portstr,
+                                            MBEDTLS_NET_PROTO_TCP) != 0 ||
+                        mbedtls_ssl_set_hostname(&g_conn.ssl, host) != 0)
+                      {
+                        hx_close();
+                        return ret;
+                      }
+
+                    mbedtls_ssl_set_bio(&g_conn.ssl, &g_conn.net,
+                                        mbedtls_net_send,
+                                        mbedtls_net_recv, NULL);
+                    goto retry_handshake;
+                  }
+
+                hx_close();
+                return ret;      /* mbedtls 负码可读 */
+              }
+          }
+      }
 
       goto headers;                /* 复用同一套请求/头解析 */
     }
