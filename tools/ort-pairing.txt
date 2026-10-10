@@ -9,15 +9,15 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-10 ORT（§94 **真 Docker Hub 全流程拉取 + TLS
-#               续项四件套** —— 官方根三根（+ISRG Root X2）+ NTP 自取
-#               时钟 + 真 token/manifest/blob 至内容寻址通过（经
-#               307→CloudFront）+ chunked-over-TLS + 断点续传。
-#               **无内核源码改动**，维持 bcc3f04052；平台内存布局调整在
-#               配置层（RAM 32MB + 页池 0x41000000 + PSEUDOFS_SOFTLINKS，
-#               见 proposals/scripts/ort-a-knsh_smp.config）。夹具随内核
-#               配置重烤（syscall 表位移，见 §94）。）
+# 最近配对事件：2026-10-10 ORT（§95 **挂载点符号链接** —— tmpfs 链接
+#               节点 + VFS 按 mkdir 模式路由（op 加结构体尾部，位置式
+#               初始化表零改动）+ unionfs readlink 委托 + §86 跟随收口
+#               （_ort_reroot 唯一实现，跟随也走重挂咽喉）。由此真 alpine
+#               层体（514 条目 = 96 目录 + 335 绝对链接 + 83 文件）完整
+#               解包入 rootfs（活体硬判）。apps 侧 = orting lsroot 链接行
+#               + readlink/symlink 探针 + TLS 握手 -0x7200 偶发重试一次
+#               （验证之前，安全语义不变）。内核 7855565ddc。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=bcc3f04052153a18c46e708920293563b752e9d5
+nuttx=7855565ddc67a1ec7fdf928783fda0d236d58ac3
