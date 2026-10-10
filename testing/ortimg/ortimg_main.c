@@ -74,7 +74,10 @@
 /* 镜像存储根：设计文档写 /var/ort/images —— 本板 /var 无挂载，tmpfs 在
  * /tmp（qemu_bringup 挂），故用 /tmp/ort 做根；产品化时由 init 把持久
  * 存储挂到 /var，路径前缀随挂载点平移（手册 §三·补六十三 边界）。 */
-#define ORT_STORE_ROOT   "/tmp/ort"
+/* [ORT §97] 存储根：**自动探测** —— /data 已挂载（持久盘，
+ * orta-store-persist 装置）用 /data/ort；否则回落 /tmp/ort（易失，
+ * 全部既有装置的行为不变）。main() 启动时定。 */
+static char g_store[64] = "/tmp/ort";
 
 /* 单层体上限（prototype 防线：tmpfs 在 RAM，别让一张大 manifest 抽干内存） */
 #define ORT_BLOB_MAX     (64 * 1024 * 1024)
@@ -2067,7 +2070,7 @@ static int do_up(FAR const char *view, FAR const char *host, unsigned port,
         }
 
       snprintf(lp, sizeof(lp),
-               ORT_STORE_ROOT "/images/sha256/%s/layer.tar", hex);
+               "%s/images/sha256/%s/layer.tar", g_store, hex);
 
       printf("[up] 铺层[%u] → %s\n", (unsigned)i, ro);
       if (do_tar_apply(lp, ro) != 0)
@@ -2117,7 +2120,7 @@ static int do_start(FAR const char *view, FAR const char *host, unsigned port,
     }
 
   snprintf(cfgp, sizeof(cfgp),
-           ORT_STORE_ROOT "/images/sha256/%s/config.json", hex);
+           "%s/images/sha256/%s/config.json", g_store, hex);
 
   ret = do_run(view, cfgp);
   printf("[start] 完成: view=%s（r=%d，收尾: orting down %s）\n",
@@ -2479,6 +2482,33 @@ static int dl_sink(FAR void *arg, FAR const char *buf, size_t len)
   return 0;
 }
 
+/* [ORT §97] 静默文件摘要（存储命中快检用） */
+
+static int store_file_digest(FAR const char *path, FAR char *hexout)
+{
+  static char   buf[4096];
+  FAR FILE     *f = fopen(path, "rb");
+  struct ort_sha256_s c;
+  uint8_t raw[32];
+  size_t  n;
+
+  if (f == NULL)
+    {
+      return -1;
+    }
+
+  ort_sha256_init(&c);
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+    {
+      ort_sha256_update(&c, buf, n);
+    }
+
+  fclose(f);
+  ort_sha256_final(&c, raw);
+  ort_sha256_hex(raw, hexout);
+  return 0;
+}
+
 static int blob_download(FAR const char *host, unsigned port,
                          FAR const char *repo, FAR const char *bearer,
                          FAR const char *digest, uint64_t msize,
@@ -2501,10 +2531,34 @@ static int blob_download(FAR const char *host, unsigned port,
       hex += 7;
     }
 
-  snprintf(dir,   sizeof(dir),   ORT_STORE_ROOT "/images/sha256/%s", hex);
+  snprintf(dir,   sizeof(dir),   "%s/images/sha256/%s", g_store, hex);
   snprintf(part,  sizeof(part),  "%s/%s.part", dir, leaf);
   snprintf(final, sizeof(final), "%s/%s", dir, leaf);
   snprintf(path,  sizeof(path),  "/v2/%s/blobs/%s", repo, digest);
+
+  /* [ORT §97] **已在库**快检（内容寻址）：文件名即 digest，命中且重算
+   * 摘要一致就免下载 —— 持久存储/跨重启复用的直接收益。不信缓存：
+   * 摘要不符就删掉重下（fail-closed 到网络路径）。 */
+
+  {
+    struct stat cst;
+    char chk[65];
+
+    if (stat(final, &cst) == 0 && (uint64_t)cst.st_size == msize &&
+        store_file_digest(final, chk) == 0 && strcmp(chk, hex) == 0)
+      {
+        printf("[pull] %s %s\n", tag, path);
+        printf("[pull]    已在库（%s，%llu 字节摘要复核一致，跳过下载）\n",
+               final, (unsigned long long)msize);
+        return 0;
+      }
+
+    if (stat(final, &cst) == 0)
+      {
+        printf("[pull]    在库件摘要不符（%s）—— 删除重下\n", final);
+        unlink(final);
+      }
+  }
 
   printf("[pull] %s %s\n", tag, path);
   printf("[pull]    体 %llu 字节 → %s\n",
@@ -2894,53 +2948,6 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
           }
       }
 
-      /* ⑦ 层体解包 → rootfs（OCI 覆盖/whiteout 语义：后层盖前层） */
-
-      {
-        static char rootfs[256];
-        char rs[160];
-        size_t k = 0;
-        uint32_t i;
-
-        while (repo[k] != '\0' && k < sizeof(rs) - 1)
-          {
-            rs[k] = (repo[k] == '/') ? '_' : repo[k];
-            k++;
-          }
-
-        rs[k] = '\0';
-
-        if (snprintf(rootfs, sizeof(rootfs), ORT_STORE_ROOT "/rootfs/%s@%s",
-                     rs, tag) >= (int)sizeof(rootfs))
-          {
-            printf("[pull]    rootfs 路径过长（repo/tag 请短些）\n");
-            return 2;
-          }
-
-        for (i = 0; i < g_mf.nlayers && i < 8; i++)
-          {
-            static char lp[300];
-            FAR const char *hex2 = g_mf.layers[i].digest;
-
-            if (strncmp(hex2, "sha256:", 7) == 0)
-              {
-                hex2 += 7;
-              }
-
-            snprintf(lp, sizeof(lp),
-                     ORT_STORE_ROOT "/images/sha256/%s/layer.tar", hex2);
-
-            printf("[pull] ⑦ 应用层[%u] → %s\n", (unsigned)i, rootfs);
-            if (do_tar_apply(lp, rootfs) != 0)
-              {
-                printf("[pull]    层[%u]应用失败 → pull 失败\n", (unsigned)i);
-                return 1;
-              }
-          }
-
-        printf("[pull]    rootfs: %s\n", rootfs);
-      }
-
       /* ⑧ 配置 blob 下载 + 解析（A2 起步：运行时要跑什么 —— Entrypoint/
        *    Cmd/Env/WorkingDir）。路径与层同一条：内容寻址校验 + 原子落盘；
        *    解析走白名单解析器（有界、超界报错不截断）。 */
@@ -2967,7 +2974,7 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
           }
 
         snprintf(cfgp, sizeof(cfgp),
-                 ORT_STORE_ROOT "/images/sha256/%s/config.json", hex3);
+                 "%s/images/sha256/%s/config.json", g_store, hex3);
 
         if (read_file(cfgp, &clen) != 0)
           {
@@ -2984,6 +2991,54 @@ static int do_pull(FAR const char *host, unsigned port, FAR const char *repo,
 
         config_dump(stdout, "[pull] ⑧ ", "[pull]    ", &g_cfg);
       }
+      /* ⑦ 层体解包 → rootfs（OCI 覆盖/whiteout 语义：后层盖前层） */
+
+      {
+        static char rootfs[256];
+        char rs[160];
+        size_t k = 0;
+        uint32_t i;
+
+        while (repo[k] != '\0' && k < sizeof(rs) - 1)
+          {
+            rs[k] = (repo[k] == '/') ? '_' : repo[k];
+            k++;
+          }
+
+        rs[k] = '\0';
+
+        if (snprintf(rootfs, sizeof(rootfs), "%s/rootfs/%s@%s",
+                     g_store, rs, tag) >= (int)sizeof(rootfs))
+          {
+            printf("[pull]    rootfs 路径过长（repo/tag 请短些）\n");
+            return 2;
+          }
+
+        for (i = 0; i < g_mf.nlayers && i < 8; i++)
+          {
+            static char lp[300];
+            FAR const char *hex2 = g_mf.layers[i].digest;
+
+            if (strncmp(hex2, "sha256:", 7) == 0)
+              {
+                hex2 += 7;
+              }
+
+            snprintf(lp, sizeof(lp),
+                     "%s/images/sha256/%s/layer.tar", g_store, hex2);
+
+            printf("[pull] ⑦ 应用层[%u] → %s\n", (unsigned)i, rootfs);
+            if (do_tar_apply(lp, rootfs) != 0)
+              {
+                printf("[pull]    层[%u]应用失败 → pull 失败\n", (unsigned)i);
+                return 1;
+              }
+          }
+
+        printf("[pull]    rootfs: %s\n", rootfs);
+      }
+
+
 
       printf("[pull] PULL RESULT: OK\n");
     }
@@ -3369,6 +3424,19 @@ out:
 
 int main(int argc, FAR char *argv[])
 {
+{
+  /* [ORT §97] 存储根自动探测（见 g_store 注释） */
+
+  {
+    struct stat st;
+
+    if (stat("/data", &st) == 0 && S_ISDIR(st.st_mode))
+      {
+        strlcpy(g_store, "/data/ort", sizeof(g_store));
+      }
+  }
+}
+
 
   g_buf = malloc(ORTIMG_MAX_FILE);
   if (g_buf == NULL)
