@@ -38,6 +38,8 @@
 #include <unistd.h>
 #include <malloc.h>
 #include <sched.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <sys/prctl.h>
 #include <errno.h>
 #ifndef CONFIG_DISABLE_SIGNALS
@@ -387,6 +389,55 @@ int main(int argc, FAR char *argv[])
              (int)me, (int)pp,
              k1 == 0 ? "OK" : (k1 < 0 && e1 == EPERM ? "EPERM" : "ERR"),
              ks == 0 ? "OK" : (ks < 0 && es == EPERM ? "EPERM" : "ERR"));
+    }
+
+  else if (argc >= 3 && strcmp(argv[2], "selfid") == 0)
+    {
+      /* §99（pid 第二刀）子视角探针：读自己的 getpid/getppid 后**以 7
+       * 退出** —— 父侧 waitpid 回读的是"本地号子进程 + 退出码"两个面。
+       * 容器臂应 me=2 pp=1（子本地号/父本地号）；对照臂全全局号。 */
+
+      printf("ORTHELLO: selfid me=%d pp=%d\n",
+             (int)getpid(), (int)getppid());
+      return 7;
+    }
+
+  else if (argc >= 3 && strcmp(argv[2], "pidprobe2") == 0)
+    {
+      /* §99 pid 命名空间第二刀（进程管理号面）：
+       *   ① spawn 回传号：本进程（容器 entrypoint=本地 1）posix_spawn
+       *      拿到的应是**本地号**（2）；对照臂=全局号；
+       *   ② waitpid 入口号：waitpid(上面那个号) 必须能解析到真子；
+       *   ③ 回收号回传：waited 应与 child 同号（容器=2）；
+       *   ④ waitpid(-1)：再起一个、任收一路 —— 回收号也要本地化（3）；
+       *   ⑤ 子自视角：子（selfid 模式）自报 me/pp —— 容器=2/1。
+       * 路径用 argv[0]（容器臂=/bin/orthello 经内核重挂；对照臂=
+       * /u/bin/orthello 直路径）—— 两臂同代码不同世界。 */
+
+      FAR char *cargv[4];
+      int r1, r2;
+      int st1 = 0, st2 = 0;
+      pid_t me = getpid();
+      pid_t c1 = -1, c2 = -1, w1 = -1, w2 = -1;
+
+      cargv[0] = argv[0];
+      cargv[1] = argv[1] != NULL ? argv[1] : "/etc/hello.txt";
+      cargv[2] = "selfid";
+      cargv[3] = NULL;
+
+      r1 = posix_spawn(&c1, argv[0], NULL, NULL, cargv, environ);
+      printf("ORTHELLO: pid2 me=%d child=%d r1=%d\n", (int)me, (int)c1, r1);
+
+      w1 = waitpid(c1, &st1, 0);
+      printf("ORTHELLO: pid2 waited=%d stat=%d\n",
+             (int)w1, WIFEXITED(st1) ? WEXITSTATUS(st1) : -1);
+
+      r2 = posix_spawn(&c2, argv[0], NULL, NULL, cargv, environ);
+
+      w2 = waitpid(-1, &st2, 0);
+      printf("ORTHELLO: pid2 any=%d stat=%d c2=%d r2=%d\n",
+             (int)w2, WIFEXITED(st2) ? WEXITSTATUS(st2) : -1,
+             (int)c2, r2);
     }
 
   return 0;
