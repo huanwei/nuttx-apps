@@ -9,12 +9,13 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-10 ORT（§97 **持久存储** —— virtio-blk + FAT：
-#               OCI 内容（层体+配置）跨重启存活；存储根自动探测 + 已在库
-#               快检；**第 9 处本地修复**：上游 bc9e1ffb01 的 SFN 回退
-#               漏失败路径（≤11 字符小写名建出全空格无名条目）。
-#               内核 58d656f053。apps 侧 §97 = 存储根/快检/⑧⑦次序。）
+# 最近配对事件：2026-10-10 ORT（§98 **容器 pid 视图第一刀** —— 命名空间
+#               = 同 root 全部任务组；getpid=1/getppid=0/本地号 kill；
+#               权威落点 group_initialize（早期改写会被覆盖）；号解析
+#               覆盖信号 3 + 调度 4 共 7 入口；vasprintf 偶发断言装永久
+#               遗言打印。M 双编 + run5 回归 ×2 逐字对上。内核
+#               7d8a03f6c2。apps 侧 §98 = pidprobe + 探针靶位迁移。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=58d656f0536f546a831abf906594756925c4b2c3
+nuttx=7d8a03f6c2b22aaa39073d5f9fa8b1c83325fb92
