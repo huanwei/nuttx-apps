@@ -9,15 +9,16 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-11 ORT（§100 **PendSV 重排钩子根因封堵**（第 10 处
-#               本地修复）—— 钩子不区分"已武装待投递"与"投递中"：对投递中
-#               的任务重排 = 双重进入 = 被放弃那趟留下硬件异常帧（布局 ≠
-#               XCPTCONTEXT），尾段按 xcp 恢复即 INVSTATE（PC=0/xPSR.T=0）。
-#               修 = 投递中标记 ort_sd_active + 钩子跳过（ISR 只计数，尾部
-#               罕见见证）。绑定 18/18；修后 an500 0/12（r2/r12 命中见证）、
-#               an547 4/4；A：全量重建 + e2e ×2 + 双负臂全绿。内核
-#               c7994d7362。apps 侧本轮未动（内核单侧修复）。）
+# 最近配对事件：2026-10-11 ORT（§101 **设备面第一刀（devacl）** —— A2 蓝图
+#               最后一块起步：先勘察后定案（三臂探针闸前实测缺**绑域容器
+#               能开 console/null/zero 全部**，两 SKU 同形）；闸 = fs_open
+#               按解析后 inode 判设备类 → 容器 -EPERM。两层防御：路径层 root
+#               只挡 A 侧；**M 绑域是唯一实弹面**。闸后三臂全 PASS 两 SKU +
+#               run5 逐字；A：e2e ×2 + 双负臂 + 宿主全绿（㉙ 设备两臂 +
+#               ㉚ spawn 失败反证臂——§70 遗留补掉）。内核 400bb86059。
+#               apps 侧 §101 = devprobe 三臂（ortsup）+ 两臂（orthello）+
+#               夹具重烤。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=c7994d73621444c8c607c029633713fa7a9f049b
+nuttx=400bb86059fd35aa12c19d45a66f28bc96aac21e
