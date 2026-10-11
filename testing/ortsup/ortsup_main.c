@@ -1877,6 +1877,209 @@ static int ort_sigprobe_driver(void)
   return pass ? 0 : 1;
 }
 
+/****************************************************************************
+ * [ORT §101] 设备面第一刀自测（三臂）—— devacl：容器不得打开设备节点
+ *
+ *   与 §89 sigprobe 同构（同装置哲学：一条启动测三种标记形态）：
+ *     ① unbound：无根无域 —— 对照臂：三设备应全 OK；
+ *     ② domain ：绑域（M 容器真实形态）—— **本闸唯一实弹面**：没有
+ *                root 挡路 ⇒ 闸前全 OK（缺口现场取证）、闸后全 EPERM；
+ *     ③ rooted ：设根标记 —— 绝对路径被重挂到 /rt，/dev/* 够不着
+ *                ⇒ 全"打不开"（路径层已挡；A 侧容器的真实形态）。
+ *
+ *   ★ 臂序 unbound → domain → rooted 不是随意的：root 一经设定**无法
+ *     清除**（PR_SET_ORT_ROOT 只重设，"设根者自己"那份永不重挂但也
+ *     拿不掉）——domain 臂若排在 rooted 之后会被 root 掩蔽（全"打不开"
+ *     而非 EPERM），闸的实弹面就没了。
+ *
+ *   开 O_RDONLY 三个节点（an500 配置全部：console/null/zero）。
+ *   域臂的"应然"按**闸在**写（全 EPERM）；闸前预跑=臂 FAIL 但 probe
+ *   行带 OK×3 —— 缺口实锤即取证（手册 §101 勘察步）。
+ ****************************************************************************/
+
+static int ort_devprobe_probe(int argc, FAR char *argv[])
+{
+  FAR const char *mode = "unbound";
+  static const FAR char *devs[3] =
+    {
+      "/dev/console", "/dev/null", "/dev/zero"
+    };
+
+  FAR const char *res[3];
+  char mbuf[16];
+  int fd;
+  int k;
+  int i;
+
+  for (k = 0; k < argc; k++)
+    {
+      if (argv[k] != NULL && strcmp(argv[k], "devprobe-probe") == 0)
+        {
+          break;
+        }
+    }
+
+  if (k + 1 < argc && argv[k + 1] != NULL)
+    {
+      strncpy(mbuf, argv[k + 1], sizeof(mbuf) - 1);
+      mbuf[sizeof(mbuf) - 1] = '\0';
+      mode = mbuf;
+    }
+
+  if (strcmp(mode, "domain") == 0)
+    {
+      prctl(PR_ORT_WAIT_ADMISSION, 3000);
+    }
+
+  for (i = 0; i < 3; i++)
+    {
+      fd = open(devs[i], O_RDONLY);
+      if (fd >= 0)
+        {
+          close(fd);
+          res[i] = "OK";
+        }
+      else if (errno == EPERM)
+        {
+          res[i] = "EPERM";
+        }
+      else
+        {
+          res[i] = "打不开";
+        }
+    }
+
+  printf("[devprobe] probe(%s): console=%s null=%s zero=%s\n", mode,
+         res[0], res[1], res[2]);
+
+  if (strcmp(mode, "unbound") == 0)
+    {
+      return (!strcmp(res[0], "OK") && !strcmp(res[1], "OK") &&
+              !strcmp(res[2], "OK")) ? 0 : 1;
+    }
+
+  if (strcmp(mode, "rooted") == 0)
+    {
+      return (!strcmp(res[0], "打不开") && !strcmp(res[1], "打不开") &&
+              !strcmp(res[2], "打不开")) ? 0 : 1;
+    }
+
+  return (!strcmp(res[0], "EPERM") && !strcmp(res[1], "EPERM") &&
+          !strcmp(res[2], "EPERM")) ? 0 : 1;
+}
+
+#ifndef CONFIG_BUILD_KERNEL
+static int ort_devprobe_probe_entry(int argc, FAR char *argv[])
+{
+  return ort_devprobe_probe(argc, argv);
+}
+#endif
+
+static int ort_devprobe_driver(void)
+{
+  FAR char *cargv[4];
+  pid_t pids[3];
+  int   sts[3];
+  int   i;
+  int   ret;
+  int   pass = 1;
+
+  /* 根目录要存在（rooted 臂的重挂目标；幂等挂载） */
+
+  if (ort_rt_ready() != 0)
+    {
+      return 1;
+    }
+
+  cargv[0] = (FAR char *)"ortsup";
+  cargv[1] = (FAR char *)"devprobe-probe";
+  cargv[3] = NULL;
+
+  /* 臂①：unbound（无根、无域）→ 三设备应全 OK */
+
+  cargv[2] = (FAR char *)"unbound";
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pids[0], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[devprobe] *** 臂① spawn 失败: %d ***\n", ret);
+                  return 1; }
+#else
+  pids[0] = task_create("devprobe-unbound", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_devprobe_probe_entry, cargv);
+  if (pids[0] < 0) { printf("[devprobe] *** 臂① create 失败: %d ***\n",
+                            (int)pids[0]); return 1; }
+#endif
+
+  /* 臂②：domain（容器真实形态）——监督者注册 + 绑域 + 准入唤醒。
+   * 必须先于 rooted 臂（root 无法清除，会掩蔽闸的实弹面）。 */
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
+  if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
+    {
+      printf("[devprobe] *** 注册监督者失败（臂② 跳过）——如其它模式已注册过，需 RESET ***\n");
+      return 1;
+    }
+
+  cargv[2] = (FAR char *)"domain";
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pids[1], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[devprobe] *** 臂② spawn 失败: %d ***\n", ret);
+                  return 1; }
+#else
+  pids[1] = task_create("devprobe-domain", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_devprobe_probe_entry, cargv);
+  if (pids[1] < 0) { printf("[devprobe] *** 臂② create 失败: %d ***\n",
+                            (int)pids[1]); return 1; }
+#endif
+
+  ret = prctl(PR_SET_ORT_DOMAIN, 0, (int)pids[1]);
+  if (ret != 0)
+    {
+      printf("[devprobe] *** 绑域失败: %d ***\n", ret);
+      return 1;
+    }
+
+  /* 臂③：rooted（设根标记）→ /dev/* 全"打不开" */
+
+  ret = prctl(PR_SET_ORT_ROOT, "/rt");
+  if (ret != 0)
+    {
+      printf("[devprobe] *** 设根失败: %d ***\n", ret);
+      return 1;
+    }
+
+  cargv[2] = (FAR char *)"rooted";
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pids[2], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[devprobe] *** 臂③ spawn 失败: %d ***\n", ret);
+                  return 1; }
+#else
+  pids[2] = task_create("devprobe-rooted", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_devprobe_probe_entry, cargv);
+  if (pids[2] < 0) { printf("[devprobe] *** 臂③ create 失败: %d ***\n",
+                            (int)pids[2]); return 1; }
+#endif
+
+  for (i = 0; i < 3; i++)
+    {
+      sts[i] = 1;
+      waitpid(pids[i], &sts[i], 0);
+      {
+        int ok = WIFEXITED(sts[i]) && WEXITSTATUS(sts[i]) == 0;
+        printf("[devprobe] arm%s=%s\n",
+               i == 0 ? "(unbound)"
+                      : (i == 1 ? "(domain)" : "(rooted)"),
+               ok ? "PASS" : "FAIL");
+        if (!ok)
+          {
+            pass = 0;
+          }
+      }
+    }
+
+  printf("DEVPROBE RESULT: %s\n", pass ? "PASS" : "FAIL");
+  return pass ? 0 : 1;
+}
+
 static int ort_container_main(int argc, FAR char *argv[])
 {
   FAR const char *mode = NULL;
@@ -3559,6 +3762,16 @@ int main(int argc, FAR char *argv[])
   if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "sigprobe") == 0)
     {
       return ort_sigprobe_driver();
+    }
+
+  if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "devprobe-probe") == 0)
+    {
+      return ort_devprobe_probe(argc, argv);
+    }
+
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "devprobe") == 0)
+    {
+      return ort_devprobe_driver();
     }
 
   if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "waitadm") == 0)

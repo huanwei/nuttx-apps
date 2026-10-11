@@ -1,0 +1,9 @@
+{
+  "architecture": "arm",
+  "os": "linux",
+  "config": {
+    "Entrypoint": ["/bin/nope"],
+    "Cmd": ["x"],
+    "WorkingDir": "/tmp/ort/wd"
+  }
+}

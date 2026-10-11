@@ -37,6 +37,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <malloc.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -400,6 +401,45 @@ int main(int argc, FAR char *argv[])
       printf("ORTHELLO: selfid me=%d pp=%d\n",
              (int)getpid(), (int)getppid());
       return 7;
+    }
+
+  else if (argc >= 3 && strcmp(argv[2], "devprobe") == 0)
+    {
+      /* §101 设备面第一刀（devacl）：开三个设备节点并报告 ——
+       *   容器臂（rooted，经 orting run）：绝对路径被重挂 ⇒ 全"打不开"
+       *     （路径层已挡；对象层闸在解析阶段之前就 ENOENT 了）；
+       *   对照臂（nsh 直 exec）：全 OK（闸对非容器不设防）。
+       * 两臂同形不同值 ⇒ 有分辨力。O_RDONLY 即可（不需要写权）。 */
+
+      static const FAR char *devs[3] =
+        {
+          "/dev/console", "/dev/null", "/dev/zero"
+        };
+
+      char rdir[3][16];
+      int fd;
+      int i;
+
+      for (i = 0; i < 3; i++)
+        {
+          fd = open(devs[i], O_RDONLY);
+          if (fd >= 0)
+            {
+              close(fd);
+              strlcpy(rdir[i], "OK", sizeof(rdir[i]));
+            }
+          else if (errno == EPERM)
+            {
+              strlcpy(rdir[i], "EPERM", sizeof(rdir[i]));
+            }
+          else
+            {
+              strlcpy(rdir[i], "打不开", sizeof(rdir[i]));
+            }
+        }
+
+      printf("ORTHELLO: devprobe console=%s null=%s zero=%s\n",
+             rdir[0], rdir[1], rdir[2]);
     }
 
   else if (argc >= 3 && strcmp(argv[2], "pidprobe2") == 0)
