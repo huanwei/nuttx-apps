@@ -80,6 +80,7 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <mqueue.h>
 #include <sched.h>
 #include <errno.h>
 #include <sys/wait.h>
@@ -2163,6 +2164,196 @@ static int ort_devprobe_driver(void)
   return pass ? 0 : 1;
 }
 
+/****************************************************************************
+ * [ORT §106] IPC 面第一刀自测（三臂）—— mqueue：容器不得开全局 POSIX
+ *   消息队列（CONFIG_FS_MQUEUE_VFS_PATH 命名空间，两 SKU 共享）。
+ *
+ *   为什么实弹面在 M：mq_open 走 inode_find("/var/mqueue/<名>") ——
+ *   A 侧容器（设根）被**路径层**重挂挡掉（打不开，与 §101 设备面同构）；
+ *   M 绑域容器没有 root，直抵**全局**队列（跨容器/监督者可达）—— 探针
+ *   闸前预跑即缺口取证。
+ *
+ *   三臂同 devprobe 观：① unbound 对照（open/unlink 全 OK）；
+ *   ② domain（M 容器真实形态，闸后 EPERM）；③ rooted（A 形态，打不开）。
+ *   ★ 臂序 unbound → domain → rooted：root 无法清除会掩蔽（同 devprobe）。
+ ****************************************************************************/
+
+static int ort_mqprobe_probe(int argc, FAR char *argv[])
+{
+  FAR const char *mode = "unbound";
+  FAR const char *ores;
+  FAR const char *ures;
+  char mbuf[16];
+  mqd_t mq;
+  int k;
+
+  for (k = 0; k < argc; k++)
+    {
+      if (argv[k] != NULL && strcmp(argv[k], "mqprobe-probe") == 0)
+        {
+          break;
+        }
+    }
+
+  if (k + 1 < argc && argv[k + 1] != NULL)
+    {
+      strncpy(mbuf, argv[k + 1], sizeof(mbuf) - 1);
+      mbuf[sizeof(mbuf) - 1] = '\0';
+      mode = mbuf;
+    }
+
+  if (strcmp(mode, "domain") == 0)
+    {
+      prctl(PR_ORT_WAIT_ADMISSION, 3000);
+    }
+
+  mq = mq_open("/ortmq", O_CREAT | O_RDWR, 0666, NULL);
+  if (mq != (mqd_t)-1)
+    {
+      ores = "OK";
+
+      if (mq_unlink("/ortmq") == 0)
+        {
+          ures = "OK";
+        }
+      else
+        {
+          ures = (errno == EPERM) ? "EPERM" : "打不开";
+        }
+
+      mq_close(mq);
+    }
+  else
+    {
+      ores = (errno == EPERM) ? "EPERM" : "打不开";
+      ures = ores;   /* 开都开不了 —— unlink 判据取同形（对称可读） */
+    }
+
+  printf("[mqprobe] probe(%s): open=%s unlink=%s\n", mode, ores, ures);
+
+  if (strcmp(mode, "unbound") == 0)
+    {
+      return (!strcmp(ores, "OK") && !strcmp(ures, "OK")) ? 0 : 1;
+    }
+
+  if (strcmp(mode, "rooted") == 0)
+    {
+      return (!strcmp(ores, "打不开") && !strcmp(ures, "打不开")) ? 0 : 1;
+    }
+
+  return (!strcmp(ores, "EPERM") && !strcmp(ures, "EPERM")) ? 0 : 1;
+}
+
+#ifndef CONFIG_BUILD_KERNEL
+static int ort_mqprobe_probe_entry(int argc, FAR char *argv[])
+{
+  return ort_mqprobe_probe(argc, argv);
+}
+#endif
+
+static int ort_mqprobe_driver(void)
+{
+  FAR char *cargv[4];
+  pid_t pids[3];
+  int   sts[3];
+  int   i;
+  int   ret;
+  int   pass = 1;
+
+  /* rooted 臂的重挂目标要存在（幂等挂载） */
+
+  if (ort_rt_ready() != 0)
+    {
+      return 1;
+    }
+
+  cargv[0] = (FAR char *)"ortsup";
+  cargv[1] = (FAR char *)"mqprobe-probe";
+  cargv[3] = NULL;
+
+  /* 臂①：unbound（对照）→ open/unlink 全 OK */
+
+  cargv[2] = (FAR char *)"unbound";
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pids[0], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[mqprobe] *** 臂① spawn 失败: %d ***\n", ret);
+                  return 1; }
+#else
+  pids[0] = task_create("mqprobe-unbound", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_mqprobe_probe_entry, cargv);
+  if (pids[0] < 0) { printf("[mqprobe] *** 臂① create 失败: %d ***\n",
+                            (int)pids[0]); return 1; }
+#endif
+
+  /* 臂②：domain（容器真实形态）——监督者注册 + 绑域 + 准入唤醒 */
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
+  if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
+    {
+      printf("[mqprobe] *** 注册监督者失败（臂② 跳过）***\n");
+      return 1;
+    }
+
+  cargv[2] = (FAR char *)"domain";
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pids[1], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[mqprobe] *** 臂② spawn 失败: %d ***\n", ret);
+                  return 1; }
+#else
+  pids[1] = task_create("mqprobe-domain", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_mqprobe_probe_entry, cargv);
+  if (pids[1] < 0) { printf("[mqprobe] *** 臂② create 失败: %d ***\n",
+                            (int)pids[1]); return 1; }
+#endif
+
+  ret = prctl(PR_SET_ORT_DOMAIN, 0, (int)pids[1]);
+  if (ret != 0)
+    {
+      printf("[mqprobe] *** 绑域失败: %d ***\n", ret);
+      return 1;
+    }
+
+  /* 臂③：rooted（设根标记）→ /var/mqueue 被路径层重挂 ⇒ 打不开 */
+
+  ret = prctl(PR_SET_ORT_ROOT, "/rt");
+  if (ret != 0)
+    {
+      printf("[mqprobe] *** 设根失败: %d ***\n", ret);
+      return 1;
+    }
+
+  cargv[2] = (FAR char *)"rooted";
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pids[2], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[mqprobe] *** 臂③ spawn 失败: %d ***\n", ret);
+                  return 1; }
+#else
+  pids[2] = task_create("mqprobe-rooted", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_mqprobe_probe_entry, cargv);
+  if (pids[2] < 0) { printf("[mqprobe] *** 臂③ create 失败: %d ***\n",
+                            (int)pids[2]); return 1; }
+#endif
+
+  for (i = 0; i < 3; i++)
+    {
+      static const FAR char *labels[3] =
+        { "(unbound)", "(domain)", "(rooted)" };
+      int ok;
+
+      sts[i] = 1;
+      waitpid(pids[i], &sts[i], 0);
+      ok = WIFEXITED(sts[i]) && WEXITSTATUS(sts[i]) == 0;
+      printf("[mqprobe] arm%s=%s\n", labels[i], ok ? "PASS" : "FAIL");
+      if (!ok)
+        {
+          pass = 0;
+        }
+    }
+
+  printf("MQPROBE RESULT: %s\n", pass ? "PASS" : "FAIL");
+  return pass ? 0 : 1;
+}
+
 static int ort_container_main(int argc, FAR char *argv[])
 {
   FAR const char *mode = NULL;
@@ -3989,6 +4180,16 @@ int main(int argc, FAR char *argv[])
   if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "devprobe") == 0)
     {
       return ort_devprobe_driver();
+    }
+
+  if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "mqprobe-probe") == 0)
+    {
+      return ort_mqprobe_probe(argc, argv);
+    }
+
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "mqprobe") == 0)
+    {
+      return ort_mqprobe_driver();
     }
 
   if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "waitadm") == 0)

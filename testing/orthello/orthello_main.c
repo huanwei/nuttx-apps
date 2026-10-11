@@ -38,6 +38,7 @@
 #include <unistd.h>
 #include <malloc.h>
 #include <fcntl.h>
+#include <mqueue.h>
 #include <sched.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -440,6 +441,41 @@ int main(int argc, FAR char *argv[])
 
       printf("ORTHELLO: devprobe console=%s null=%s zero=%s\n",
              rdir[0], rdir[1], rdir[2]);
+    }
+
+  else if (argc >= 3 && strcmp(argv[2], "mqprobe") == 0)
+    {
+      /* §106 IPC 面第一刀（mqueue）：开/删全局队列报告 ——
+       *   容器臂（rooted，经 orting run）："/var/mqueue" 被路径层重挂
+       *     ⇒ 全"打不开"（闸在解析后，A 侧轮不到）；
+       *   对照臂（nsh 直 exec）：OK×2（闸对非容器不设防）。 */
+
+      FAR const char *ores;
+      FAR const char *ures;
+      mqd_t mq = mq_open("/ortmq", O_CREAT | O_RDWR, 0666, NULL);
+
+      if (mq != (mqd_t)-1)
+        {
+          ores = "OK";
+
+          if (mq_unlink("/ortmq") == 0)
+            {
+              ures = "OK";
+            }
+          else
+            {
+              ures = (errno == EPERM) ? "EPERM" : "打不开";
+            }
+
+          mq_close(mq);
+        }
+      else
+        {
+          ores = (errno == EPERM) ? "EPERM" : "打不开";
+          ures = ores;
+        }
+
+      printf("ORTHELLO: mqprobe open=%s unlink=%s\n", ores, ures);
     }
 
   else if (argc >= 3 && strcmp(argv[2], "pidprobe3") == 0)
