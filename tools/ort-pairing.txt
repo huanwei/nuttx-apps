@@ -9,16 +9,15 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-10 ORT（§99 **容器 pid 第二刀（管理号面）** ——
-#               容器内 spawn 回传号 / waitpid 入口号 / 回收号全本地化
-#               （含 -1 任收一路）；谓词必须 tg_ort_re_root（"root 非空"
-#               会把设根者 orting 自己算进容器 —— 两臂冒烟全绿、全电池
-#               才暴露）；回收号靠创建时留存的 ch_ort_lpid（子亡后查不了
-#               表）；group_leave 退引用叠加 lpid!=0 守卫。A：e2e ×2 +
-#               双负臂全绿（㉘）；M 双编 + run5 回归（an547 2/2、an500
-#               8/10 逐字对上；2/10 偶发 INVSTATE 滚动观察在案）。内核
-#               80605c0c1d。apps 侧 §99 = pidprobe2 + 夹具重烤。）
+# 最近配对事件：2026-10-11 ORT（§100 **PendSV 重排钩子根因封堵**（第 10 处
+#               本地修复）—— 钩子不区分"已武装待投递"与"投递中"：对投递中
+#               的任务重排 = 双重进入 = 被放弃那趟留下硬件异常帧（布局 ≠
+#               XCPTCONTEXT），尾段按 xcp 恢复即 INVSTATE（PC=0/xPSR.T=0）。
+#               修 = 投递中标记 ort_sd_active + 钩子跳过（ISR 只计数，尾部
+#               罕见见证）。绑定 18/18；修后 an500 0/12（r2/r12 命中见证）、
+#               an547 4/4；A：全量重建 + e2e ×2 + 双负臂全绿。内核
+#               c7994d7362。apps 侧本轮未动（内核单侧修复）。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=80605c0c1daca6475b554537c2ee5a4730454a49
+nuttx=c7994d73621444c8c607c029633713fa7a9f049b
