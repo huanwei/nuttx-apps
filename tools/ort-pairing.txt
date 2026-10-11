@@ -9,16 +9,16 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-11 ORT（§101 **设备面第一刀（devacl）** —— A2 蓝图
-#               最后一块起步：先勘察后定案（三臂探针闸前实测缺**绑域容器
-#               能开 console/null/zero 全部**，两 SKU 同形）；闸 = fs_open
-#               按解析后 inode 判设备类 → 容器 -EPERM。两层防御：路径层 root
-#               只挡 A 侧；**M 绑域是唯一实弹面**。闸后三臂全 PASS 两 SKU +
-#               run5 逐字；A：e2e ×2 + 双负臂 + 宿主全绿（㉙ 设备两臂 +
-#               ㉚ spawn 失败反证臂——§70 遗留补掉）。内核 400bb86059。
-#               apps 侧 §101 = devprobe 三臂（ortsup）+ 两臂（orthello）+
-#               夹具重烤。）
+# 最近配对事件：2026-10-11 ORT（§102 **容器 pid 第三刀（实例化 + 主线程
+#               tid）** —— 命名空间 root 键改**实例键**（tg_ort_nsid）：
+#               设根者派生=新实例 / 成员派生=继承 ⇒ 同 root 并发多容器
+#               **各自 init=1**；主线程 gettid 视图（tid==pid；咽喉 =
+#               tls_initinfo，须排除 pthread）；pthread 线程号面仍全局
+#               （边界，与 tgkill 的 tid 面留后续刀）。并发臂（& + hold=4）
+#               两容器各自 me=1 pp=0 tid=1；A：e2e ×2 + 双负臂 + 宿主全绿
+#               （㉛）；M 双编 + run5 两 SKU ×2 逐字。内核 b10f9f481d。
+#               apps 侧 §102 = pidprobe3（hold= 并发臂）+ 夹具重烤。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=400bb86059fd35aa12c19d45a66f28bc96aac21e
+nuttx=b10f9f481d3459c11d718749c7a5d92ef2b30570
