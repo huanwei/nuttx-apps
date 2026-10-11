@@ -243,6 +243,8 @@ struct ort_cg_s
   int             faults;
   bool            failed;        /* 已失效且不再重启 */
   bool            completed;     /* [§103] 非关键 CG 正常完成（code=0）的终局 */
+  char            devwl[129];    /* [§104] 设备白名单（manifest 可选字段
+                                  *   devices 原文；空 = 不下发 = 全拒绝） */
   int             admitted_ms;   /* 被准入的时刻（-1 = 尚未准入） */
   int             ready;         /* ④ 就绪上报（当前实例；新实例重置为 0） */
 };
@@ -553,6 +555,7 @@ static bool mf_bool(FAR const char *v, FAR bool *out)
 #define SEEN_HANDLES  (1u << 3)
 #define SEEN_VERSION  (1u << 4)
 #define SEEN_PROTOCOL (1u << 5)
+#define SEEN_DEVWL    (1u << 6)   /* [§104] devices 可选 —— 不进 SEEN_ALL */
 #define SEEN_ALL      (SEEN_DOMAIN | SEEN_CRITICAL | SEEN_RESTARTS | \
                        SEEN_HANDLES | SEEN_VERSION | SEEN_PROTOCOL)
 
@@ -831,6 +834,28 @@ static int manifest_parse(FAR const char *text, size_t len,
             }
 
           seen[n - 1] |= SEEN_RESTARTS;
+        }
+      else if (strcmp(key, "devices") == 0)
+        {
+          /* [§104] 可选：设备白名单（逗号分隔路径，如 "/dev/null"）。
+           *   缺省 = 不下发 ⇒ 内核侧全拒绝（§101 语义保持）。 */
+
+          size_t vl = strlen(val);
+
+          if (vl > sizeof(cg->devwl) - 1)
+            {
+              mf_err(lineno, "devices 过长（≤ 128 字节）");
+              goto fail;
+            }
+
+          if (seen[n - 1] & SEEN_DEVWL)
+            {
+              mf_err(lineno, "devices 重复");
+              goto fail;
+            }
+
+          memcpy(cg->devwl, val, vl + 1);
+          seen[n - 1] |= SEEN_DEVWL;
         }
       else if (strcmp(key, "handles_fault") == 0)
         {
@@ -1937,7 +1962,10 @@ static int ort_devprobe_probe(int argc, FAR char *argv[])
       mode = mbuf;
     }
 
-  if (strcmp(mode, "domain") == 0)
+  /* ★ 等绑域的两种容器形态都要等（wled 首版漏了 —— 裸跑退出后驱动
+   *   再绑域得 -ESRCH，实锤过）。 */
+
+  if (strcmp(mode, "domain") == 0 || strcmp(mode, "wled") == 0)
     {
       prctl(PR_ORT_WAIT_ADMISSION, 3000);
     }
@@ -1975,6 +2003,14 @@ static int ort_devprobe_probe(int argc, FAR char *argv[])
               !strcmp(res[2], "打不开")) ? 0 : 1;
     }
 
+  if (strcmp(mode, "wled") == 0)
+    {
+      /* [§104] 名单 = "/dev/null" ⇒ 只开一个口 */
+
+      return (!strcmp(res[0], "EPERM") && !strcmp(res[1], "OK") &&
+              !strcmp(res[2], "EPERM")) ? 0 : 1;
+    }
+
   return (!strcmp(res[0], "EPERM") && !strcmp(res[1], "EPERM") &&
           !strcmp(res[2], "EPERM")) ? 0 : 1;
 }
@@ -1989,8 +2025,8 @@ static int ort_devprobe_probe_entry(int argc, FAR char *argv[])
 static int ort_devprobe_driver(void)
 {
   FAR char *cargv[4];
-  pid_t pids[3];
-  int   sts[3];
+  pid_t pids[4];
+  int   sts[4];
   int   i;
   int   ret;
   int   pass = 1;
@@ -2049,7 +2085,39 @@ static int ort_devprobe_driver(void)
       return 1;
     }
 
-  /* 臂③：rooted（设根标记）→ /dev/* 全"打不开" */
+  /* 臂③：[§104] wled —— domain + 白名单 "/dev/null"：null 放行、
+   * console/zero 仍 EPERM（名单只开一个口）。 */
+
+  cargv[2] = (FAR char *)"wled";
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pids[2], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[devprobe] *** 臂③ spawn 失败: %d ***\n", ret);
+                  return 1; }
+#else
+  pids[2] = task_create("devprobe-wled", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_devprobe_probe_entry, cargv);
+  if (pids[2] < 0) { printf("[devprobe] *** 臂③ create 失败: %d ***\n",
+                            (int)pids[2]); return 1; }
+#endif
+
+  ret = prctl(PR_SET_ORT_DEVWL, (int)pids[2], "/dev/null");
+  if (ret != 0)
+    {
+      printf("[devprobe] *** 臂③ 白名单下发失败: %d ***\n", ret);
+      return 1;
+    }
+
+  /* ★ 绑域放在白名单**之后**：绑域的准入 post 才是探针的放行唤醒点 ——
+   *   反过来会撕开"醒来开设备时名单还没到"的窗口（臂内赛跑，实锤过）。 */
+
+  ret = prctl(PR_SET_ORT_DOMAIN, 1, (int)pids[2]);
+  if (ret != 0)
+    {
+      printf("[devprobe] *** 臂③ 绑域失败: %d ***\n", ret);
+      return 1;
+    }
+
+  /* 臂④：rooted（设根标记）→ /dev/* 全"打不开" */
 
   ret = prctl(PR_SET_ORT_ROOT, "/rt");
   if (ret != 0)
@@ -2060,26 +2128,25 @@ static int ort_devprobe_driver(void)
 
   cargv[2] = (FAR char *)"rooted";
 #if defined(CONFIG_BUILD_KERNEL)
-  ret = posix_spawn(&pids[2], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
-  if (ret != 0) { printf("[devprobe] *** 臂③ spawn 失败: %d ***\n", ret);
+  ret = posix_spawn(&pids[3], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[devprobe] *** 臂④ spawn 失败: %d ***\n", ret);
                   return 1; }
 #else
-  pids[2] = task_create("devprobe-rooted", CONTAINER_PRIO, CONTAINER_STACK,
+  pids[3] = task_create("devprobe-rooted", CONTAINER_PRIO, CONTAINER_STACK,
                         ort_devprobe_probe_entry, cargv);
-  if (pids[2] < 0) { printf("[devprobe] *** 臂③ create 失败: %d ***\n",
-                            (int)pids[2]); return 1; }
+  if (pids[3] < 0) { printf("[devprobe] *** 臂④ create 失败: %d ***\n",
+                            (int)pids[3]); return 1; }
 #endif
 
-  for (i = 0; i < 3; i++)
+  for (i = 0; i < 4; i++)
     {
       sts[i] = 1;
       waitpid(pids[i], &sts[i], 0);
       {
+        static const FAR char *labels[4] =
+          { "(unbound)", "(domain)", "(wled)", "(rooted)" };
         int ok = WIFEXITED(sts[i]) && WEXITSTATUS(sts[i]) == 0;
-        printf("[devprobe] arm%s=%s\n",
-               i == 0 ? "(unbound)"
-                      : (i == 1 ? "(domain)" : "(rooted)"),
-               ok ? "PASS" : "FAIL");
+        printf("[devprobe] arm%s=%s\n", labels[i], ok ? "PASS" : "FAIL");
         if (!ok)
           {
             pass = 0;
@@ -3495,6 +3562,20 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
     {
       printf("[ortsup] 绑域失败 %s pid=%d\n", cg->name, (int)pid);
       return -1;
+    }
+
+  /* [§104] 设备白名单下发（manifest 可选字段 devices）。失败 =
+   * fail-closed：不启动一个"声明了名单却没下发成"的实例 ——
+   * 否则监督者以为有名单、内核侧却是全拒绝（或反之），两侧语义分叉。 */
+
+  if (cg->devwl[0] != '\0')
+    {
+      if (prctl(PR_SET_ORT_DEVWL, (int)pid, cg->devwl) != 0)
+        {
+          printf("[ortsup] 设备白名单下发失败 %s pid=%d\n",
+                 cg->name, (int)pid);
+          return -1;
+        }
     }
 
   cg->pid         = pid;
