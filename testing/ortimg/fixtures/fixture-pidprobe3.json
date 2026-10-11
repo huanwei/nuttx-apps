@@ -1,0 +1,9 @@
+{
+  "architecture": "arm",
+  "os": "linux",
+  "config": {
+    "Entrypoint": ["/bin/orthello"],
+    "Cmd": ["/etc/hello.txt", "pidprobe3", "hold=4"],
+    "WorkingDir": "/tmp/ort/wd"
+  }
+}

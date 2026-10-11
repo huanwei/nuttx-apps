@@ -442,6 +442,37 @@ int main(int argc, FAR char *argv[])
              rdir[0], rdir[1], rdir[2]);
     }
 
+  else if (argc >= 3 && strcmp(argv[2], "pidprobe3") == 0)
+    {
+      /* §102 pid 第三刀：gettid 视图（主线程 tid==pid）——
+       *   容器臂应 1/0/1（getpid=getppid-local-view/tid 全本地）；
+       *   对照臂 me==tid（同全局号）。
+       * 可选 hold=N（秒）：并发臂用——睡眠保持容器存活，制造两个
+       * 同 root 容器的重叠窗口（实例化判据：两容器各自 me=1）。 */
+
+      pid_t me = getpid();
+      pid_t pp = getppid();
+      pid_t tid = gettid();
+      int hold = 0;
+      int k;
+
+      for (k = 3; k < argc; k++)
+        {
+          if (argv[k] != NULL && strncmp(argv[k], "hold=", 5) == 0)
+            {
+              hold = atoi(argv[k] + 5);
+            }
+        }
+
+      printf("ORTHELLO: pidprobe3 me=%d pp=%d tid=%d\n",
+             (int)me, (int)pp, (int)tid);
+
+      if (hold > 0)
+        {
+          sleep(hold);
+        }
+    }
+
   else if (argc >= 3 && strcmp(argv[2], "pidprobe2") == 0)
     {
       /* §99 pid 命名空间第二刀（进程管理号面）：
