@@ -1090,6 +1090,8 @@ static volatile int g_ev_addr[MAX_EVENTS];
 static volatile int g_ev_faults[MAX_EVENTS];
 static volatile int g_ev_kind[MAX_EVENTS];   /* [§103] 0=FAULT 1=EXIT */
 static volatile int g_ev_code[MAX_EVENTS];   /* [§103] EXIT 的退出码 */
+static volatile int g_ev_ready[MAX_EVENTS];  /* [§105] 故障/退出**时刻**的
+                                              *   就绪位（归因判据随事件走） */
 static volatile int g_ev_count;    /* 已入队的事件数 */
 static volatile int g_ev_lost;     /* 内核侧累计丢弃数 */
 
@@ -1110,6 +1112,7 @@ static void drain_faults(void)
           g_ev_faults[g_ev_count] = (int)rec.faults;
           g_ev_kind[g_ev_count]   = (int)rec.kind;   /* [§103] 分型随行 */
           g_ev_code[g_ev_count]   = (int)rec.code;   /* [§103] 退出码随行 */
+          g_ev_ready[g_ev_count]  = (int)rec.ready;  /* [§105] 就绪随行 */
         }
 
       /* ── 事件序审计（§三·补三十一 的验收装置）────────────────────
@@ -1208,8 +1211,9 @@ static void drain_faults(void)
         {
           if (g_drained < 8)
             {
-              printf("[ortsup] ← 退出事件 #%u victim=%d code=%d\n",
-                     (unsigned)rec.seq, rec.victim, (int)rec.code);
+              printf("[ortsup] ← 退出事件 #%u victim=%d code=%d ready=%u\n",
+                     (unsigned)rec.seq, rec.victim, (int)rec.code,
+                     (unsigned)rec.ready);
               fflush(stdout);
             }
 
@@ -1226,9 +1230,10 @@ static void drain_faults(void)
       if (g_drained < 8 || (g_drained % 20000u) == 0)
         {
           printf("[ortsup] ← 故障事件 #%u victim=%d pc=%p addr=%p "
-                 "faults=%u%s\n",
+                 "faults=%u ready=%u%s\n",
                  (unsigned)rec.seq, rec.victim, (void *)rec.pc,
                  (void *)rec.addr, (unsigned)rec.faults,
+                 (unsigned)rec.ready,
                  rec.lost ? "  ⚠️ 有事件丢失" : "");
           fflush(stdout);
         }
@@ -2567,6 +2572,16 @@ static int ort_container_main(int argc, FAR char *argv[])
     fflush(stdout);
   }
 
+  /* ★★ [§105] standby 也上报就绪 —— 语义扩展为"初始化完毕、**可接管**"
+   *   （现任的上报在 step_state 首次 announce 处，standby 不走 announce
+   *   所以在这里显式报）。替换交接用它替代"撑满启动窗口"的证明（窗口
+   *   仍是兜底）。nopub（raw_ 前缀）不报 —— 天然当"不配合"对照臂。 */
+
+  if (standby && !nopub)
+    {
+      prctl(PR_ORT_READY);
+    }
+
   /* ── 压力模式：把状态槽的并发窗口放大（测试装置）──────────────────
    *
    * 现任：每轮写 64 字节，**16 个字全部相等**；
@@ -2979,6 +2994,7 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
   pid_t newpid;
   int waited = 0;
   bool healthy = true;
+  bool ready_seen = false;
 
   spec->pid = -1;
 
@@ -3044,6 +3060,15 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
           healthy = false;
           break;
         }
+
+      /* [§105] 就绪上报（"可接管"）优先于"撑满窗口"的证明 ——
+       *   窗口仍是兜底（不配合的 standby 照旧走满窗口）。 */
+
+      if (prctl(PR_GET_ORT_READY, (int)newpid) == 1)
+        {
+          ready_seen = true;
+          break;
+        }
     }
 
   if (!healthy)
@@ -3054,10 +3079,21 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
       return false;
     }
 
-  /* 新的证明了自己 → 撤下旧的。到这里才真正"提交" */
+  /* 新的证明了自己 → 撤下旧的。到这里才真正"提交"。
+   * *两种证明**分型打印**：ready 判定（早）/ 窗口兜底（原行逐字不动，
+   * 保非上报臂的跨轮可比性）。 */
 
-  printf("[ortsup]   ✓ 新实例 pid=%d 已过启动窗口(%d ms) → 撤下旧实例 pid=%d\n",
-         (int)newpid, waited, (int)live->pid);
+  if (ready_seen)
+    {
+      printf("[ortsup]   ✓ 新实例 pid=%d 已就绪（ready 判定，用时 %d ms"
+             " < 窗口 %d ms）→ 撤下旧实例 pid=%d\n",
+             (int)newpid, waited, g_startup_window_ms, (int)live->pid);
+    }
+  else
+    {
+      printf("[ortsup]   ✓ 新实例 pid=%d 已过启动窗口(%d ms) → 撤下旧实例 pid=%d\n",
+             (int)newpid, waited, (int)live->pid);
+    }
 
   /* ★ 顺序：先点名新实例（它开始发布自己的状态），再撤旧的
    *   （旧的收到 SIGTERM 会立刻停止发布）。
@@ -3430,7 +3466,13 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
     int n = 0;
 
     cargv[n++] = (FAR char *)"container";   /* 标记位，两条路的唯一锚点 */
-    cargv[n++] = (FAR char *)mode;
+
+    /* [§105] `quiet_`（**含**，不与下面的前缀链互斥——可组合：
+     *   raw_quiet_* = nopub + ok）⇒ 以 "ok" 模式起：不注入故障。
+     *   替换交接这类"要活得住"的场景用它；原型默认流一律故障演示。 */
+
+    cargv[n++] = (strstr(cg->name, "quiet_") != NULL)
+                     ? (FAR char *)"ok" : (FAR char *)mode;
     cargv[n++] = dbuf;
     cargv[n++] = lbuf;
     cargv[n++] = vbuf;
@@ -3614,6 +3656,19 @@ static bool in_startup(FAR struct ort_cg_s *cg)
          (g_now_ms - cg->admitted_ms) < g_startup_window_ms;
 }
 
+/* ★★ [§105] 失效归因专用版：就绪判据优先取**事件携带的**故障时刻事实
+ *   （ev_ready），缓存位只作或运算补充 —— 封掉"上报后不足一拍即失效"
+ *   的归因竞态（§51 未收口 1：缓存粒度 = 循环节拍，上报与失效同拍时
+ *   缓存可能还没看到）。状态机用途（all_cgs_ready）仍用缓存版。 */
+
+static bool in_startup_ev(FAR struct ort_cg_s *cg, int ev_ready)
+{
+  return g_state == ORT_BOOT &&
+         cg->admitted_ms >= 0 &&
+         !cg->ready && ev_ready == 0 &&
+         (g_now_ms - cg->admitted_ms) < g_startup_window_ms;
+}
+
 /* 是否全部 CG 都已通过启动窗口（= 系统可以进 NOMINAL 了） */
 
 static bool all_cgs_ready(void)
@@ -3631,7 +3686,8 @@ static bool all_cgs_ready(void)
   return true;
 }
 
-static void on_cg_failed(FAR struct ort_cg_s *cg, int kind, int code)
+static void on_cg_failed(FAR struct ort_cg_s *cg, int kind, int code,
+                         int ev_ready)
 {
   /* ★★ [§103] **策略层分型**（事件层自 §49 起带 kind/code，这里接上）：
    *
@@ -3649,7 +3705,7 @@ static void on_cg_failed(FAR struct ort_cg_s *cg, int kind, int code)
    *     · FAULT（kind=0）→ 现状（逐字不动）。
    */
 
-  if (kind == 1 && !in_startup(cg) && !cg->critical && code == 0)
+  if (kind == 1 && !in_startup_ev(cg, ev_ready) && !cg->critical && code == 0)
     {
       cg->completed = true;
       printf("[ortsup] COMPLETED %s (code=0) —— 正常完成：不重启、不耗预算\n",
@@ -3666,7 +3722,7 @@ static void on_cg_failed(FAR struct ort_cg_s *cg, int kind, int code)
    * 运行期失效 = "它跑了、然后坏了"     → 运行时问题 → 可以先重启
    */
 
-  if (in_startup(cg))
+  if (in_startup_ev(cg, ev_ready))
     {
       printf("[ortsup] %s 在启动窗口内失效（准入后 %d ms < %d ms）"
              "→ 按 startup 策略\n",
@@ -4460,9 +4516,10 @@ int main(int argc, FAR char *argv[])
 
       while (g_handled < g_ev_count)
         {
-          int victim = g_ev_victim[g_handled];
-          int kind   = g_ev_kind[g_handled];   /* [§103] 分型随行 */
-          int code   = g_ev_code[g_handled];   /* [§103] 退出码随行 */
+          int victim   = g_ev_victim[g_handled];
+          int kind     = g_ev_kind[g_handled];     /* [§103] 分型随行 */
+          int code     = g_ev_code[g_handled];     /* [§103] 退出码随行 */
+          int ev_ready = g_ev_ready[g_handled];    /* [§105] 就绪随行 */
 
           g_handled++;
 
@@ -4480,7 +4537,7 @@ int main(int argc, FAR char *argv[])
                    *   "S1 兜底照常工作"（假通过）。
                    *   清位是**新实例**的事：start_cg 已经做了。 */
 
-                  on_cg_failed(&g_cgs[i], kind, code);
+                  on_cg_failed(&g_cgs[i], kind, code, ev_ready);
                   break;
                 }
             }
