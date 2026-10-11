@@ -9,15 +9,12 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-11 ORT（§102 **容器 pid 第三刀（实例化 + 主线程
-#               tid）** —— 命名空间 root 键改**实例键**（tg_ort_nsid）：
-#               设根者派生=新实例 / 成员派生=继承 ⇒ 同 root 并发多容器
-#               **各自 init=1**；主线程 gettid 视图（tid==pid；咽喉 =
-#               tls_initinfo，须排除 pthread）；pthread 线程号面仍全局
-#               （边界，与 tgkill 的 tid 面留后续刀）。并发臂（& + hold=4）
-#               两容器各自 me=1 pp=0 tid=1；A：e2e ×2 + 双负臂 + 宿主全绿
-#               （㉛）；M 双编 + run5 两 SKU ×2 逐字。内核 b10f9f481d。
-#               apps 侧 §102 = pidprobe3（hold= 并发臂）+ 夹具重烤。）
+# 最近配对事件：2026-10-11 ORT（§103 监督者策略层 EXIT/FAULT 分型：
+#               四规则（窗口内 startup / 关键含正常退出→安全动作（保守，
+#               S1）/ 非关键 exit(0)→COMPLETED / 非零退出→运行期失效）；
+#               RESULT 行格式未动保跨轮可比；实读更正 §49"不进故障路径"
+#               只对打印成立。apps 侧 ortsup 改动，内核未动，nuttx= 仍为
+#               b10f9f481d。四场景装置 ×2 全 PASS；M 双编 + run5 逐字。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
