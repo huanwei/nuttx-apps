@@ -3027,6 +3027,11 @@ static bool stop_cg(FAR struct ort_cg_s *cg)
       usleep(10000);
       waited += 10;
 
+      /* [§107] 宽限等待也是"监督者在干活"——照常心跳（3 s 宽限与
+       * 3 s 看门狗超时同量级，不跳会自伤）。 */
+
+      prctl(PR_ORT_HEARTBEAT);
+
       if (kill(cg->pid, 0) != 0)
         {
           printf("[ortsup]   %s pid=%d 在 %d ms 内干净退出\n",
@@ -3245,6 +3250,10 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
     {
       usleep(LOOP_MS * 1000);
       waited += LOOP_MS;
+
+      /* [§107] 替换证明窗可达 9 s ≫ 看门狗 3 s —— 等待期间照常心跳。 */
+
+      prctl(PR_ORT_HEARTBEAT);
 
       if (kill(newpid, 0) != 0)
         {
@@ -4192,6 +4201,40 @@ int main(int argc, FAR char *argv[])
       return ort_mqprobe_driver();
     }
 
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "wdselftest") == 0)
+    {
+      /* ★★ [§107] 看门狗自测（⚠️ 仅原型）：注册监督者 → 心跳约 1 s →
+       * **有意停跳**（保持"活着但静默"）—— 内核看门狗应在超时后
+       * 打见证行 + PANIC（fail-stop）。这条模式就是"静默失联"本身的
+       * 确定性复现装置（不依赖 kill 之类的外部手段）。 */
+
+      int i;
+
+      prctl(PR_ORT_SUPERVISOR_RESET);
+      if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
+        {
+          printf("[ortsup] wdselftest: *** 注册监督者失败 ***\n");
+          return 1;
+        }
+
+      printf("[ortsup] wdselftest: 心跳 1 s，然后**停跳**（等看门狗）\n");
+      fflush(stdout);
+
+      for (i = 0; i < 200; i++)
+        {
+          prctl(PR_ORT_HEARTBEAT);
+          usleep(5000);
+        }
+
+      printf("[ortsup] wdselftest: 心跳停止 —— 静默中\n");
+      fflush(stdout);
+
+      for (;;)
+        {
+          sleep(1);
+        }
+    }
+
   if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "waitadm") == 0)
     {
       unsigned ms  = (unsigned)atoi(argv[2]);
@@ -4793,7 +4836,17 @@ int main(int argc, FAR char *argv[])
 
       usleep(LOOP_MS * 1000);
       g_now_ms += LOOP_MS;      /* 监督者时钟 */
+
+      /* [§107] 监督者心跳（每轮一次）：首跳武装内核看门狗，此后
+       * 静默 3 s → fail-stop。 */
+
+      prctl(PR_ORT_HEARTBEAT);
     }
+
+  /* [§107] 走到收尾 = 干净退出（场景结束）——**显式解除**看门狗
+   * （崩溃/挂死解不了，那正是 fail-stop 要抓的）。 */
+
+  prctl(PR_ORT_HEARTBEAT_STOP);
 
   /* ── 收尾 ──────────────────────────────────────────────────────── */
 
