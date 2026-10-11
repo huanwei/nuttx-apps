@@ -157,7 +157,7 @@ static void become_supervisor(void)
 
   prctl(PR_ORT_SUPERVISOR_RESET);
 
-  ret = prctl(PR_SET_ORT_SUPERVISOR);
+  ret = prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN);
   if (ret != 0)
     {
       printf("[ortmem] FAIL: PR_SET_ORT_SUPERVISOR = %d\n", ret);
@@ -251,7 +251,7 @@ static volatile int g_steal_ret;
 
 static int steal_task(int argc, FAR char *argv[])
 {
-  g_steal_ret  = prctl(PR_SET_ORT_SUPERVISOR);
+  g_steal_ret  = prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN);
   g_steal_done = 1;
   return g_steal_ret == -EPERM ? 0 : 4;
 }
@@ -291,7 +291,7 @@ static void scene_basic(int domain)
 
 static void scene_hijack(int domain)
 {
-  int ret = prctl(PR_SET_ORT_SUPERVISOR);
+  int ret = prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN);
 
   (void)domain;
 

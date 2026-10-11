@@ -1151,7 +1151,7 @@ static int do_sup(FAR const char *view, int ncfg, FAR char * const *cfgs)
   int ret;
   int i;
 
-  ret = prctl(PR_SET_ORT_SUPERVISOR);
+  ret = prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN);
   if (ret < 0)
     {
       printf("[sup] 注册监督者失败: %d（errno=%d）→ sup 中止\n",
@@ -1385,7 +1385,7 @@ static int do_par(FAR const char *view, int ncfg, FAR char * const *cfgs)
       ncfg = ORT_PAR_MAX;
     }
 
-  ret = prctl(PR_SET_ORT_SUPERVISOR);
+  ret = prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN);
   if (ret < 0)
     {
       printf("[par] 注册监督者失败: %d（errno=%d）→ par 中止\n", ret, errno);
@@ -1564,7 +1564,7 @@ static int do_supd(int secs)
       secs = 10;
     }
 
-  ret = prctl(PR_SET_ORT_SUPERVISOR);
+  ret = prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN);
   if (ret < 0)
     {
       printf("[supd] 注册监督者失败: %d（errno=%d）→ supd 中止\n",
@@ -1661,7 +1661,7 @@ static int do_orch(int secs, FAR const char *view, int ncfg,
       ncfg = ORT_ORCH_MAX;
     }
 
-  ret = prctl(PR_SET_ORT_SUPERVISOR);
+  ret = prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN);
   if (ret < 0)
     {
       printf("[orch] 注册监督者失败: %d（errno=%d）→ orch 中止\n",

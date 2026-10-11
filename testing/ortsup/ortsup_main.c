@@ -1874,7 +1874,7 @@ static int ort_sigprobe_driver(void)
   /* 臂③：domain（容器真实形态）——监督者注册 + 绑域 + 准入唤醒 */
 
   prctl(PR_ORT_SUPERVISOR_RESET);
-  if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
+  if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
     {
       printf("[sigprobe] *** 注册监督者失败（臂③ 跳过）——如其它模式已注册过，需 RESET ***\n");
       return 1;
@@ -2066,7 +2066,7 @@ static int ort_devprobe_driver(void)
    * 必须先于 rooted 臂（root 无法清除，会掩蔽闸的实弹面）。 */
 
   prctl(PR_ORT_SUPERVISOR_RESET);
-  if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
+  if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
     {
       printf("[devprobe] *** 注册监督者失败（臂② 跳过）——如其它模式已注册过，需 RESET ***\n");
       return 1;
@@ -2288,7 +2288,7 @@ static int ort_mqprobe_driver(void)
   /* 臂②：domain（容器真实形态）——监督者注册 + 绑域 + 准入唤醒 */
 
   prctl(PR_ORT_SUPERVISOR_RESET);
-  if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
+  if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
     {
       printf("[mqprobe] *** 注册监督者失败（臂② 跳过）***\n");
       return 1;
@@ -4211,7 +4211,7 @@ int main(int argc, FAR char *argv[])
       int i;
 
       prctl(PR_ORT_SUPERVISOR_RESET);
-      if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
+      if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
         {
           printf("[ortsup] wdselftest: *** 注册监督者失败 ***\n");
           return 1;
@@ -4233,6 +4233,50 @@ int main(int argc, FAR char *argv[])
         {
           sleep(1);
         }
+    }
+
+  if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "suptest") == 0)
+    {
+      /* ★★ [§108] 注册鉴权自测（⚠️ 仅原型，配合 RESET）：三臂 ——
+       *   ok   = 原名 + 正确凭据 → 应放行；
+       *   bad  = 原名 + 错凭据   → 应被**凭据层**拦
+       *          （内核 alert: `bad token`）；
+       *   name = **改名**后用正确凭据 → 应被**名字层**拦
+       *          （内核 alert: `not in [...]`）—— 名字层负面臂的
+       *          现场复现（此前只能靠改构建；现在一行 PR_SET_NAME）。
+       * 两层 alert 文案不同 ⇒ 装置能分辨是哪一层拦下的。
+       * ⚠️ ORT-A 的 prctl 直接返回负 errno（rc=-1 即 -EPERM）；
+       *    ORT-M 走 syscall 包装（rc=-1 + errno）——本模式用于 A 装置。 */
+
+      FAR const char *which = argv[2];
+      char oldname[CONFIG_TASK_NAME_SIZE + 1];
+      int rc;
+
+      oldname[0] = '\0';
+
+      prctl(PR_ORT_SUPERVISOR_RESET);
+
+      if (strcmp(which, "name") == 0)
+        {
+          prctl(PR_GET_NAME, oldname);
+          prctl(PR_SET_NAME, "intruder");
+        }
+
+      errno = 0;
+      rc = prctl(PR_SET_ORT_SUPERVISOR,
+                 strcmp(which, "bad") == 0 ? (int)0x0badbad
+                                           : (int)CONFIG_ORT_SUPERVISOR_TOKEN);
+
+      printf("[suptest] %s: rc=%d errno=%d\n", which, rc, errno);
+      fflush(stdout);
+
+      if (oldname[0] != '\0')
+        {
+          prctl(PR_SET_NAME, oldname);
+        }
+
+      prctl(PR_ORT_SUPERVISOR_RESET);
+      return 0;
     }
 
   if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "waitadm") == 0)
@@ -4329,7 +4373,7 @@ int main(int argc, FAR char *argv[])
 
   prctl(PR_ORT_SUPERVISOR_RESET);
 
-  if (prctl(PR_SET_ORT_SUPERVISOR) != 0)
+  if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
     {
       printf("[ortsup] FAIL: 注册监督者失败\n");
       return 1;
