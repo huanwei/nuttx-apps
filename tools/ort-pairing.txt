@@ -9,13 +9,14 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-11 ORT（§105 **④ 就绪位收口** —— 归因判据随
-#               事件走（故障/退出记录携带 ready；EXIT 在 group_leave 当场取
-#               ——tcb 可能已亡）；替换交接 ready 优先、窗口兜底（5ms ≪
-#               9000ms + 接续；兜底行逐字）；新增 quiet_ 前缀（不注入故障）。
-#               归因三臂 v1/v2/v3 回归同形；M run5 逐字；A 全电池绿。内核
-#               fd17b26257。apps 侧 §105 = ortsup 接线 + quiet_。
+# 最近配对事件：2026-10-11 ORT（§106 **IPC 面第一刀（mqueue）** —— 勘察：
+#               信号量/SHM 两 SKU 均未开，IPC 面唯一活着的是 mqueue；
+#               mq_open=inode_find("/var/mqueue/<名>") ⇒ 两层同构（A 路径
+#               层挡 / **M 绑域实弹**）；闸在解析后三处（open 既有/创建/
+#               unlink）→ 容器 -EPERM（第一刀全拒绝）。三臂两 SKU PASS +
+#               run5 逐字；A 全电池绿（㉜）。内核 61e7156ddf。apps 侧
+#               §106 = 双 mqprobe + 夹具。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=fd17b26257fa3e1f4751dcb0bfcc2d6835009d89
+nuttx=61e7156ddf4796d8e08cb63cd96e4cbd08ae9ab0
