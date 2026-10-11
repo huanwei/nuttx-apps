@@ -242,6 +242,7 @@ struct ort_cg_s
   int             restarts;
   int             faults;
   bool            failed;        /* 已失效且不再重启 */
+  bool            completed;     /* [§103] 非关键 CG 正常完成（code=0）的终局 */
   int             admitted_ms;   /* 被准入的时刻（-1 = 尚未准入） */
   int             ready;         /* ④ 就绪上报（当前实例；新实例重置为 0） */
 };
@@ -1062,6 +1063,8 @@ static void app_enter_safe_state(void)
 static volatile int g_ev_victim[MAX_EVENTS];
 static volatile int g_ev_addr[MAX_EVENTS];
 static volatile int g_ev_faults[MAX_EVENTS];
+static volatile int g_ev_kind[MAX_EVENTS];   /* [§103] 0=FAULT 1=EXIT */
+static volatile int g_ev_code[MAX_EVENTS];   /* [§103] EXIT 的退出码 */
 static volatile int g_ev_count;    /* 已入队的事件数 */
 static volatile int g_ev_lost;     /* 内核侧累计丢弃数 */
 
@@ -1080,6 +1083,8 @@ static void drain_faults(void)
           g_ev_victim[g_ev_count] = rec.victim;
           g_ev_addr[g_ev_count]   = (int)rec.addr;
           g_ev_faults[g_ev_count] = (int)rec.faults;
+          g_ev_kind[g_ev_count]   = (int)rec.kind;   /* [§103] 分型随行 */
+          g_ev_code[g_ev_count]   = (int)rec.code;   /* [§103] 退出码随行 */
         }
 
       /* ── 事件序审计（§三·补三十一 的验收装置）────────────────────
@@ -1163,10 +1168,16 @@ static void drain_faults(void)
       g_ev_count++;
       g_ev_lost = (int)rec.lost;
 
-      /* ★ 事件分型（2026-10-05，手册 §三·补四十九）：kind=1 = 容器
-       *   **正常退出**。与故障同走上面的审计（seq 连续性 / 缺口记账
-       *   一体生效），但**不进故障路径** —— 不触发重启计数、不改
-       *   CG 状态：退出 ≠ 故障。（有故障史的容器不发 EXIT 事件。） */
+      /* ★ 事件分型：kind=1 = 容器**正常退出**。与故障同走上面的审计
+       *   （seq 连续性 / 缺口记账一体生效）。（有故障史的容器不发
+       *   EXIT 事件。）
+       *
+       *   ⚠️ **更正（§103 实读）**：§49 当时的注释写"不进故障路径
+       *   —— 不触发重启计数、不改 CG 状态"——那句只对**打印层**成立：
+       *   事件记录早已进 g_ev_victim（上面那段对所有 kind 都记），
+       *   策略层（on_cg_failed）此前**不区分 kind** —— 正常退出也会走
+       *   cg->faults++ 与重启预算。§103 起 kind/code 随记录一并交给
+       *   策略层做真正的分型（见 on_cg_failed）。 */
 
       if (rec.kind == 1)
         {
@@ -2095,6 +2106,8 @@ static int ort_container_main(int argc, FAR char *argv[])
   int badptr = 0;                /* 测试装置：用非法用户指针调 ORT 接口 */
   int badinsn = 0;               /* 测试装置：执行一条**未定义指令** */
   int exit0 = 0;                 /* 测试装置：正常退出（撞"退出事件"通道） */
+  int exitlate = 0;              /* [§103] 窗口后正常退出（撞"完成"策略格） */
+  int exit1 = 0;                 /* [§103] 窗口后非零退出（撞运行期分型格） */
   int delay = 0;
   int domain = 0;
   int version = 0;
@@ -2151,6 +2164,14 @@ static int ort_container_main(int argc, FAR char *argv[])
       else if (strcmp(argv[i], "exit0") == 0)
         {
           exit0 = 1;
+        }
+      else if (strcmp(argv[i], "exitlate") == 0)
+        {
+          exitlate = 1;
+        }
+      else if (strcmp(argv[i], "exit1") == 0)
+        {
+          exit1 = 1;
         }
       else if (strcmp(argv[i], "nopub") == 0)
         {
@@ -2617,6 +2638,19 @@ static int ort_container_main(int argc, FAR char *argv[])
              domain);
       fflush(stdout);
       _exit(0);
+    }
+
+  /* [§103] 窗口后退出：睡过启动窗口（1500ms），让死亡落在**运行期**
+   * —— 这正是策略层分型要测的那一格（正常完成 / 非零退出两条路）。
+   * 2500ms = 窗口余量 + 监督者 BOOT→NOMINAL 迁移时间。 */
+
+  if (exitlate || exit1)
+    {
+      printf("[ortsup] 容器(domain %d): **延迟退出模式** —— 2500ms 后"
+             " _exit(%d)\n", domain, exit1 ? 1 : 0);
+      fflush(stdout);
+      usleep(2500 * 1000);
+      _exit(exit1 ? 1 : 0);
     }
 
   (void)burst;
@@ -3367,6 +3401,14 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
       {
         cargv[n++] = (FAR char *)"exit0";
       }
+    else if (strncmp(cg->name, "exitlate_", 9) == 0)
+      {
+        cargv[n++] = (FAR char *)"exitlate";
+      }
+    else if (strncmp(cg->name, "exit1_", 6) == 0)
+      {
+        cargv[n++] = (FAR char *)"exit1";
+      }
 
     cargv[n] = NULL;
   }
@@ -3508,8 +3550,33 @@ static bool all_cgs_ready(void)
   return true;
 }
 
-static void on_cg_failed(FAR struct ort_cg_s *cg)
+static void on_cg_failed(FAR struct ort_cg_s *cg, int kind, int code)
 {
+  /* ★★ [§103] **策略层分型**（事件层自 §49 起带 kind/code，这里接上）：
+   *
+   *   规则（全部写死可判）：
+   *     · 启动窗口内（**不分 kind/code**）→ startup 策略（§49 的
+   *       exit0 行为逐字保持：窗口 = 部署判定窗，"没起来" = 部署问题）；
+   *     · 关键 CG 的任何死亡（**含正常退出**）→ 安全动作（保守口径，
+   *       依据公理 S1"不信任失效组件"：exit(0) 是**自我声明**，
+   *       监督者无法把它与"没干完就跑"区分 —— 关键服务消失就是
+   *       失去保障；这是**设计决策**，不是定理）；
+   *     · 非关键 + EXIT(code=0) → **正常完成**：不重启、不耗预算、
+   *       状态不动（完成 = 正常终局）；
+   *     · 非关键 + EXIT(code≠0) → **非零退出**：按运行期失效走
+   *       （重启预算照耗），打印标 kind；
+   *     · FAULT（kind=0）→ 现状（逐字不动）。
+   */
+
+  if (kind == 1 && !in_startup(cg) && !cg->critical && code == 0)
+    {
+      cg->completed = true;
+      printf("[ortsup] COMPLETED %s (code=0) —— 正常完成：不重启、不耗预算\n",
+             cg->name);
+      fflush(stdout);
+      return;
+    }
+
   cg->faults++;
 
   /* ★ H29：先判启动期还是运行期 —— 两套策略语义完全不同。
@@ -3536,8 +3603,21 @@ static void on_cg_failed(FAR struct ort_cg_s *cg)
       return;
     }
 
-  printf("[ortsup] %s 失效（第 %d 次，restart %d/%d）\n",
-         cg->name, cg->faults, cg->restarts, cg->max_restarts);
+  /* [§103] 运行期路径的打印按 kind 措辞（M 标准场景恒 kind=0 ⇒
+   * "失效" 逐字不变，既有逐字对比不受影响）。 */
+
+  if (kind == 1)
+    {
+      printf("[ortsup] %s **%s退出**（code=%d）→ 按运行期失效"
+             "（第 %d 次，restart %d/%d）\n",
+             cg->name, code == 0 ? "正常" : "非零", code,
+             cg->faults, cg->restarts, cg->max_restarts);
+    }
+  else
+    {
+      printf("[ortsup] %s 失效（第 %d 次，restart %d/%d）\n",
+             cg->name, cg->faults, cg->restarts, cg->max_restarts);
+    }
 
   /* 以下为运行期策略。关键 CG：无论重启预算如何，直接进安全态（T7 / T8） */
 
@@ -4300,6 +4380,8 @@ int main(int argc, FAR char *argv[])
       while (g_handled < g_ev_count)
         {
           int victim = g_ev_victim[g_handled];
+          int kind   = g_ev_kind[g_handled];   /* [§103] 分型随行 */
+          int code   = g_ev_code[g_handled];   /* [§103] 退出码随行 */
 
           g_handled++;
 
@@ -4317,7 +4399,7 @@ int main(int argc, FAR char *argv[])
                    *   "S1 兜底照常工作"（假通过）。
                    *   清位是**新实例**的事：start_cg 已经做了。 */
 
-                  on_cg_failed(&g_cgs[i]);
+                  on_cg_failed(&g_cgs[i], kind, code);
                   break;
                 }
             }
