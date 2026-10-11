@@ -9,14 +9,13 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-11 ORT（§107 **看门狗：监督者静默失联 fail-stop** ——
-#               心跳（首跳武装 LPWORK 500ms 周期项，停摆 3000ms → 见证 +
-#               PANIC）+ STOP 显式解除（干净退出自己解；崩溃/挂死解不了 =
-#               要抓的）；beat 三点（主环/替换 9s 窗/停止宽限 3s）。
-#               A/M 两 SKU 两臂 PASS + run5 逐字；既有装置九日志零残留；
-#               A 全电池绿。内核 cb40d6513c。apps 侧 §107 = ortsup 三点
-#               beat + wdselftest。）
+# 最近配对事件：2026-10-12 ORT（§108 **监督者槽位收口** —— 凭据级鉴权
+#               （PR_SET_ORT_SUPERVISOR 双层：名字白名单 + 构建期 TOKEN
+#               0x4f525431；分开见证可分辨）+ **pid 复用半的代码实证收口**
+#               （pid 单调不复用 + 前提绊线）。12 处调用点同轮重编；suptest
+#               三臂一次过；M 回归 + A 全电池绿。内核 7704eaf306。apps 侧
+#               §108 = 三 app 凭据接线 + suptest。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=cb40d6513ce8f7c8b800916ca6c9ba0e88e61011
+nuttx=7704eaf3065d60d6e5321feadd462cf99b19e6d7
