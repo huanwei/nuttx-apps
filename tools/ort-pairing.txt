@@ -9,15 +9,13 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-11 ORT（§104 **设备面第二刀（按 manifest 的设备
-#               白名单）** —— manifest devices= 字段 → PR_SET_ORT_DEVWL
-#               （prctl 33）→ fs_open 闸按组名单放行（末段名粒度）；缺省=
-#               全拒绝（§101 语义保持，向后兼容）；ort_devwl_set 三边同锁
-#               （换名/释放/比对）。M 四臂两 SKU 全 PASS（wled ⇒
-#               console=EPERM/null=OK/zero=EPERM）+ run5 逐字；A：宿主 +
-#               e2e ×2 + 双负臂全绿。内核 d94b173bf9。apps 侧 §104 =
-#               ortsup devices= 接线 + devprobe 第四臂。）
+# 最近配对事件：2026-10-11 ORT（§105 **④ 就绪位收口** —— 归因判据随
+#               事件走（故障/退出记录携带 ready；EXIT 在 group_leave 当场取
+#               ——tcb 可能已亡）；替换交接 ready 优先、窗口兜底（5ms ≪
+#               9000ms + 接续；兜底行逐字）；新增 quiet_ 前缀（不注入故障）。
+#               归因三臂 v1/v2/v3 回归同形；M run5 逐字；A 全电池绿。内核
+#               fd17b26257。apps 侧 §105 = ortsup 接线 + quiet_。
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=d94b173bf9c6bd41d7527689f4a9f9d60b8a63aa
+nuttx=fd17b26257fa3e1f4751dcb0bfcc2d6835009d89
