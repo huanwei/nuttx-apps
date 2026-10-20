@@ -2599,6 +2599,139 @@ static int ort_fdprobe_driver(void)
   return pass ? 0 : 1;
 }
 
+#ifndef CONFIG_BUILD_KERNEL
+/* [§113] 容器派生属性继承勘察：domain 容器内 task_create 一个子组。
+ * 仅 M（PROTECTED）：A 的 ELF 用户程序没有 task_create。
+ * 父（容器）应 domain=0 + devwl 生效（zero=OK / null=EPERM）；子组
+ * 当前**未继承**属性 —— 若显示 domain=-1 且 null=OK，即缺口实锤。 */
+
+static int ort_spawnprobe_child(int argc, FAR char *argv[])
+{
+  int dom = prctl(PR_GET_ORT_DOMAIN);
+  int z;
+  int n;
+  int ze;
+  int ne;
+
+  errno = 0;
+  z = open("/dev/zero", O_RDONLY);
+  ze = errno;
+  errno = 0;
+  n = open("/dev/null", O_RDONLY);
+  ne = errno;
+
+  printf("[spawnprobe] child: domain=%d zero=%s null=%s\n", dom,
+         z >= 0 ? "OK" : (ze == EPERM ? "EPERM" : "打不开"),
+         n >= 0 ? "OK" : (ne == EPERM ? "EPERM" : "打不开"));
+
+  if (z >= 0) close(z);
+  if (n >= 0) close(n);
+  return 0;
+}
+
+static int ort_spawnprobe_parent(int argc, FAR char *argv[])
+{
+  FAR char *cargv[2];
+  pid_t pid;
+  int st = 0;
+  int dom;
+  int z;
+  int n;
+  int ze;
+  int ne;
+
+  prctl(PR_ORT_WAIT_ADMISSION, 3000);
+  dom = prctl(PR_GET_ORT_DOMAIN);
+
+  errno = 0;
+  z = open("/dev/zero", O_RDONLY);
+  ze = errno;
+  errno = 0;
+  n = open("/dev/null", O_RDONLY);
+  ne = errno;
+
+  printf("[spawnprobe] parent: domain=%d zero=%s null=%s\n", dom,
+         z >= 0 ? "OK" : (ze == EPERM ? "EPERM" : "打不开"),
+         n >= 0 ? "OK" : (ne == EPERM ? "EPERM" : "打不开"));
+
+  if (z >= 0) close(z);
+  if (n >= 0) close(n);
+
+  cargv[0] = (FAR char *)"spawnprobe-child";
+  cargv[1] = NULL;
+
+  errno = 0;
+  pid = task_create("spawnprobe-child", CONTAINER_PRIO, 4096,
+                    (main_t)ort_spawnprobe_child, cargv);
+  printf("[spawnprobe] spawn pid=%d errno=%d\n", (int)pid, errno);
+
+  if (pid > 0)
+    {
+      waitpid(pid, &st, 0);
+      printf("[spawnprobe] child status=%d\n", st);
+    }
+
+  return 0;
+}
+
+static int ort_spawnprobe_driver(void)
+{
+  FAR char *cargv[3];
+  pid_t pid;
+  int st = 0;
+  int ret;
+
+  cargv[0] = (FAR char *)"ortsup";
+  cargv[1] = (FAR char *)"spawnprobe-parent";
+  cargv[2] = NULL;
+
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pid, "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0)
+    {
+      printf("[spawnprobe] *** spawn 失败: %d ***\n", ret);
+      return 1;
+    }
+#else
+  pid = task_create("spawnprobe-parent", CONTAINER_PRIO, CONTAINER_STACK,
+                    ort_spawnprobe_parent, cargv);
+  if (pid < 0)
+    {
+      printf("[spawnprobe] *** create 失败: %d ***\n", (int)pid);
+      return 1;
+    }
+#endif
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
+  if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
+    {
+      printf("[spawnprobe] *** 注册监督者失败 ***\n");
+      return 1;
+    }
+
+  /* devwl 必须先于绑域下发（§104 的臂内时序规矩） */
+
+  ret = prctl(PR_SET_ORT_DEVWL, (int)pid, "/dev/zero");
+  if (ret != 0)
+    {
+      printf("[spawnprobe] *** 下发 devwl 失败: %d ***\n", ret);
+      return 1;
+    }
+
+  ret = prctl(PR_SET_ORT_DOMAIN, 0, (int)pid);
+  if (ret != 0)
+    {
+      printf("[spawnprobe] *** 绑域失败: %d ***\n", ret);
+      return 1;
+    }
+
+  waitpid(pid, &st, 0);
+  printf("[spawnprobe] parent status=%d\n", st);
+  printf("SPAWNPROBE DONE\n");
+  return 0;
+}
+#endif /* !CONFIG_BUILD_KERNEL */
+
 static int ort_container_main(int argc, FAR char *argv[])
 {
   FAR const char *mode = NULL;
@@ -4455,6 +4588,18 @@ int main(int argc, FAR char *argv[])
     {
       return ort_fdprobe_driver();
     }
+
+#ifndef CONFIG_BUILD_KERNEL
+  if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "spawnprobe-parent") == 0)
+    {
+      return ort_spawnprobe_parent(argc, argv);
+    }
+
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "spawnprobe") == 0)
+    {
+      return ort_spawnprobe_driver();
+    }
+#endif
 
   if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "wdselftest") == 0)
     {

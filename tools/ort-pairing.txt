@@ -9,15 +9,14 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-20 ORT（§112 **继承 fd 收口** —— host→容器只留
-#               stdio：A 在 spawn 复制点（父不重挂、子重挂）/ M 在准入
-#               返回自清；容器间派生保留完整继承。实测：已打开 fd 绕过
-#               §101/§104 的 open 闸（自建 launcher 可传宿主文件/设备）。
-#               A 全电池绿 ×2 + 双负臂（e2e ㉟/T18 两臂 nopen=3）；
-#               M 双编 run5+mqprobe+fdprobe 两 SKU PASS。内核 52ab4b3429。
-#               apps 侧 §112 = orthello fdprobe/fdlaunch + ortsup fdprobe
-#               双臂 + 夹具 fixture-fdprobe。）
+# 最近配对事件：2026-10-20 ORT（§113 **容器派生属性继承** —— task_init 把
+#               domain/devwl/memcap 传给子组；修复前 M 容器内 task_create
+#               的子组 domain=-1、/dev/null=OK（闸失效实锤）。fd 谓词统一
+#               re_root||domain（容器内派生完整继承+fdsafe）。A 全电池绿
+#               ×2 + 双负臂；M 双编 run5+mqprobe+fdprobe+spawnprobe 两
+#               SKU PASS。内核 66bf30633c。
+#               apps 侧 §113 = ortsup spawnprobe（仅 M 编译）。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=52ab4b34290e7ca2199f6d72ec5e9c6a2cc91c81
+nuttx=66bf30633c95cd34928fdd2c7f890c3a7b3b6898
