@@ -2183,7 +2183,10 @@ static int ort_mqprobe_probe(int argc, FAR char *argv[])
   FAR const char *mode = "unbound";
   FAR const char *ores;
   FAR const char *ures;
+  FAR const char *ps = "NA";
   char mbuf[16];
+  char rbuf[32];
+  unsigned int prio = 0;
   mqd_t mq;
   int k;
 
@@ -2205,6 +2208,34 @@ static int ort_mqprobe_probe(int argc, FAR char *argv[])
   if (strcmp(mode, "domain") == 0)
     {
       prctl(PR_ORT_WAIT_ADMISSION, 3000);
+    }
+
+  /* [§111] 容器臂（domain/rooted）：全局名 "/ortg" 由驱动持有且含
+   * "GLOBAL"。容器应看到**自己实例里的空队列** —— 非阻塞收必 EAGAIN；
+   * 若收到 GLOBAL，说明命名空间翻译失效（= 全局可见，LEAK）。 */
+
+  if (strcmp(mode, "unbound") != 0)
+    {
+      mq = mq_open("/ortg", O_CREAT | O_RDWR | O_NONBLOCK, 0666, NULL);
+      if (mq != (mqd_t)-1)
+        {
+          if (mq_receive(mq, rbuf, sizeof(rbuf), &prio) < 0 &&
+              errno == EAGAIN)
+            {
+              ps = "EAGAIN";
+            }
+          else
+            {
+              ps = "LEAK";
+            }
+
+          mq_unlink("/ortg");
+          mq_close(mq);
+        }
+      else
+        {
+          ps = "打不开";
+        }
     }
 
   mq = mq_open("/ortmq", O_CREAT | O_RDWR, 0666, NULL);
@@ -2229,19 +2260,18 @@ static int ort_mqprobe_probe(int argc, FAR char *argv[])
       ures = ores;   /* 开都开不了 —— unlink 判据取同形（对称可读） */
     }
 
-  printf("[mqprobe] probe(%s): open=%s unlink=%s\n", mode, ores, ures);
+  printf("[mqprobe] probe(%s): open=%s unlink=%s peek=%s\n",
+         mode, ores, ures, ps);
 
   if (strcmp(mode, "unbound") == 0)
     {
       return (!strcmp(ores, "OK") && !strcmp(ures, "OK")) ? 0 : 1;
     }
 
-  if (strcmp(mode, "rooted") == 0)
-    {
-      return (!strcmp(ores, "打不开") && !strcmp(ures, "打不开")) ? 0 : 1;
-    }
+  /* domain / rooted：自有命名空间可建可删，且看不见全局队列 */
 
-  return (!strcmp(ores, "EPERM") && !strcmp(ures, "EPERM")) ? 0 : 1;
+  return (!strcmp(ores, "OK") && !strcmp(ures, "OK") &&
+          !strcmp(ps, "EAGAIN")) ? 0 : 1;
 }
 
 #ifndef CONFIG_BUILD_KERNEL
@@ -2254,6 +2284,9 @@ static int ort_mqprobe_probe_entry(int argc, FAR char *argv[])
 static int ort_mqprobe_driver(void)
 {
   FAR char *cargv[4];
+  char   rbuf[32];
+  unsigned int prio = 0;
+  mqd_t  gq;
   pid_t pids[3];
   int   sts[3];
   int   i;
@@ -2266,6 +2299,18 @@ static int ort_mqprobe_driver(void)
     {
       return 1;
     }
+
+  /* [§111] 驱动是宿主（re_root 假）：先建**全局**队列 "/ortg" 并留
+   * "GLOBAL" —— 容器臂同名打开时若看不见这条消息才算命名空间成立。 */
+
+  gq = mq_open("/ortg", O_CREAT | O_RDWR, 0666, NULL);
+  if (gq == (mqd_t)-1 || mq_send(gq, "GLOBAL", 7, 1) < 0)
+    {
+      printf("[mqprobe] *** 全局队列建/发失败（errno=%d）***\n", errno);
+      return 1;
+    }
+
+  mq_close(gq);
 
   cargv[0] = (FAR char *)"ortsup";
   cargv[1] = (FAR char *)"mqprobe-probe";
@@ -2348,6 +2393,34 @@ static int ort_mqprobe_driver(void)
         {
           pass = 0;
         }
+    }
+
+  /* [§111] 全局队列必须原封不动（容器只在各自前缀里建/删同名队列） */
+
+  gq = mq_open("/ortg", O_RDONLY, 0);
+  if (gq != (mqd_t)-1)
+    {
+      ssize_t n = mq_receive(gq, rbuf, sizeof(rbuf), &prio);
+
+      if (n > 0)
+        {
+          rbuf[(size_t)n < sizeof(rbuf) ? (size_t)n : sizeof(rbuf) - 1] = '\0';
+        }
+
+      printf("[mqprobe] global read=%s\n",
+             n > 0 ? rbuf : "(none)");
+      if (n <= 0 || strcmp(rbuf, "GLOBAL") != 0)
+        {
+          pass = 0;
+        }
+
+      mq_unlink("/ortg");
+      mq_close(gq);
+    }
+  else
+    {
+      printf("[mqprobe] *** 全局队列打不开（errno=%d）***\n", errno);
+      pass = 0;
     }
 
   printf("MQPROBE RESULT: %s\n", pass ? "PASS" : "FAIL");

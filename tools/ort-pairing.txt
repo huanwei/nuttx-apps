@@ -9,13 +9,15 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-20 ORT（§110 **overlayfs 残余收口** —— 目录 rename
-#               递归上移（链接重建/子树复制）+ 同名重建清旧记号（内核见证行）；
-#               真因修复 = copyup_item 1KB 栈缓冲改堆（压穿内核栈的假"锁挂死"）；
-#               合并态目录 rename fail-closed。A 全电池绿 ×2 + 双负臂；
-#               M 双编 run5 两 SKU 同形。内核 241040b05f。
-#               apps 侧 §110 = 夹具 dir2/{a,b}.txt + l→a.txt。）
+# 最近配对事件：2026-10-20 ORT（§111 **IPC 面第二刀：mqueue 实例命名空间** ——
+#               容器名字单组件校验 + ort.n<nsid>/ort.d<domain> 前缀；
+#               可信路径全局解析（inode 的 find/reserve/remove 三处成对）；
+#               §106 全拒退役。实测陷阱：只换 find → 容器删队列时把 /u
+#               挂载点从命名空间卸掉。A 全电池绿 ×2 + 双负臂；
+#               M 双编 run5 + mqprobe 两 SKU PASS。内核 cd14c42b99。
+#               apps 侧 §111 = orthello mqhost/mqpeek/mqread/mqleave/
+#               mqcheck/mqesc 六臂 + ortsup mqprobe 全局队/peek 判据 + 夹具。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=241040b05f58268293088195e6220a38fd992d51
+nuttx=cd14c42b995a57f9911b864b779f4fbc13514845

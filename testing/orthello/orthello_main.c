@@ -533,6 +533,140 @@ int main(int argc, FAR char *argv[])
       printf("ORTHELLO: mqprobe open=%s unlink=%s\n", ores, ures);
     }
 
+  else if (argc >= 3 && strcmp(argv[2], "mqhost") == 0)
+    {
+      /* [§111] 宿主臂：在**全局**命名空间留一条带 token 的队列
+       * （不 unlink —— 留给容器臂证明"看不见"、宿主臂证明"还在"）。 */
+
+      mqd_t mq = mq_open("/isoq", O_CREAT | O_RDWR, 0666, NULL);
+      int ok = 0;
+
+      if (mq != (mqd_t)-1)
+        {
+          ok = mq_send(mq, "GLOBAL", 7, 1) == 0;
+          mq_close(mq);
+        }
+
+      printf("ORTHELLO: mqhost=%s\n", ok ? "OK" : "FAIL");
+    }
+
+  else if (argc >= 3 && strcmp(argv[2], "mqpeek") == 0)
+    {
+      /* [§111] 容器臂：同名 "/isoq" 在本实例里是**自己的空队列** ——
+       * 非阻塞收必 EAGAIN；收到任何消息 = 全局可见（LEAK）。 */
+
+      char rbuf[32];
+      unsigned int prio = 0;
+      ssize_t n;
+      mqd_t mq = mq_open("/isoq", O_CREAT | O_RDWR | O_NONBLOCK,
+                         0666, NULL);
+
+      if (mq == (mqd_t)-1)
+        {
+          printf("ORTHELLO: mqpeek=打不开\n");
+        }
+      else
+        {
+          n = mq_receive(mq, rbuf, sizeof(rbuf), &prio);
+          printf("ORTHELLO: mqpeek=%s\n",
+                 (n < 0 && errno == EAGAIN) ? "EAGAIN" : "LEAK");
+          mq_unlink("/isoq");
+          mq_close(mq);
+        }
+    }
+
+  else if (argc >= 3 && strcmp(argv[2], "mqread") == 0)
+    {
+      /* [§111] 宿主臂：全局队必须原封不动（容器只删了自己前缀里的） */
+
+      char rbuf[32];
+      unsigned int prio = 0;
+      ssize_t n;
+      mqd_t mq = mq_open("/isoq", O_RDONLY, 0);
+
+      if (mq == (mqd_t)-1)
+        {
+          printf("ORTHELLO: mqread=打不开\n");
+        }
+      else
+        {
+          n = mq_receive(mq, rbuf, sizeof(rbuf), &prio);
+          if (n > 0)
+            {
+              rbuf[(size_t)n < sizeof(rbuf) ? (size_t)n :
+                   sizeof(rbuf) - 1] = '\0';
+            }
+
+          printf("ORTHELLO: mqread=%s\n", n > 0 ? rbuf : "(none)");
+          mq_unlink("/isoq");
+          mq_close(mq);
+        }
+    }
+
+  else if (argc >= 3 && strcmp(argv[2], "mqleave") == 0)
+    {
+      /* [§111] 跨实例隔离的"前者"：容器 A 建 /isoq2 留 "C1" 不删 */
+
+      mqd_t mq = mq_open("/isoq2", O_CREAT | O_RDWR, 0666, NULL);
+      int ok = 0;
+
+      if (mq != (mqd_t)-1)
+        {
+          ok = mq_send(mq, "C1", 3, 1) == 0;
+          mq_close(mq);
+        }
+
+      printf("ORTHELLO: mqleave=%s\n", ok ? "OK" : "FAIL");
+    }
+
+  else if (argc >= 3 && strcmp(argv[2], "mqcheck") == 0)
+    {
+      /* [§111] 跨实例隔离的"后者"：容器 B 同名打开 → 自己的空队列 */
+
+      char rbuf[32];
+      unsigned int prio = 0;
+      ssize_t n;
+      mqd_t mq = mq_open("/isoq2", O_CREAT | O_RDWR | O_NONBLOCK,
+                         0666, NULL);
+
+      if (mq == (mqd_t)-1)
+        {
+          printf("ORTHELLO: mqcheck=打不开\n");
+        }
+      else
+        {
+          n = mq_receive(mq, rbuf, sizeof(rbuf), &prio);
+          printf("ORTHELLO: mqcheck=%s\n",
+                 (n < 0 && errno == EAGAIN) ? "EAGAIN" : "LEAK");
+          mq_unlink("/isoq2");
+          mq_close(mq);
+        }
+    }
+
+  else if (argc >= 3 && strcmp(argv[2], "mqesc") == 0)
+    {
+      /* [§111] 名字负臂：`..` / 带斜杠 / 超长 —— 容器必须全拒
+       * （翻译器只放单组件；超限 ENAMETOOLONG）。 */
+
+      char longname[80];
+      mqd_t m;
+      int opened = 0;
+
+      m = mq_open("/..", O_CREAT | O_RDWR, 0666, NULL);
+      if (m != (mqd_t)-1) { opened++; mq_close(m); }
+
+      m = mq_open("/a/b", O_CREAT | O_RDWR, 0666, NULL);
+      if (m != (mqd_t)-1) { opened++; mq_close(m); }
+
+      memset(longname, 'x', sizeof(longname) - 1);
+      longname[0] = '/';
+      longname[sizeof(longname) - 1] = '\0';
+      m = mq_open(longname, O_CREAT | O_RDWR, 0666, NULL);
+      if (m != (mqd_t)-1) { opened++; mq_close(m); }
+
+      printf("ORTHELLO: mqesc=%s\n", opened == 0 ? "DENIED" : "OPEN");
+    }
+
   else if (argc >= 3 && strcmp(argv[2], "pidprobe3") == 0)
     {
       /* §102 pid 第三刀：gettid 视图（主线程 tid==pid）——
