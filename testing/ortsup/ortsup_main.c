@@ -78,6 +78,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
 #include <mqueue.h>
@@ -2427,6 +2428,177 @@ static int ort_mqprobe_driver(void)
   return pass ? 0 : 1;
 }
 
+/* [§112] 继承 fd 收口自测：驱动**故意**手持非 stdio fd（目录/设备）再
+ * 拉起两种容器：
+ *   · domain —— 绑域容器；收口点在 WAIT_ADMISSION 返回（自清）
+ *   · rooted —— 设根容器；收口点在 spawn 复制处（stdio-only）
+ * 子探针应只看到 0..2，且 /dev/zero 的 read 能力不应存在。 */
+
+static int ort_fdprobe_probe(int argc, FAR char *argv[])
+{
+  FAR const char *mode = "domain";
+  char mbuf[16];
+  char pbuf[128];
+  int fd;
+  int k;
+  int nopen = 0;
+  int reads = 0;
+  int caps = 0;
+
+  for (k = 0; k < argc; k++)
+    {
+      if (argv[k] != NULL && strcmp(argv[k], "fdprobe-probe") == 0)
+        {
+          break;
+        }
+    }
+
+  if (k + 1 < argc && argv[k + 1] != NULL)
+    {
+      strncpy(mbuf, argv[k + 1], sizeof(mbuf) - 1);
+      mbuf[sizeof(mbuf) - 1] = '\0';
+      mode = mbuf;
+    }
+
+  if (strcmp(mode, "domain") == 0)
+    {
+      prctl(PR_ORT_WAIT_ADMISSION, 3000);
+    }
+
+  for (fd = 0; fd < 16; fd++)
+    {
+      if (fcntl(fd, F_GETFD) < 0)
+        {
+          continue;
+        }
+
+      nopen++;
+      memset(pbuf, 0, sizeof(pbuf));
+      if (fcntl(fd, F_GETPATH, pbuf) >= 0 &&
+          strstr(pbuf, "/dev/zero") != NULL)
+        {
+          char b;
+          ssize_t nr;
+
+          errno = 0;
+          nr = read(fd, &b, 1);
+          reads++;
+          if (nr == 1)
+            {
+              caps++;
+            }
+        }
+    }
+
+  printf("[fdprobe] probe(%s): nopen=%d caps=%d reads=%d\n",
+         mode, nopen, caps, reads);
+
+  return (nopen == 3 && caps == 0) ? 0 : 1;
+}
+
+#ifndef CONFIG_BUILD_KERNEL
+static int ort_fdprobe_probe_entry(int argc, FAR char *argv[])
+{
+  return ort_fdprobe_probe(argc, argv);
+}
+#endif
+
+static int ort_fdprobe_driver(void)
+{
+  FAR char *cargv[4];
+  pid_t pids[2];
+  int sts[2];
+  int fd_root;
+  int fd_zero;
+  int i;
+  int ret;
+  int pass = 1;
+
+  if (ort_rt_ready() != 0)
+    {
+      return 1;
+    }
+
+  fd_root = open("/", O_RDONLY | O_DIRECTORY);
+  fd_zero = open("/dev/zero", O_RDONLY);
+
+  printf("[fdprobe] held fds root=%d zero=%d\n", fd_root, fd_zero);
+
+  cargv[0] = (FAR char *)"ortsup";
+  cargv[1] = (FAR char *)"fdprobe-probe";
+  cargv[3] = NULL;
+
+  /* 臂①：domain（绑域 + 准入；收口在准入返回） */
+
+  cargv[2] = (FAR char *)"domain";
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pids[0], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[fdprobe] *** 臂① spawn 失败: %d ***\n", ret);
+                  return 1; }
+#else
+  pids[0] = task_create("fdprobe-domain", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_fdprobe_probe_entry, cargv);
+  if (pids[0] < 0) { printf("[fdprobe] *** 臂① create 失败: %d ***\n",
+                            (int)pids[0]); return 1; }
+#endif
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
+  if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
+    {
+      printf("[fdprobe] *** 注册监督者失败 ***\n");
+      return 1;
+    }
+
+  ret = prctl(PR_SET_ORT_DOMAIN, 0, (int)pids[0]);
+  if (ret != 0)
+    {
+      printf("[fdprobe] *** 绑域失败: %d ***\n", ret);
+      return 1;
+    }
+
+  /* 臂②：rooted（设根 + 派生；收口在 fd 复制处） */
+
+  ret = prctl(PR_SET_ORT_ROOT, "/rt");
+  if (ret != 0)
+    {
+      printf("[fdprobe] *** 设根失败: %d ***\n", ret);
+      return 1;
+    }
+
+  cargv[2] = (FAR char *)"rooted";
+#if defined(CONFIG_BUILD_KERNEL)
+  ret = posix_spawn(&pids[1], "/system/bin/ortsup", NULL, NULL, cargv, NULL);
+  if (ret != 0) { printf("[fdprobe] *** 臂② spawn 失败: %d ***\n", ret);
+                  return 1; }
+#else
+  pids[1] = task_create("fdprobe-rooted", CONTAINER_PRIO, CONTAINER_STACK,
+                        ort_fdprobe_probe_entry, cargv);
+  if (pids[1] < 0) { printf("[fdprobe] *** 臂② create 失败: %d ***\n",
+                            (int)pids[1]); return 1; }
+#endif
+
+  for (i = 0; i < 2; i++)
+    {
+      static const FAR char *labels[2] = { "(domain)", "(rooted)" };
+      int ok;
+
+      sts[i] = 1;
+      waitpid(pids[i], &sts[i], 0);
+      ok = WIFEXITED(sts[i]) && WEXITSTATUS(sts[i]) == 0;
+      printf("[fdprobe] arm%s=%s\n", labels[i], ok ? "PASS" : "FAIL");
+      if (!ok)
+        {
+          pass = 0;
+        }
+    }
+
+  if (fd_root >= 0) close(fd_root);
+  if (fd_zero >= 0) close(fd_zero);
+
+  printf("FDPROBE RESULT: %s\n", pass ? "PASS" : "FAIL");
+  return pass ? 0 : 1;
+}
+
 static int ort_container_main(int argc, FAR char *argv[])
 {
   FAR const char *mode = NULL;
@@ -4272,6 +4444,16 @@ int main(int argc, FAR char *argv[])
   if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "mqprobe") == 0)
     {
       return ort_mqprobe_driver();
+    }
+
+  if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "fdprobe-probe") == 0)
+    {
+      return ort_fdprobe_probe(argc, argv);
+    }
+
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "fdprobe") == 0)
+    {
+      return ort_fdprobe_driver();
     }
 
   if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "wdselftest") == 0)

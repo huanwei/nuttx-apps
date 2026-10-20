@@ -9,15 +9,15 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-20 ORT（§111 **IPC 面第二刀：mqueue 实例命名空间** ——
-#               容器名字单组件校验 + ort.n<nsid>/ort.d<domain> 前缀；
-#               可信路径全局解析（inode 的 find/reserve/remove 三处成对）；
-#               §106 全拒退役。实测陷阱：只换 find → 容器删队列时把 /u
-#               挂载点从命名空间卸掉。A 全电池绿 ×2 + 双负臂；
-#               M 双编 run5 + mqprobe 两 SKU PASS。内核 cd14c42b99。
-#               apps 侧 §111 = orthello mqhost/mqpeek/mqread/mqleave/
-#               mqcheck/mqesc 六臂 + ortsup mqprobe 全局队/peek 判据 + 夹具。）
+# 最近配对事件：2026-10-20 ORT（§112 **继承 fd 收口** —— host→容器只留
+#               stdio：A 在 spawn 复制点（父不重挂、子重挂）/ M 在准入
+#               返回自清；容器间派生保留完整继承。实测：已打开 fd 绕过
+#               §101/§104 的 open 闸（自建 launcher 可传宿主文件/设备）。
+#               A 全电池绿 ×2 + 双负臂（e2e ㉟/T18 两臂 nopen=3）；
+#               M 双编 run5+mqprobe+fdprobe 两 SKU PASS。内核 52ab4b3429。
+#               apps 侧 §112 = orthello fdprobe/fdlaunch + ortsup fdprobe
+#               双臂 + 夹具 fixture-fdprobe。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=cd14c42b995a57f9911b864b779f4fbc13514845
+nuttx=52ab4b34290e7ca2199f6d72ec5e9c6a2cc91c81

@@ -643,6 +643,130 @@ int main(int argc, FAR char *argv[])
         }
     }
 
+  else if (argc >= 3 && strcmp(argv[2], "fdprobe") == 0)
+    {
+      /* [§112] 继承面勘察：枚举本进程 0..15 的 fd（F_GETPATH 看路径），
+       * 并对每个可开 fd 试相对解析（openat）—— 含 `..` 上跳。
+       * 被动臂（经 orting run）反映**真实 launcher** 留下的 fd；
+       * 夹带臂（fdlaunch 起）证明结构性继承面。 */
+
+      char pbuf[128];
+      char path0[128];
+      int fd;
+      int nopen = 0;
+
+      printf("ORTHELLO: fdprobe begin\n");
+
+      for (fd = 0; fd < 16; fd++)
+        {
+          int p;
+          int f2;
+
+          if (fcntl(fd, F_GETFD) < 0)
+            {
+              continue;
+            }
+
+          nopen++;
+          memset(path0, 0, sizeof(path0));
+          p = fcntl(fd, F_GETPATH, path0);
+          printf("ORTHELLO: fdprobe fd=%d path=%s\n",
+                 fd, (p >= 0 && path0[0] != '\0') ? path0 : "(none)");
+
+          errno = 0;
+          f2 = openat(fd, "etc/hello.txt", O_RDONLY);
+          printf("ORTHELLO: fdprobe fd=%d openat-name=%d errno=%d\n",
+                 fd, f2, errno);
+          if (f2 >= 0)
+            {
+              close(f2);
+            }
+
+          errno = 0;
+          f2 = openat(fd, "..", O_RDONLY);
+          printf("ORTHELLO: fdprobe fd=%d openat-dotdot=%d errno=%d\n",
+                 fd, f2, errno);
+          if (f2 >= 0)
+            {
+              memset(pbuf, 0, sizeof(pbuf));
+              if (fcntl(f2, F_GETPATH, pbuf) >= 0)
+                {
+                  printf("ORTHELLO: fdprobe fd=%d dotdot-path=%s\n",
+                         fd, pbuf);
+                }
+
+              close(f2);
+            }
+
+          /* 能力见证：只对明确安全的宿主文件/设备读 1 字节
+           * （console 读了会阻塞，跳过）。 */
+
+          if (strstr(path0, "/dev/zero") != NULL ||
+              strstr(path0, "/system/") != NULL)
+            {
+              char b = 0;
+              ssize_t nr;
+
+              errno = 0;
+              nr = read(fd, &b, 1);
+              printf("ORTHELLO: fdprobe fd=%d read=%d errno=%d\n",
+                     fd, (int)nr, errno);
+            }
+        }
+
+      printf("ORTHELLO: fdprobe done nopen=%d\n", nopen);
+    }
+
+  else if (argc >= 3 && strcmp(argv[2], "fdlaunch") == 0)
+    {
+      /* [§112] 夹带臂：本进程扮演 launcher —— 故意持宿主的目录/文件/
+       * 设备 fd，设根后 spawn 一个容器子进程（fdprobe）。与 orting 的
+       * 真实路径同型（设根在父、spawn 绝对视图路径）。 */
+
+      int fd_root;
+      int fd_host;
+      int fd_zero;
+      pid_t pid;
+      int st = 0;
+      int ret;
+      FAR char *cargv[4];
+
+      fd_root = open("/", O_RDONLY | O_DIRECTORY);
+      fd_host = open("/system/bin/init", O_RDONLY);
+      fd_zero = open("/dev/zero", O_RDONLY);
+
+      printf("ORTHELLO: fdlaunch fds root=%d host=%d zero=%d\n",
+             fd_root, fd_host, fd_zero);
+
+      ret = prctl(PR_SET_ORT_ROOT, "/u");
+      if (ret != 0)
+        {
+          printf("ORTHELLO: fdlaunch setroot failed=%d errno=%d\n",
+                 ret, errno);
+        }
+      else
+        {
+          cargv[0] = (FAR char *)"/bin/orthello";
+          cargv[1] = (FAR char *)"/etc/hello.txt";
+          cargv[2] = (FAR char *)"fdprobe";
+          cargv[3] = NULL;
+
+          ret = posix_spawn(&pid, "/u/bin/orthello", NULL, NULL,
+                            cargv, NULL);
+          printf("ORTHELLO: fdlaunch spawn=%d errno=%d pid=%d\n",
+                 ret, errno, (int)pid);
+          if (ret == 0)
+            {
+              waitpid(pid, &st, 0);
+              printf("ORTHELLO: fdlaunch child status=%d\n", st);
+            }
+        }
+
+      if (fd_root >= 0) close(fd_root);
+      if (fd_host >= 0) close(fd_host);
+      if (fd_zero >= 0) close(fd_zero);
+    }
+
   else if (argc >= 3 && strcmp(argv[2], "mqesc") == 0)
     {
       /* [§111] 名字负臂：`..` / 带斜杠 / 超长 —— 容器必须全拒
