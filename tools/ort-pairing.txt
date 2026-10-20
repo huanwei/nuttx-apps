@@ -9,14 +9,14 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-20 ORT（§113 **容器派生属性继承** —— task_init 把
-#               domain/devwl/memcap 传给子组；修复前 M 容器内 task_create
-#               的子组 domain=-1、/dev/null=OK（闸失效实锤）。fd 谓词统一
-#               re_root||domain（容器内派生完整继承+fdsafe）。A 全电池绿
-#               ×2 + 双负臂；M 双编 run5+mqprobe+fdprobe+spawnprobe 两
-#               SKU PASS。内核 66bf30633c。
-#               apps 侧 §113 = ortsup spawnprobe（仅 M 编译）。）
+# 最近配对事件：2026-10-21 ORT（§114 **IPC 面第三刀：绑域即清旧实例队列** ——
+#               M 的 IPC 键=域，域在 CG 重启复用；同域先后两个容器，后者
+#               读到前者未 unlink 的队列（check=OLD）。新增
+#               nxmq_purge_prefix；三份 bind 在落域前清理（M 两遍式、区外
+#               可睡眠、失败 fail-closed）。A 全电池绿 ×2 + 双负臂；M 双编
+#               run5+mqprobe+fdprobe+spawnprobe+reuseprobe 两 SKU PASS。
+#               内核 9ed72f1ba7。apps 侧 §114 = ortsup reuseprobe（仅 M）。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=66bf30633c95cd34928fdd2c7f890c3a7b3b6898
+nuttx=9ed72f1ba7b6809d3eefab3571e5e40fa3a4c84d

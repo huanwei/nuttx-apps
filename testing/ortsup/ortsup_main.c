@@ -2732,6 +2732,149 @@ static int ort_spawnprobe_driver(void)
 }
 #endif /* !CONFIG_BUILD_KERNEL */
 
+#ifndef CONFIG_BUILD_KERNEL
+/* [§114] 同域复用勘察：两个容器先后绑同一个 domain。A 留一条 "OLD"
+ * 不删；B（新组、同域）同名打开应得到**自己**的空队列（EAGAIN）。
+ * 修复前域键复用 ⇒ B 会读到 A 的 OLD（跨实例泄漏）。 */
+
+static int ort_reuseprobe_arm(int argc, FAR char *argv[])
+{
+  FAR const char *mode = "leave";
+  char mbuf[16];
+  char rbuf[32];
+  unsigned int prio = 0;
+  ssize_t n;
+  int re;
+  int k;
+  int ret;
+  mqd_t mq;
+
+  for (k = 0; k < argc; k++)
+    {
+      if (argv[k] != NULL && strcmp(argv[k], "reuseprobe-arm") == 0)
+        {
+          break;
+        }
+    }
+
+  if (k + 1 < argc && argv[k + 1] != NULL)
+    {
+      strncpy(mbuf, argv[k + 1], sizeof(mbuf) - 1);
+      mbuf[sizeof(mbuf) - 1] = '\0';
+      mode = mbuf;
+    }
+
+  ret = prctl(PR_ORT_WAIT_ADMISSION, 3000);
+  if (ret != 0)
+    {
+      printf("[reuseprobe] %s admission failed %d\n", mode, ret);
+      return 1;
+    }
+
+  if (strcmp(mode, "leave") == 0)
+    {
+      mq = mq_open("/ortreuse", O_CREAT | O_RDWR, 0666, NULL);
+      if (mq == (mqd_t)-1)
+        {
+          printf("[reuseprobe] leave=打不开 errno=%d\n", errno);
+          return 1;
+        }
+
+      if (mq_send(mq, "OLD", 4, 1) < 0)
+        {
+          printf("[reuseprobe] leave=发送失败 errno=%d\n", errno);
+          mq_close(mq);
+          return 1;
+        }
+
+      mq_close(mq);              /* 故意不 unlink */
+      printf("[reuseprobe] leave=OK\n");
+      return 0;
+    }
+
+  mq = mq_open("/ortreuse", O_CREAT | O_RDWR | O_NONBLOCK, 0666, NULL);
+  if (mq == (mqd_t)-1)
+    {
+      printf("[reuseprobe] check=打不开 errno=%d\n", errno);
+      return 1;
+    }
+
+  errno = 0;
+  n = mq_receive(mq, rbuf, sizeof(rbuf), &prio);
+  re = errno;
+
+  if (n > 0)
+    {
+      rbuf[(size_t)n < sizeof(rbuf) ? (size_t)n : sizeof(rbuf) - 1] = '\0';
+      printf("[reuseprobe] check=%s\n", rbuf);
+    }
+  else if (re == EAGAIN)
+    {
+      printf("[reuseprobe] check=EAGAIN\n");
+    }
+  else
+    {
+      printf("[reuseprobe] check=ERR errno=%d\n", re);
+    }
+
+  mq_unlink("/ortreuse");
+  mq_close(mq);
+  return (n < 0 && re == EAGAIN) ? 0 : 1;
+}
+
+static int ort_reuseprobe_driver(void)
+{
+  FAR char *cargv[4];
+  pid_t pids[2];
+  int sts[2];
+  static const FAR char *modes[2] = { "leave", "check" };
+  int i;
+  int ret;
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
+  if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
+    {
+      printf("[reuseprobe] *** 注册监督者失败 ***\n");
+      return 1;
+    }
+
+  cargv[0] = (FAR char *)"ortsup";
+  cargv[1] = (FAR char *)"reuseprobe-arm";
+  cargv[3] = NULL;
+
+  for (i = 0; i < 2; i++)
+    {
+      cargv[2] = (FAR char *)modes[i];
+
+      pids[i] = task_create("reuseprobe", CONTAINER_PRIO, CONTAINER_STACK,
+                            ort_reuseprobe_arm, cargv);
+      if (pids[i] < 0)
+        {
+          printf("[reuseprobe] *** 臂%d create 失败: %d ***\n",
+                 i, (int)pids[i]);
+          return 1;
+        }
+
+      ret = prctl(PR_SET_ORT_DOMAIN, 0, (int)pids[i]);
+      if (ret != 0)
+        {
+          printf("[reuseprobe] *** 臂%d 绑域失败: %d ***\n", i, ret);
+          return 1;
+        }
+
+      sts[i] = 1;
+      waitpid(pids[i], &sts[i], 0);
+      printf("[reuseprobe] arm%d status=%d\n", i, sts[i]);
+    }
+
+  printf("REUSEPROBE RESULT: %s\n",
+         (WIFEXITED(sts[0]) && WEXITSTATUS(sts[0]) == 0 &&
+          WIFEXITED(sts[1]) && WEXITSTATUS(sts[1]) == 0) ? "PASS" : "FAIL");
+  return (WIFEXITED(sts[0]) && WEXITSTATUS(sts[0]) == 0 &&
+          WIFEXITED(sts[1]) && WEXITSTATUS(sts[1]) == 0) ? 0 : 1;
+}
+#endif /* !CONFIG_BUILD_KERNEL */
+
 static int ort_container_main(int argc, FAR char *argv[])
 {
   FAR const char *mode = NULL;
@@ -4598,6 +4741,16 @@ int main(int argc, FAR char *argv[])
   if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "spawnprobe") == 0)
     {
       return ort_spawnprobe_driver();
+    }
+
+  if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "reuseprobe-arm") == 0)
+    {
+      return ort_reuseprobe_arm(argc, argv);
+    }
+
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "reuseprobe") == 0)
+    {
+      return ort_reuseprobe_driver();
     }
 #endif
 
