@@ -44,6 +44,9 @@
 #include <sys/wait.h>
 #include <sys/prctl.h>
 #include <errno.h>
+#ifndef CONFIG_DISABLE_PTHREAD
+#  include <pthread.h>
+#endif
 #ifndef CONFIG_DISABLE_SIGNALS
 #  include <signal.h>
 #endif
@@ -55,6 +58,23 @@
 static void ort_sigsegv_handler(int signo)
 {
   (void)signo;
+}
+#endif
+
+#if !defined(CONFIG_DISABLE_PTHREAD) && !defined(CONFIG_DISABLE_SIGNALS)
+/* §109 线程号面探针的子线程：自报 getpid（组号）/gettid（本线程号），
+ * 存活一小会儿，好让主线程做完 kill/tgkill 探针再 join。 */
+
+static FAR void *ort_threadprobe_fn(FAR void *arg)
+{
+  (void)arg;
+
+  printf("ORTHELLO: threadp me=%d tid=%d\n",
+         (int)getpid(), (int)gettid());
+  fflush(stdout);
+
+  usleep(400 * 1000);
+  return NULL;
 }
 #endif
 
@@ -403,6 +423,41 @@ int main(int argc, FAR char *argv[])
              (int)getpid(), (int)getppid());
       return 7;
     }
+
+#if !defined(CONFIG_DISABLE_PTHREAD) && !defined(CONFIG_DISABLE_SIGNALS)
+  else if (argc >= 3 && strcmp(argv[2], "threadprobe") == 0)
+    {
+      /* §109 线程号面（pid 第四刀）：建一个 pthread，读双方号面 +
+       * 四条通路 —— pthread_kill(本地句柄,0) / tgkill(本地组号,本地
+       * tid,0) / pthread_join(本地句柄) / 线程自视角。
+       *   容器臂：me=1 tid=1 pt=2（同实例同一计数器）；
+       *   对照臂：全全局号且 tid==me、pt==线程全局号。 */
+
+      pthread_t th = 0;
+      int rc;
+      int k1, e1, k2, e2, jr;
+
+      rc = pthread_create(&th, NULL, ort_threadprobe_fn, NULL);
+      usleep(150 * 1000);        /* 让线程先打印、保持存活 */
+
+      errno = 0;
+      k1 = pthread_kill(th, 0);
+      e1 = errno;
+
+      errno = 0;
+      k2 = tgkill(getpid(), (int)th, 0);
+      e2 = errno;
+
+      jr = pthread_join(th, NULL);
+
+      printf("ORTHELLO: threadprobe me=%d tid=%d pt=%d kill=%s tgk=%s "
+             "join=%s cr=%d\n",
+             (int)getpid(), (int)gettid(), (int)th,
+             k1 == 0 ? "OK" : (e1 == EPERM ? "EPERM" : "ERR"),
+             k2 == 0 ? "OK" : (e2 == EPERM ? "EPERM" : "ERR"),
+             jr == 0 ? "OK" : "ERR", rc);
+    }
+#endif
 
   else if (argc >= 3 && strcmp(argv[2], "devprobe") == 0)
     {
