@@ -9,13 +9,13 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-12 ORT（§108 **监督者槽位收口** —— 凭据级鉴权
-#               （PR_SET_ORT_SUPERVISOR 双层：名字白名单 + 构建期 TOKEN
-#               0x4f525431；分开见证可分辨）+ **pid 复用半的代码实证收口**
-#               （pid 单调不复用 + 前提绊线）。12 处调用点同轮重编；suptest
-#               三臂一次过；M 回归 + A 全电池绿。内核 7704eaf306。apps 侧
-#               §108 = 三 app 凭据接线 + suptest。）
+# 最近配对事件：2026-10-12 ORT（§109 **容器 pid 第四刀（线程号面 + 句柄面）** ——
+#               每线程本地 tid（ort_ltid，与组号同一计数器）；pthread_t=数字
+#               的句柄面：create 本地化 / join·detach·cancel 入口解析 /
+#               resolve 扩 tcb 级 + getter 三补；getter 与 tgkill tid 面全部
+#               复用一处。两臂四通路判据；A 全电池绿 + M 双编 run5 逐字。
+#               内核 424dfa2e3b。apps 侧 §109 = orthello threadprobe + 夹具。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=7704eaf3065d60d6e5321feadd462cf99b19e6d7
+nuttx=424dfa2e3bdb1b13b00de1abf571df361953605f
