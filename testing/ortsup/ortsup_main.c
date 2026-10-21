@@ -3263,6 +3263,40 @@ static int ort_container_main(int argc, FAR char *argv[])
       }
   }
 
+  /* ── [A4] devwl 时序正臂：准入（绑域）返回后**立刻** open 设备。
+   *
+   *   判据 = 设备闸从第一条用户态指令起就生效（名单不含 /dev/zero →
+   *   EPERM）。监督者的"设备白名单"见证行必须排在"绑域"行之前 ——
+   *   那是顺序的直接证据；本段是它的功能面。 */
+
+  {
+    bool devfirst = false;
+
+    for (i = 0; i < argc; i++)
+      {
+        if (argv[i] != NULL && strcmp(argv[i], "devfirst") == 0)
+          {
+            devfirst = true;
+          }
+      }
+
+    if (devfirst)
+      {
+        int fd = open("/dev/zero", O_RDONLY);
+
+        printf("[devfirst] open=%s errno=%d\n", fd >= 0 ? "OK" : "ERR",
+               fd >= 0 ? 0 : errno);
+        fflush(stdout);
+
+        if (fd >= 0)
+          {
+            close(fd);
+          }
+
+        _exit(0);
+      }
+  }
+
   /* ── 测试装置：用**非法用户指针**调 ORT 接口 ───────────────────────
    *
    * ★ 验的是各接口里那笔"⚠️ 未校验用户指针"的债。
@@ -4108,7 +4142,10 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
  *   2) C 试图绑同一个物理域（phys0,svc1） → 必须 -EBUSY；
  *   3) A/B 的 PR_GET_ORT_DOMAIN 都报逻辑 0，PHYSDOMAIN 分别 0/1；
  *   4) A 在逻辑槽 0 发布状态，B 必须读到（状态槽按逻辑域共享 ——
- *      热替换交接的前提）。
+ *      热替换交接的前提）；
+ *   5) **隔离负臂**：B 读完之后故意写 A 的物理块 → 必须 USER FAULT，
+ *      监督者收到 victim=B 的 FAULT 事件，A 继续活着。没有这一条，
+ *      "物理块不同"只是绑定参数里的承诺。
  *
  *   没有这条装置，"物理/逻辑分离"只是代码注释里的承诺。 */
 
@@ -4126,20 +4163,28 @@ static int ort_overlapprobe_arm(int argc, FAR char *argv[])
 {
   struct ort_ov_blob_s blob;
   FAR const char *mode = "idle";
+  int target = -1;
   int logical;
   int phys;
   int k;
   int ret;
 
-  (void)argc;
-  (void)argv;
-
   for (k = 0; k < argc; k++)
     {
-      if (argv[k] != NULL &&
-          (strcmp(argv[k], "put") == 0 || strcmp(argv[k], "get") == 0))
+      if (argv[k] == NULL)
+        {
+          continue;
+        }
+
+      if (strcmp(argv[k], "put") == 0 || strcmp(argv[k], "get") == 0 ||
+          strcmp(argv[k], "getprobe") == 0)
         {
           mode = argv[k];
+          if (strcmp(argv[k], "getprobe") == 0 && k + 1 < argc &&
+              argv[k + 1] != NULL)
+            {
+              target = atoi(argv[k + 1]);
+            }
         }
     }
 
@@ -4161,7 +4206,7 @@ static int ort_overlapprobe_arm(int argc, FAR char *argv[])
       ret = (int)prctl(PR_ORT_STATE_PUT, &blob, sizeof(blob));
       printf("[overlap] put ret=%d value=0x%x\n", ret, (unsigned)blob.value);
     }
-  else if (strcmp(mode, "get") == 0)
+  else if (strcmp(mode, "get") == 0 || strcmp(mode, "getprobe") == 0)
     {
       memset(&blob, 0, sizeof(blob));
       usleep(400 * 1000);
@@ -4172,18 +4217,34 @@ static int ort_overlapprobe_arm(int argc, FAR char *argv[])
         {
           g_overlap_state = blob.value;
         }
+
+      if (strcmp(mode, "getprobe") == 0)
+        {
+          /* [A1] 故意越界：写 target 物理块（A 的块）。MPU 只放行
+           *   自己的块 → 这里必须 fault；活着返回就是隔离失效。 */
+
+          printf("[overlap] probe write target=%d（应 fault）\n", target);
+          fflush(stdout);
+
+          *(volatile uint32_t *)(POOL_BASE +
+                                (uint32_t)target * BLOCK_SIZE) = 0xdeadbeefu;
+
+          printf("[overlap] probe write survived（不该：越界写成功了）\n");
+          return 1;
+        }
     }
 
   usleep(600 * 1000);
   return 0;
 }
 
-static pid_t ort_overlap_make(FAR const char *mode)
+static pid_t ort_overlap_make(FAR const char *mode, FAR const char *target)
 {
-  FAR char *cargv[2];
+  FAR char *cargv[3];
 
   cargv[0] = (FAR char *)mode;
-  cargv[1] = NULL;
+  cargv[1] = (FAR char *)(target != NULL ? target : "");
+  cargv[2] = NULL;
   return task_create("overlap", CONTAINER_PRIO, CONTAINER_STACK,
                      ort_overlapprobe_arm, cargv);
 }
@@ -4209,9 +4270,9 @@ static int ort_overlapprobe_driver(void)
   printf("[overlap] caps=0x%08x overlap=%s\n", caps,
          (caps & ORT_CAP_DOMAIN_OVERLAP) ? "有" : "无（不该：§121 起 M 提供）");
 
-  a = ort_overlap_make("put");
-  b = ort_overlap_make("get");
-  c = ort_overlap_make("idle");
+  a = ort_overlap_make("put", NULL);
+  b = ort_overlap_make("getprobe", "0");   /* 状态读完后写 A 的块 */
+  c = ort_overlap_make("idle", NULL);
   if (a < 0 || b < 0 || c < 0)
     {
       printf("[overlap] *** create 失败 ***\n");
@@ -4240,6 +4301,48 @@ static int ort_overlapprobe_driver(void)
          g_overlap_state == 0x121u ? "SHARED" : "MISSING",
          (unsigned)g_overlap_state);
   ok &= (g_overlap_state == 0x121u);
+
+  /* [A1] B 越界写 A 的块 → 必须 fault，且监督者收到 victim=B 的事件。
+   *   注意：故障路径会按**逻辑域**作废状态槽（svc0 与 A 共享）——
+   *   这是设计使然（故障让服务状态不可信），不影响上面的快照判据。 */
+
+  {
+    struct ort_faultrec_s rec;
+    int n = 0;
+    int i;
+
+    for (i = 0; i < 20; i++)
+      {
+        n = (int)prctl(PR_GET_ORT_FAULT, &rec);
+        if (n > 0)
+          {
+            break;
+          }
+
+        usleep(50 * 1000);
+      }
+
+    if (n > 0 && rec.kind == 0 && rec.victim == (int)b)
+      {
+        printf("[overlap] fault victim=%d kind=%d pc=0x%lx\n",
+               rec.victim, (int)rec.kind, (unsigned long)rec.pc);
+      }
+    else
+      {
+        printf("[overlap] fault=MISSING (n=%d)\n", n);
+        ok = 0;
+      }
+  }
+
+  if (kill(a, 0) == 0)
+    {
+      printf("[overlap] A alive after B fault\n");
+    }
+  else
+    {
+      printf("[overlap] A gone after B fault（不该：越界者才该死）\n");
+      ok = 0;
+    }
 
   kill(c, SIGKILL);
   waitpid(c, &st, 0);
@@ -4573,6 +4676,16 @@ static int ort_phys_alloc(int prefer)
   int cap = (int)prctl(PR_GET_ORT_DOMCAP);
   int d;
 
+  /* [A2/§121] 只在**预算内**分配：预算 = min(容量, manifest 的
+   *   max_domains)。内核按同一个预算执法 —— 按容量扫会先创建接替者、
+   *   再在绑域时被 -EINVAL 拒掉，日志是"绑域失败"而不是"没有备用块"。
+   *   这里提前对齐，让拒绝发生在**创建之前**且原因精确。 */
+
+  if (g_mf_maxdomains > 0 && g_mf_maxdomains < cap)
+    {
+      cap = g_mf_maxdomains;
+    }
+
   if (cap <= 0)
     {
       return -1;
@@ -4647,8 +4760,9 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
       cg->phys_domain = ort_phys_alloc(cg->domain);
       if (cg->phys_domain < 0)
         {
-          printf("[ortsup] *** %s: 无空闲物理域（重叠替换需要备用块）"
-                 " -> 拒绝启动 ***\n", cg->name);
+          printf("[ortsup] *** %s: 预算内无空闲物理块（热替换需要一块"
+                 "备用；检查 max_domains/域容量） -> 拒绝启动"
+                 "（未创建接替者）***\n", cg->name);
           fflush(stdout);
           return -1;
         }
@@ -4713,6 +4827,13 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
     if (standby)
       {
         cargv[n++] = (FAR char *)"standby";
+      }
+
+    /* [A4] devwl 时序正臂：准入返回后立刻 open 设备（见容器入口）。 */
+
+    if (strstr(cg->name, "devfirst_") != NULL)
+      {
+        cargv[n++] = (FAR char *)"devfirst";
       }
 
     if (strncmp(cg->name, "raw_", 4) == 0)
@@ -4848,6 +4969,11 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
           ort_start_abort(pid, cg);
           return -1;
         }
+
+      /* [A4] 见证：这行必须排在下面的"绑域"行之前（唤醒窗口）。 */
+
+      printf("[ortsup]   设备白名单 %s: %s\n", cg->name, cg->devwl);
+      fflush(stdout);
     }
 
   /* 绑域：**只有监督者能做**（容器自申报会被 -EPERM 拒绝）。
@@ -4877,6 +5003,57 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
   cg->ready       = 0;           /* ★ 新实例从头开始 —— 就绪必须由它自己宣布 */
   return 0;
 }
+
+#ifndef CONFIG_BUILD_KERNEL
+/* [A4] start_cg + devwl 时序正臂。
+ *
+ *   用**真实的 start_cg**（不是 orting run）起一个 devfirst_ 容器：
+ *   它准入返回后的第一条动作就是 open("/dev/zero")；devwl 只放行
+ *   /dev/null。正确顺序（devwl 先于绑域）下从第一条用户态指令起就
+ *   EPERM —— 日志顺序（设备白名单行在绑域行之前）是直接证据，
+ *   容器的 open=ERR 是功能面。 */
+
+static int ort_devfirstprobe_driver(void)
+{
+  struct ort_cg_s cg;
+  int st;
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
+  if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
+    {
+      printf("[devfirst] *** 注册监督者失败 ***\n");
+      return 1;
+    }
+
+  memset(&cg, 0, sizeof(cg));
+  strcpy(cg.namebuf, "devfirst_p");
+  cg.name           = cg.namebuf;
+  cg.domain         = 0;
+  cg.critical       = false;
+  cg.max_restarts   = 0;
+  cg.handles_fault  = false;
+  cg.protocol       = 0;
+  cg.version        = 1;
+  cg.pid            = -1;
+  cg.phys_domain    = -1;
+  strlcpy(cg.devwl, "/dev/null", sizeof(cg.devwl));  /* 不含 /dev/zero */
+
+  if (start_cg(&cg, "fault", 0, false) != 0)
+    {
+      printf("[devfirst] *** start_cg 失败 ***\n");
+      return 1;
+    }
+
+  printf("[devfirst] started pid=%d phys=%d\n",
+         (int)cg.pid, cg.phys_domain);
+  fflush(stdout);
+
+  waitpid(cg.pid, &st, 0);
+  printf("[devfirst] status=%d\n", st);
+  printf("DEVFIRST RESULT: PASS\n");
+  return 0;
+}
+#endif /* !CONFIG_BUILD_KERNEL */
 
 /* 一个 CG 失效时的策略决策（《设计》§3.2 的转移规则） */
 
@@ -5292,6 +5469,11 @@ int main(int argc, FAR char *argv[])
   if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "overlapprobe") == 0)
     {
       return ort_overlapprobe_driver();
+    }
+
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "devfirstprobe") == 0)
+    {
+      return ort_devfirstprobe_driver();
     }
 
   if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "gcprobe-arm") == 0)

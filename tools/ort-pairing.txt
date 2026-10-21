@@ -9,23 +9,22 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-21 ORT（§121 **域两维：物理域（实例）+ 逻辑域
-#               （服务）** —— 物理域 = MPU 块 + ort.d<enc>. IPC 实例键；
-#               逻辑域 = 状态槽/故障作废/部署。PR_SET_ORT_DOMAIN2 打包
-#               phys|svc<<8（用户态 prctl 代理只转 2 个变参）；
-#               PR_GET_ORT_PHYSDOMAIN。§119 闸改按物理域独占：同逻辑域
-#               可重叠。M 两 SKU 申报 DOMAIN_OVERLAP。ortsup 分配物理块
-#               （优先逻辑域、standby 避开现任、无空闲 fail-closed）、
-#               devwl 前移到绑域之前、绑失败杀孤儿并释放块；容器块地址
-#               （own/priv_self）全部改用物理域（首版混用→接替者一启动
-#               就 USER FAULT）。判据：overlapprobe（同逻辑不同物理 OK、
-#               同物理 EBUSY、状态槽按逻辑共享）+ ortm-replace（两 SKU
-#               × ready/窗口：两次绑域同 service 不同 physical、tick
-#               接续）。A 全电池 ×2 + 双负臂 + 替换两臂；M 双编 run5 +
-#               七探针 + overlap + replace 两臂，两 SKU PASS。
-#               内核 73b67d5943。apps 侧 §121 = ortsup 物理分配/两维绑定
-#               + overlapprobe（hotprobe 退役）。）
+# 最近配对事件：2026-10-21 ORT（§122 **A 组收口** —— ① 重叠物理隔离
+#               负臂：B 越界写 A 的块 → USER FAULT + 监督者收到 victim=B
+#               事件 + A 继续；② 热替换资源前置：分配器只在
+#               min(容量,max_domains) 内扫，无备用块时在**创建接替者前**
+#               精确拒绝（tight：max_domains=1/domain=0，只有 1 条 BOOT）；
+#               ③ 冷替换正臂（protocol=0：先停后起、旧实例退出作废状态
+#               槽 → 接替者冷启动）；④ devfirst 正臂（真实 start_cg +
+#               devwl 先于绑域 → 准入后立刻 open 名单外设备 EPERM）；
+#               ⑤ pid 单调绊线（next_pid<=g_lastpid → PANIC）；⑥ supervisor
+#               电池清单入手册；⑦ lost 旧行更正 / e2e 描述 / 删除未用
+#               dirT 夹具（layer0 ce1822e3）。A 全电池 ×2 + 双负臂 +
+#               替换两臂；M 双编 run5 + 七探针 + overlap/devfirst +
+#               replace 四臂（warm/raw/cold/tight）两 SKU PASS。
+#               内核 18982f150b。apps 侧 §122 = ortsup 探针/资源前置 +
+#               夹具重生成。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=73b67d59430e2bc272aa804231e74d0076155b40
+nuttx=18982f150bb9ad894e2f474d20fdd659d47de5dd
