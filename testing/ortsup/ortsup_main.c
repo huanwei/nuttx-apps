@@ -3911,6 +3911,32 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
 
   spec->pid = -1;
 
+  /* ── [§120] 平台能力闸：热替换要求"同域重叠实例" ──────────────────
+   *
+   * ★ 闸的位置是**本次变更的准入**，不是 manifest 装载时的准入。
+   *   protocol=1 本身在 M 上完全合法（SIGTERM 有界退出、状态发布），
+   *   只是"重叠期"不成立。启动时拒绝 protocol=1 会把正常部署也挡掉。
+   *
+   * ★ 为什么必须在 start_cg **之前**拒绝：
+   *   否则会先创建接替者、绑域时才 -EBUSY（§119），留下一个未准入的
+   *   任务在准入等待里空转到超时 —— 日志只差一行字，行为差一个进程。
+   *
+   * ★ 拒绝 = 本次变更不生效、旧实例继续（fail-closed），不做静默
+   *   降级。要换就请声明 protocol=0 走冷替换（有服务空档，但合法）。
+   */
+
+  if (spec->protocol != 0 && !spec->protocol_falsified &&
+      (g_caps & ORT_CAP_DOMAIN_OVERLAP) == 0)
+    {
+      printf("[ortsup]   ✗ 平台不提供同域重叠实例（ORT_CAP_DOMAIN_OVERLAP）"
+             " → 拒绝热替换 %s\n", spec->name);
+      printf("[ortsup]     本次变更未生效，旧实例 pid=%d 继续服务；"
+             "如需替换请声明 protocol=0（冷替换，有服务空档）\n",
+             (int)live->pid);
+      fflush(stdout);
+      return false;
+    }
+
   /* ── 没声明生命周期协议 → 只能冷替换 ──────────────────────────────
    *
    * ★ 这里**必须明说**，不能悄悄按同一套流程走。装作能热替换的话：
@@ -3945,12 +3971,10 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
       return true;
     }
 
-  /* ★ ORT-M（MPU）：内核 §119 起有"一域一实例"硬闸 —— 现任还活着时，
-   *   接替者绑同一域会得到 -EBUSY（域键 mqueue 命名空间按域共享，
-   *   重叠 = 串扰）。于是**热替换在 M 上 fail-closed**：start_cg 报
-   *   "绑域失败"，本次变更放弃、旧实例继续。这是有意的：在"每实例
-   *   私有 IPC/状态"落地之前，M 的部署替换只能走冷替换
-   *   （protocol=0 或声明被证伪的那条路）。不要为绕过它去放宽内核闸。 */
+  /* ★ 能走到这里 = 平台申报了 DOMAIN_OVERLAP（A），或未来某平台具备
+   *   实例级隔离。M 在上面的能力闸就已拒绝，不会走到这里。
+   *   §119 的内核"一域一实例"闸仍是**最后防线**：即便政策被绕过，
+   *   绑同域仍会 -EBUSY。不要为绕过任何一侧去放宽内核闸。 */
 
   if (start_cg(spec, "fault", spec->critical ? 8 : 3, true) != 0)
     {
@@ -4029,6 +4053,196 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
   stop_cg(live);
   return true;
 }
+
+#ifndef CONFIG_BUILD_KERNEL
+/* [§120] M 热替换准入自测：平台没有 ORT_CAP_DOMAIN_OVERLAP。
+ *
+ *   造一个**活着**的 live CG（protocol=1）和一份要求热替换的 spec，
+ *   直接调 replace_cg()：
+ *     · 必须在创建接替者**之前**拒绝（返回 false、spec.pid 仍为 -1）；
+ *     · 必须打印能力闸见证（脚本判）；
+ *     · 旧实例必须还在跑。
+ *
+ *   为什么需要这条负臂：没有它，"提前拒绝"与"走到 start_cg 再被
+ *   §119 的 -EBUSY 挡"在日志上只差一行字 —— 而后者会留下一个
+ *   未准入的接替者空转到 admission 超时。 */
+
+static int ort_hotprobe_arm(int argc, FAR char *argv[])
+{
+  int ret;
+
+  (void)argc;
+  (void)argv;
+
+  ret = prctl(PR_ORT_WAIT_ADMISSION, 5000);
+  if (ret != 0)
+    {
+      printf("[hotprobe] live admission failed %d\n", ret);
+      return 1;
+    }
+
+  printf("[hotprobe] live admitted pid=%d\n", (int)getpid());
+  usleep(1500 * 1000);
+  printf("[hotprobe] live tick\n");
+  return 0;
+}
+
+static int ort_hotprobe_driver(void)
+{
+  struct ort_cg_s live;
+  struct ort_cg_s spec;
+  FAR char *cargv[3];
+  unsigned int caps;
+  pid_t pid;
+  int st;
+  bool ok = true;
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
+  if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
+    {
+      printf("[hotprobe] *** 注册监督者失败 ***\n");
+      return 1;
+    }
+
+  caps = (unsigned int)prctl(PR_GET_ORT_CAPS);
+  g_caps = caps;               /* replace_cg 的能力闸读的是 g_caps */
+  printf("[hotprobe] caps=0x%08x overlap=%s\n", caps,
+         (caps & ORT_CAP_DOMAIN_OVERLAP) ? "有（不该：M 不提供）" : "无");
+
+  if ((caps & ORT_CAP_DOMAIN_OVERLAP) != 0)
+    {
+      ok = false;
+    }
+
+  cargv[0] = (FAR char *)"ortsup";
+  cargv[1] = (FAR char *)"hotprobe-arm";
+  cargv[2] = NULL;
+
+  pid = task_create("hotprobe-live", CONTAINER_PRIO, CONTAINER_STACK,
+                    ort_hotprobe_arm, cargv);
+  if (pid < 0)
+    {
+      printf("[hotprobe] *** live create 失败: %d ***\n", (int)pid);
+      return 1;
+    }
+
+  if (prctl(PR_SET_ORT_DOMAIN, 0, (int)pid) != 0)
+    {
+      printf("[hotprobe] *** live 绑域失败 ***\n");
+      kill(pid, SIGKILL);
+      waitpid(pid, &st, 0);
+      return 1;
+    }
+
+  printf("[hotprobe] live pid=%d\n", (int)pid);
+
+  memset(&live, 0, sizeof(live));
+  memset(&spec, 0, sizeof(spec));
+
+  live.name       = "hotprobe-live";
+  live.domain     = 0;
+  live.protocol   = 1;
+  live.pid        = pid;
+  live.admitted_ms = 1;
+
+  spec.name       = "hotprobe-warm";
+  spec.domain     = 0;
+  spec.protocol   = 1;      /* 声明"可热替换" —— 平台兑现不了 */
+  spec.version    = 2;
+  spec.max_restarts = 2;
+
+  if (replace_cg(&live, &spec))
+    {
+      printf("[hotprobe] replace=true（不该：平台无重叠能力）\n");
+      ok = false;
+    }
+  else
+    {
+      printf("[hotprobe] replace=false\n");
+    }
+
+  if (spec.pid != -1)
+    {
+      printf("[hotprobe] spec pid=%d（不该：接替者已被创建）\n", (int)spec.pid);
+      ok = false;
+    }
+  else
+    {
+      printf("[hotprobe] spec pid=-1（未创建接替者）\n");
+    }
+
+  /* 旧实例必须继续服务（没有被 stop_cg 撤下）。 */
+
+  usleep(300 * 1000);
+  if (kill(pid, 0) == 0)
+    {
+      printf("[hotprobe] live=alive（旧实例继续）\n");
+    }
+  else
+    {
+      printf("[hotprobe] live=gone（不该）\n");
+      ok = false;
+    }
+
+  /* ── 冷替换正臂（protocol=0）：能力闸不得误伤 ────────────────────
+   *
+   *   这是"热替换明示不可用"的另一半：M 的替换路径必须仍然可用 ——
+   *   先停后起（stop_cg → start_cg → 重新绑域，§119 的闸在旧组
+   *   销毁后放行）。只有 Cold 成功，才谈得上"冷替换可用"。
+   *
+   *   冷路径返回 true 不等于绑定成功（start_cg 失败时也返回 true，
+   *   只是 spec->failed=1）；判据看 spec.pid > 0 且 !spec.failed。 */
+
+  if (ok)
+    {
+      memset(&spec, 0, sizeof(spec));
+      spec.name         = "hotprobe-cold";
+      spec.domain       = 0;
+      spec.protocol     = 0;   /* 未声明生命周期协议 → 冷替换 */
+      spec.version      = 2;
+      spec.max_restarts = 2;
+
+      if (!replace_cg(&live, &spec))
+        {
+          printf("[hotprobe] cold=false（不该：冷替换不受能力闸限制）\n");
+          ok = false;
+        }
+      else if (spec.pid <= 0 || spec.failed)
+        {
+          printf("[hotprobe] cold=ERR pid=%d failed=%d\n",
+                 (int)spec.pid, (int)spec.failed);
+          ok = false;
+        }
+      else
+        {
+          printf("[hotprobe] cold=OK pid=%d（先停后起）\n", (int)spec.pid);
+
+          /* 冷替换的接替者是真实容器：立刻收掉，别让它 3 s 后自己故障
+           * （本探针只证明"绑定成功"，不演故障线）。 */
+
+          kill(spec.pid, SIGKILL);
+          waitpid(spec.pid, &st, 0);
+          printf("[hotprobe] cold status=%d\n", st);
+        }
+    }
+
+  /* live 已被 stop_cg 撤下（冷替换）；补收尸，失败无害。 */
+
+  waitpid(pid, &st, 0);
+  printf("[hotprobe] live status=%d\n", st);
+
+  /* ★ stop_cg 的宽限等待会调 PR_ORT_HEARTBEAT（监督者"在干活"），
+   *   于是内核看门狗被**武装**。探针是干净退出，必须像主循环收尾
+   *   一样显式解除 —— 否则 3 s 后看门狗 PANIC，日志看起来像内核
+   *   故障（首版实测：HOTPROBE RESULT: PASS 后紧跟 Assertion panic）。
+   *   任何调用 stop_cg / 替换等待的探针都要做这一步。 */
+
+  prctl(PR_ORT_HEARTBEAT_STOP);
+
+  printf("HOTPROBE RESULT: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? 0 : 1;
+}
+#endif /* !CONFIG_BUILD_KERNEL */
 
 /****************************************************************************
  * Name: manifest_reload
@@ -4961,6 +5175,11 @@ int main(int argc, FAR char *argv[])
       return ort_bindprobe_driver();
     }
 
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "hotprobe") == 0)
+    {
+      return ort_hotprobe_driver();
+    }
+
   if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "gcprobe-arm") == 0)
     {
       return ort_gcprobe_arm(argc, argv);
@@ -5382,8 +5601,9 @@ int main(int argc, FAR char *argv[])
 
   g_caps = (unsigned int)prctl(PR_GET_ORT_CAPS);
 
-  printf("[ortsup] 平台能力位: 0x%08x（FAULT_HANDLER=%s）\n",
-         g_caps, (g_caps & ORT_CAP_FAULT_HANDLER) ? "有" : "无");
+  printf("[ortsup] 平台能力位: 0x%08x（FAULT_HANDLER=%s，DOMAIN_OVERLAP=%s）\n",
+         g_caps, (g_caps & ORT_CAP_FAULT_HANDLER) ? "有" : "无",
+         (g_caps & ORT_CAP_DOMAIN_OVERLAP) ? "有" : "无");
   fflush(stdout);
 
   /* ── 准入演练（ortsup admit）────────────────────────────────────────

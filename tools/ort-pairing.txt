@@ -9,20 +9,17 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-21 ORT（§119 **rename 目的端 POSIX 闸 + M 一域一
-#               实例** —— unionfs 视图级 ENOTDIR/EISDIR/ENOTEMPTY/EINVAL
-#               （链接先 readlink；覆盖空目录先 clearmarkers+rmdir；目录
-#               改名后落 opq 防合并渗漏）。★ NuttX VFS 在 mops->rename
-#               之前做 mv 移入改写/非目录预删 ⇒ 闸只对改写后的二级目的
-#               端生效（判据用 renprobe 直调 rename(2)，dir?/同名子项
-#               夹具）。M：ort_ipc_domain_bind(enc, exclusive) → refs!=0
-#               则 -EBUSY；认领先于 §114 清理，失败路径 unref；A 不设闸
-#               （nsid 隔离）。代价：M 热替换 fail-closed → 暂只能冷替换。
-#               A 全电池绿 ×2 + 双负臂（e2e ㊳/T21）；M 双编 run5（无绑域
-#               失败）+ 六探针（含新 bindprobe）两 SKU PASS。
-#               内核 26591ab854。apps 侧 §119 = orthello renprobe +
-#               ortsup bindprobe + 夹具 dir5/dirN/dirE/dirF/dirG/dirH。）
+# 最近配对事件：2026-10-21 ORT（§120 **M 热替换语义收口** —— 新能力位
+#               ORT_CAP_DOMAIN_OVERLAP（A 有 0x3 / M 无 0x1）；ortsup
+#               replace_cg 在**创建接替者之前**拒绝 M 的热替换（变更
+#               不生效、旧实例继续），boot 准入不拒 protocol=1；冷替换
+#               仍可用。hotprobe 正反两段：warm 拒绝（spec.pid=-1 /
+#               live=alive）+ cold=OK。装置坑：stop_cg 的心跳会武装
+#               看门狗，探针退出必须 HEARTBEAT_STOP，否则 3 s 后 PANIC。
+#               A 全电池绿 ×2 + 双负臂 + 替换交接两臂（ready/窗口）；
+#               M 双编 run5 + 七探针（含 hotprobe）两 SKU PASS。
+#               内核 7634ccb814。apps 侧 §120 = ortsup 能力闸 + hotprobe。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=26591ab854bd5f34cfb74ab7cf871a47a367c773
+nuttx=7634ccb8143e0c185396a0f2f5a4a1552e3a9c8b
