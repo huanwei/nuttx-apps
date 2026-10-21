@@ -9,15 +9,14 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-21 ORT（§117 **IPC 面第五刀：M 域键命名空间退出 GC** ——
-#               每域组引用（绑定/§113 继承 +1，组销毁 -1）+ 代际；归零 →
-#               LPWORK 异步清 ort.d<enc>.；rebind 换域 -EINVAL。
-#               ★ LPWORK 在未配置低优先队列的 SKU 上重定向到 HPWORK，
-#               首版 #ifdef CONFIG_SCHED_LPWORK 圈死导致 M 降级（实锤）。
-#               A 全电池绿 ×2 + 双负臂；M 双编 run5+五探针（含 gcprobe）
-#               两 SKU PASS。内核 2767129357。
-#               apps 侧 §117 = ortsup gcprobe（仅 M）。）
+# 最近配对事件：2026-10-21 ORT（§118 **pid 翻译表 + rename 同路径 no-op** ——
+#               每实例 pmap[128] 本地号→全局号（tls 登记 / group_leave
+#               删 / 实例销毁清）；resolve 表优先、号>=128 回退活扫；
+#               号仍单调不复用。unionfs rename(old==new)=OK（否则尾部
+#               旧名白障遮掉源）；文件目的端替换判据。A 全电池绿 ×2 +
+#               双负臂（e2e ㊲）；M 双编 run5+五探针 两 SKU PASS。
+#               内核 72017a4244。apps 侧 §118 = 夹具 dir4/dirT/dirS。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=27671293571a86d13d1fcaf976e16e69939f34fd
+nuttx=72017a42448e81ba30ffdc02702d294f893580db

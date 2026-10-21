@@ -7,6 +7,6 @@
     "Cmd": ["/etc/hello.txt"],
     "WorkingDir": "/tmp/ort/wd"
   },
-  "rootfs": {"type": "layers", "diff_ids": ["sha256:f8a3654276d7740ee7dd6a5f5fad549840f140f284f493a5d7b93edb683cce17"]},
+  "rootfs": {"type": "layers", "diff_ids": ["sha256:023e636489cb6c843372ec0cc6645309b71930be6319bcba07eca7e65fd3596a"]},
   "history": [{"created_by": "ort-fixture-gen"}]
 }
