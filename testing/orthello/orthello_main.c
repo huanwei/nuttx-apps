@@ -188,6 +188,23 @@ int main(int argc, FAR char *argv[])
       printf("ORTHELLO: content=%s\n", buf);
     }
 
+  /* [§119] rename(2) 直调探针 —— **不能**用 mv 测目的端语义：
+   *   mv 看到"目标是目录"会先把源移入其中（rename 收到的是
+   *   "<目录>/<源名>"），内核的 ENOTDIR/EISDIR/ENOTEMPTY/EINVAL
+   *   分支根本走不到。用法（argv[3]=旧名 argv[4]=新名）：
+   *     orthello <存在的文件> renprobe <old> <new>
+   *   输出整行可判：`renprobe <old> -> <new>: OK errno=0`
+   *   或 `ERR errno=<n>`（errno 为 POSIX 号）。 */
+
+  if (argc >= 5 && strcmp(argv[2], "renprobe") == 0)
+    {
+      int r = rename(argv[3], argv[4]);
+
+      printf("ORTHELLO: renprobe %s -> %s: %s errno=%d\n",
+             argv[3], argv[4], r == 0 ? "OK" : "ERR",
+             r == 0 ? 0 : errno);
+    }
+
   /* §73：容器故障模式（argv[2]）——把"容器里的一个 bug"做成三种，
    * 全部经由**镜像运行时**（orting run + 侧配置）触发：
    *   crash    空指针写（data abort；无处理器 → 首次故障即死）

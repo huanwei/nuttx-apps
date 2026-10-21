@@ -9,14 +9,20 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-21 ORT（§118 **pid 翻译表 + rename 同路径 no-op** ——
-#               每实例 pmap[128] 本地号→全局号（tls 登记 / group_leave
-#               删 / 实例销毁清）；resolve 表优先、号>=128 回退活扫；
-#               号仍单调不复用。unionfs rename(old==new)=OK（否则尾部
-#               旧名白障遮掉源）；文件目的端替换判据。A 全电池绿 ×2 +
-#               双负臂（e2e ㊲）；M 双编 run5+五探针 两 SKU PASS。
-#               内核 72017a4244。apps 侧 §118 = 夹具 dir4/dirT/dirS。）
+# 最近配对事件：2026-10-21 ORT（§119 **rename 目的端 POSIX 闸 + M 一域一
+#               实例** —— unionfs 视图级 ENOTDIR/EISDIR/ENOTEMPTY/EINVAL
+#               （链接先 readlink；覆盖空目录先 clearmarkers+rmdir；目录
+#               改名后落 opq 防合并渗漏）。★ NuttX VFS 在 mops->rename
+#               之前做 mv 移入改写/非目录预删 ⇒ 闸只对改写后的二级目的
+#               端生效（判据用 renprobe 直调 rename(2)，dir?/同名子项
+#               夹具）。M：ort_ipc_domain_bind(enc, exclusive) → refs!=0
+#               则 -EBUSY；认领先于 §114 清理，失败路径 unref；A 不设闸
+#               （nsid 隔离）。代价：M 热替换 fail-closed → 暂只能冷替换。
+#               A 全电池绿 ×2 + 双负臂（e2e ㊳/T21）；M 双编 run5（无绑域
+#               失败）+ 六探针（含新 bindprobe）两 SKU PASS。
+#               内核 26591ab854。apps 侧 §119 = orthello renprobe +
+#               ortsup bindprobe + 夹具 dir5/dirN/dirE/dirF/dirG/dirH。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=72017a42448e81ba30ffdc02702d294f893580db
+nuttx=26591ab854bd5f34cfb74ab7cf871a47a367c773

@@ -2876,6 +2876,121 @@ static int ort_reuseprobe_driver(void)
 #endif /* !CONFIG_BUILD_KERNEL */
 
 #ifndef CONFIG_BUILD_KERNEL
+/* [§119] M "一域一实例"闸门自测：
+ *   A 绑 domain 0 并**活着**；B 同域再绑必须 -EBUSY（fail-closed，
+ *   且不得清掉 A 的域键命名空间）；A 退出（组销毁 → 域引用归零）后
+ *   B 再绑必须成功（闸门不误伤正常重启/复用）。
+ *
+ *   为什么必须单独一条装置：reuseprobe 是**先后**绑域（旧实例已退出），
+ *   证明不了"在位时拒绝"；run5 的重启也只在旧实例已经死透后发生。
+ *   没有这条负臂，"闸装了但没接上"与"闸正常工作"在日志上同形。 */
+
+static int ort_bindprobe_arm(int argc, FAR char *argv[])
+{
+  int ret;
+
+  (void)argc;
+  (void)argv;
+
+  /* 准入等待放长：B 要等 A 退出（约 1.2 s）才轮到绑域。 */
+
+  ret = prctl(PR_ORT_WAIT_ADMISSION, 5000);
+  if (ret != 0)
+    {
+      printf("[bindprobe] arm admission failed %d\n", ret);
+      return 1;
+    }
+
+  printf("[bindprobe] arm admitted pid=%d\n", (int)getpid());
+  usleep(1200 * 1000);
+  return 0;
+}
+
+static int ort_bindprobe_driver(void)
+{
+  FAR char *cargv[3];
+  pid_t pa;
+  pid_t pb;
+  int st;
+  int ret;
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
+  if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
+    {
+      printf("[bindprobe] *** 注册监督者失败 ***\n");
+      return 1;
+    }
+
+  cargv[0] = (FAR char *)"ortsup";
+  cargv[1] = (FAR char *)"bindprobe-arm";
+  cargv[2] = NULL;
+
+  pa = task_create("bindprobe-A", CONTAINER_PRIO, CONTAINER_STACK,
+                   ort_bindprobe_arm, cargv);
+  if (pa < 0)
+    {
+      printf("[bindprobe] *** A create 失败: %d ***\n", (int)pa);
+      return 1;
+    }
+
+  if (prctl(PR_SET_ORT_DOMAIN, 0, (int)pa) != 0)
+    {
+      printf("[bindprobe] first=ERR\n");
+      return 1;
+    }
+
+  printf("[bindprobe] first=OK\n");
+
+  /* B 在 A 仍在位时创建并尝试绑同域 → 期望 -EBUSY（prctl 直返负
+   * errno，不走 libc 的 errno 约定）。 */
+
+  pb = task_create("bindprobe-B", CONTAINER_PRIO, CONTAINER_STACK,
+                   ort_bindprobe_arm, cargv);
+  if (pb < 0)
+    {
+      printf("[bindprobe] *** B create 失败: %d ***\n", (int)pb);
+      return 1;
+    }
+
+  ret = prctl(PR_SET_ORT_DOMAIN, 0, (int)pb);
+  if (ret == -EBUSY)
+    {
+      printf("[bindprobe] overlap=EBUSY\n");
+    }
+  else if (ret == 0)
+    {
+      printf("[bindprobe] overlap=OK（不该：同域两个活实例）\n");
+      return 1;
+    }
+  else
+    {
+      printf("[bindprobe] overlap=ERR %d\n", ret);
+      return 1;
+    }
+
+  waitpid(pa, &st, 0);
+  printf("[bindprobe] A status=%d\n", st);
+
+  /* A 的组销毁已退掉域引用 → B 绑同域必须成功（复用闸不误伤）。 */
+
+  ret = prctl(PR_SET_ORT_DOMAIN, 0, (int)pb);
+  if (ret != 0)
+    {
+      printf("[bindprobe] after=ERR %d\n", ret);
+      return 1;
+    }
+
+  printf("[bindprobe] after=OK\n");
+
+  waitpid(pb, &st, 0);
+  printf("[bindprobe] B status=%d\n", st);
+  printf("BINDPROBE RESULT: %s\n",
+         (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? "PASS" : "FAIL");
+  return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : 1;
+}
+#endif /* !CONFIG_BUILD_KERNEL */
+
+#ifndef CONFIG_BUILD_KERNEL
 /* [§117] 域键 IPC 名空间退出 GC 自测：容器（domain 0）留一条 /ortgc
  * 后退出；**不再绑新实例** —— 旧队列只能靠"最后一个组离开"的异步
  * 清理收掉。见证行：`mqueue ns purge: ort.d1. (1)`。 */
@@ -3829,6 +3944,13 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
 
       return true;
     }
+
+  /* ★ ORT-M（MPU）：内核 §119 起有"一域一实例"硬闸 —— 现任还活着时，
+   *   接替者绑同一域会得到 -EBUSY（域键 mqueue 命名空间按域共享，
+   *   重叠 = 串扰）。于是**热替换在 M 上 fail-closed**：start_cg 报
+   *   "绑域失败"，本次变更放弃、旧实例继续。这是有意的：在"每实例
+   *   私有 IPC/状态"落地之前，M 的部署替换只能走冷替换
+   *   （protocol=0 或声明被证伪的那条路）。不要为绕过它去放宽内核闸。 */
 
   if (start_cg(spec, "fault", spec->critical ? 8 : 3, true) != 0)
     {
@@ -4832,6 +4954,11 @@ int main(int argc, FAR char *argv[])
   if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "reuseprobe") == 0)
     {
       return ort_reuseprobe_driver();
+    }
+
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "bindprobe") == 0)
+    {
+      return ort_bindprobe_driver();
     }
 
   if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "gcprobe-arm") == 0)
