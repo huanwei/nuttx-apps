@@ -9,17 +9,23 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-21 ORT（§120 **M 热替换语义收口** —— 新能力位
-#               ORT_CAP_DOMAIN_OVERLAP（A 有 0x3 / M 无 0x1）；ortsup
-#               replace_cg 在**创建接替者之前**拒绝 M 的热替换（变更
-#               不生效、旧实例继续），boot 准入不拒 protocol=1；冷替换
-#               仍可用。hotprobe 正反两段：warm 拒绝（spec.pid=-1 /
-#               live=alive）+ cold=OK。装置坑：stop_cg 的心跳会武装
-#               看门狗，探针退出必须 HEARTBEAT_STOP，否则 3 s 后 PANIC。
-#               A 全电池绿 ×2 + 双负臂 + 替换交接两臂（ready/窗口）；
-#               M 双编 run5 + 七探针（含 hotprobe）两 SKU PASS。
-#               内核 7634ccb814。apps 侧 §120 = ortsup 能力闸 + hotprobe。）
+# 最近配对事件：2026-10-21 ORT（§121 **域两维：物理域（实例）+ 逻辑域
+#               （服务）** —— 物理域 = MPU 块 + ort.d<enc>. IPC 实例键；
+#               逻辑域 = 状态槽/故障作废/部署。PR_SET_ORT_DOMAIN2 打包
+#               phys|svc<<8（用户态 prctl 代理只转 2 个变参）；
+#               PR_GET_ORT_PHYSDOMAIN。§119 闸改按物理域独占：同逻辑域
+#               可重叠。M 两 SKU 申报 DOMAIN_OVERLAP。ortsup 分配物理块
+#               （优先逻辑域、standby 避开现任、无空闲 fail-closed）、
+#               devwl 前移到绑域之前、绑失败杀孤儿并释放块；容器块地址
+#               （own/priv_self）全部改用物理域（首版混用→接替者一启动
+#               就 USER FAULT）。判据：overlapprobe（同逻辑不同物理 OK、
+#               同物理 EBUSY、状态槽按逻辑共享）+ ortm-replace（两 SKU
+#               × ready/窗口：两次绑域同 service 不同 physical、tick
+#               接续）。A 全电池 ×2 + 双负臂 + 替换两臂；M 双编 run5 +
+#               七探针 + overlap + replace 两臂，两 SKU PASS。
+#               内核 73b67d5943。apps 侧 §121 = ortsup 物理分配/两维绑定
+#               + overlapprobe（hotprobe 退役）。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=7634ccb8143e0c185396a0f2f5a4a1552e3a9c8b
+nuttx=73b67d59430e2bc272aa804231e74d0076155b40

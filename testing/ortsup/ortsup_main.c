@@ -249,6 +249,15 @@ struct ort_cg_s
                                   *   devices 原文；空 = 不下发 = 全拒绝） */
   int             admitted_ms;   /* 被准入的时刻（-1 = 尚未准入） */
   int             ready;         /* ④ 就绪上报（当前实例；新实例重置为 0） */
+
+  /* [§121] 本实例的**物理域**（MPU 块 + 域键 IPC 的实例键）。
+   *   -1 = 未分配；每次 start_cg 分配/复用，stop_cg/失败时释放。
+   *   与 cg->domain（manifest 的**逻辑/服务域**）分开：热替换的
+   *   接替者拿不同的物理块，但逻辑域相同（状态交接）。
+   *   ⚠️ 解析器必须把它置 -1 —— 0 是合法块号，零初始化会被误当
+   *   "已分配 0 号块"。 */
+
+  int             phys_domain;
 };
 
 /* CG 表**由 manifest 填**，不再写死在源码里。
@@ -717,6 +726,7 @@ static int manifest_parse(FAR const char *text, size_t len,
           cg->domain      = -1;      /* -1 = 未声明，后面校验会拦 */
           cg->pid         = -1;
           cg->admitted_ms = -1;
+          cg->phys_domain = -1;      /* [§121] -1 = 尚未分配物理块 */
 
           seen[n] = 0;
           n++;
@@ -1385,7 +1395,18 @@ static uint32_t *priv_self(void)
 #else
 
   {
-    int d = (int)prctl(PR_GET_ORT_DOMAIN);
+    /* [§121] 私有状态块按**物理**域定位（不是逻辑域）：
+     *   热替换的接替者逻辑域与现任相同、物理块不同。用逻辑域会
+     *   算到现任的块上 → MPU 拒绝 → 接替者一启动就 USER FAULT
+     *   （实测：pc=0x20013076 addr=block1+0x18，正是 STOP 字）。
+     *   PR_GET_ORT_PHYSDOMAIN 是只读信息；旧内核回退逻辑域。 */
+
+    int d = (int)prctl(PR_GET_ORT_PHYSDOMAIN);
+
+    if (d < 0)
+      {
+        d = (int)prctl(PR_GET_ORT_DOMAIN);
+      }
 
     if (d >= 0 && d < NBLOCKS)
       {
@@ -3367,9 +3388,27 @@ static int ort_container_main(int argc, FAR char *argv[])
 
 #else
 
-  own   = (volatile uint32_t *)(POOL_BASE + (uint32_t)domain * BLOCK_SIZE);
-  other = (volatile uint32_t *)
-            (POOL_BASE + ((uint32_t)domain + 1) % NBLOCKS * BLOCK_SIZE);
+  /* [§121] 域块按**物理**域定位，不是 manifest 的逻辑域 ——
+   *   热替换的接替者逻辑域与现任相同、物理块不同；用 argv 里的
+   *   逻辑域算地址会让两代实例操作同一块（正是要消除的串扰）。
+   *   物理域由内核在绑域时确定，PR_GET_ORT_PHYSDOMAIN 只读返回；
+   *   访问别的块仍会 fault（MPU 只放行自己的块）。 */
+
+  {
+    int phys = (int)prctl(PR_GET_ORT_PHYSDOMAIN);
+
+    if (phys < 0)
+      {
+        phys = domain;      /* 旧内核/未绑定：退回旧行为 */
+      }
+
+    printf("[ortsup] 容器: service=%d physical=%d\n", domain, phys);
+    fflush(stdout);
+
+    own   = (volatile uint32_t *)(POOL_BASE + (uint32_t)phys * BLOCK_SIZE);
+    other = (volatile uint32_t *)
+              (POOL_BASE + ((uint32_t)phys + 1) % NBLOCKS * BLOCK_SIZE);
+  }
 
 #endif
 
@@ -3727,6 +3766,7 @@ static bool stop_cg(FAR struct ort_cg_s *cg)
 
   if (cg->pid <= 0)
     {
+      cg->phys_domain = -1;       /* [§121] 没有实例 → 不该占着物理块 */
       return true;
     }
 
@@ -3736,6 +3776,7 @@ static bool stop_cg(FAR struct ort_cg_s *cg)
        * 所以**不作结论**（见 audit_protocol 的"证据"一节）。 */
 
       cg->pid = -1;
+      cg->phys_domain = -1;       /* [§121] 实例已不在 → 释放物理块 */
       return true;
     }
 
@@ -3754,6 +3795,7 @@ static bool stop_cg(FAR struct ort_cg_s *cg)
           printf("[ortsup]   %s pid=%d 在 %d ms 内干净退出\n",
                  cg->name, (int)cg->pid, waited);
           cg->pid = -1;
+          cg->phys_domain = -1;   /* [§121] 释放物理块 */
           return true;
         }
     }
@@ -3774,6 +3816,7 @@ static bool stop_cg(FAR struct ort_cg_s *cg)
 
   kill(cg->pid, SIGKILL);
   cg->pid = -1;
+  cg->phys_domain = -1;           /* [§121] 已 SIGKILL → 块不再使用 */
   return false;
 }
 
@@ -3914,8 +3957,8 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
   /* ── [§120] 平台能力闸：热替换要求"同域重叠实例" ──────────────────
    *
    * ★ 闸的位置是**本次变更的准入**，不是 manifest 装载时的准入。
-   *   protocol=1 本身在 M 上完全合法（SIGTERM 有界退出、状态发布），
-   *   只是"重叠期"不成立。启动时拒绝 protocol=1 会把正常部署也挡掉。
+   *   protocol=1 本身完全合法（SIGTERM 有界退出、状态发布），
+   *   不成立时拒绝的只是"重叠期"。启动时拒绝会把正常部署也挡掉。
    *
    * ★ 为什么必须在 start_cg **之前**拒绝：
    *   否则会先创建接替者、绑域时才 -EBUSY（§119），留下一个未准入的
@@ -3923,6 +3966,9 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
    *
    * ★ 拒绝 = 本次变更不生效、旧实例继续（fail-closed），不做静默
    *   降级。要换就请声明 protocol=0 走冷替换（有服务空档，但合法）。
+   *
+   * ★ §121 起 M 也申报 DOMAIN_OVERLAP（物理块按实例分、逻辑域共享），
+   *   这条闸对 A/M 都不再触发；它保留给未来不具备该条件的端口。
    */
 
   if (spec->protocol != 0 && !spec->protocol_falsified &&
@@ -3971,10 +4017,10 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
       return true;
     }
 
-  /* ★ 能走到这里 = 平台申报了 DOMAIN_OVERLAP（A），或未来某平台具备
-   *   实例级隔离。M 在上面的能力闸就已拒绝，不会走到这里。
-   *   §119 的内核"一域一实例"闸仍是**最后防线**：即便政策被绕过，
-   *   绑同域仍会 -EBUSY。不要为绕过任何一侧去放宽内核闸。 */
+  /* ★ 能走到这里 = 平台申报了 DOMAIN_OVERLAP（A / M §121：物理域按
+   *   实例、逻辑域共享），或未来某平台具备同等的实例级隔离。
+   *   §119 的内核"一物理域一实例"闸仍是**最后防线**：即便政策被绕过，
+   *   绑同一块仍会 -EBUSY。不要为绕过任何一侧去放宽内核闸。 */
 
   if (start_cg(spec, "fault", spec->critical ? 8 : 3, true) != 0)
     {
@@ -4055,191 +4101,154 @@ static bool replace_cg(FAR struct ort_cg_s *live, FAR struct ort_cg_s *spec)
 }
 
 #ifndef CONFIG_BUILD_KERNEL
-/* [§120] M 热替换准入自测：平台没有 ORT_CAP_DOMAIN_OVERLAP。
+/* [§121] M 重叠实例探针：物理域按实例、逻辑域共享。
  *
- *   造一个**活着**的 live CG（protocol=1）和一份要求热替换的 spec，
- *   直接调 replace_cg()：
- *     · 必须在创建接替者**之前**拒绝（返回 false、spec.pid 仍为 -1）；
- *     · 必须打印能力闸见证（脚本判）；
- *     · 旧实例必须还在跑。
+ *   1) A(phys0,svc0) + B(phys1,svc0) 同时绑域 → 都必须成功
+ *      （§119 的闸是"一**物理**域一实例"，不是一逻辑域）；
+ *   2) C 试图绑同一个物理域（phys0,svc1） → 必须 -EBUSY；
+ *   3) A/B 的 PR_GET_ORT_DOMAIN 都报逻辑 0，PHYSDOMAIN 分别 0/1；
+ *   4) A 在逻辑槽 0 发布状态，B 必须读到（状态槽按逻辑域共享 ——
+ *      热替换交接的前提）。
  *
- *   为什么需要这条负臂：没有它，"提前拒绝"与"走到 start_cg 再被
- *   §119 的 -EBUSY 挡"在日志上只差一行字 —— 而后者会留下一个
- *   未准入的接替者空转到 admission 超时。 */
+ *   没有这条装置，"物理/逻辑分离"只是代码注释里的承诺。 */
 
-static int ort_hotprobe_arm(int argc, FAR char *argv[])
+static volatile uint32_t g_overlap_state;
+
+struct ort_ov_blob_s
 {
+  uint32_t magic;
+  uint32_t value;
+};
+
+#define ORT_OV_MAGIC 0x4f564c50u   /* 'OVLP' */
+
+static int ort_overlapprobe_arm(int argc, FAR char *argv[])
+{
+  struct ort_ov_blob_s blob;
+  FAR const char *mode = "idle";
+  int logical;
+  int phys;
+  int k;
   int ret;
 
   (void)argc;
   (void)argv;
 
+  for (k = 0; k < argc; k++)
+    {
+      if (argv[k] != NULL &&
+          (strcmp(argv[k], "put") == 0 || strcmp(argv[k], "get") == 0))
+        {
+          mode = argv[k];
+        }
+    }
+
   ret = prctl(PR_ORT_WAIT_ADMISSION, 5000);
   if (ret != 0)
     {
-      printf("[hotprobe] live admission failed %d\n", ret);
+      printf("[overlap] %s admission failed %d\n", mode, ret);
       return 1;
     }
 
-  printf("[hotprobe] live admitted pid=%d\n", (int)getpid());
-  usleep(1500 * 1000);
-  printf("[hotprobe] live tick\n");
+  logical = (int)prctl(PR_GET_ORT_DOMAIN);
+  phys    = (int)prctl(PR_GET_ORT_PHYSDOMAIN);
+  printf("[overlap] %s logical=%d physical=%d\n", mode, logical, phys);
+
+  if (strcmp(mode, "put") == 0)
+    {
+      blob.magic = ORT_OV_MAGIC;
+      blob.value = 0x121u;
+      ret = (int)prctl(PR_ORT_STATE_PUT, &blob, sizeof(blob));
+      printf("[overlap] put ret=%d value=0x%x\n", ret, (unsigned)blob.value);
+    }
+  else if (strcmp(mode, "get") == 0)
+    {
+      memset(&blob, 0, sizeof(blob));
+      usleep(400 * 1000);
+      ret = (int)prctl(PR_ORT_STATE_GET, &blob, sizeof(blob));
+      printf("[overlap] get ret=%d magic=0x%x value=0x%x\n",
+             ret, (unsigned)blob.magic, (unsigned)blob.value);
+      if (ret == (int)sizeof(blob) && blob.magic == ORT_OV_MAGIC)
+        {
+          g_overlap_state = blob.value;
+        }
+    }
+
+  usleep(600 * 1000);
   return 0;
 }
 
-static int ort_hotprobe_driver(void)
+static pid_t ort_overlap_make(FAR const char *mode)
 {
-  struct ort_cg_s live;
-  struct ort_cg_s spec;
-  FAR char *cargv[3];
+  FAR char *cargv[2];
+
+  cargv[0] = (FAR char *)mode;
+  cargv[1] = NULL;
+  return task_create("overlap", CONTAINER_PRIO, CONTAINER_STACK,
+                     ort_overlapprobe_arm, cargv);
+}
+
+static int ort_overlapprobe_driver(void)
+{
   unsigned int caps;
-  pid_t pid;
+  pid_t a;
+  pid_t b;
+  pid_t c;
   int st;
-  bool ok = true;
+  int ret;
+  int ok = 1;
 
   prctl(PR_ORT_SUPERVISOR_RESET);
   if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
     {
-      printf("[hotprobe] *** 注册监督者失败 ***\n");
+      printf("[overlap] *** 注册监督者失败 ***\n");
       return 1;
     }
 
   caps = (unsigned int)prctl(PR_GET_ORT_CAPS);
-  g_caps = caps;               /* replace_cg 的能力闸读的是 g_caps */
-  printf("[hotprobe] caps=0x%08x overlap=%s\n", caps,
-         (caps & ORT_CAP_DOMAIN_OVERLAP) ? "有（不该：M 不提供）" : "无");
+  printf("[overlap] caps=0x%08x overlap=%s\n", caps,
+         (caps & ORT_CAP_DOMAIN_OVERLAP) ? "有" : "无（不该：§121 起 M 提供）");
 
-  if ((caps & ORT_CAP_DOMAIN_OVERLAP) != 0)
+  a = ort_overlap_make("put");
+  b = ort_overlap_make("get");
+  c = ort_overlap_make("idle");
+  if (a < 0 || b < 0 || c < 0)
     {
-      ok = false;
-    }
-
-  cargv[0] = (FAR char *)"ortsup";
-  cargv[1] = (FAR char *)"hotprobe-arm";
-  cargv[2] = NULL;
-
-  pid = task_create("hotprobe-live", CONTAINER_PRIO, CONTAINER_STACK,
-                    ort_hotprobe_arm, cargv);
-  if (pid < 0)
-    {
-      printf("[hotprobe] *** live create 失败: %d ***\n", (int)pid);
+      printf("[overlap] *** create 失败 ***\n");
       return 1;
     }
 
-  if (prctl(PR_SET_ORT_DOMAIN, 0, (int)pid) != 0)
-    {
-      printf("[hotprobe] *** live 绑域失败 ***\n");
-      kill(pid, SIGKILL);
-      waitpid(pid, &st, 0);
-      return 1;
-    }
+  /* 同一逻辑域、不同物理域 → 都允许（重叠实例）。 */
 
-  printf("[hotprobe] live pid=%d\n", (int)pid);
+  ret = prctl(PR_SET_ORT_DOMAIN2, (int)ORT_DOMAIN2_PACK(0, 0), (int)a);
+  printf("[overlap] bind A(phys=0,svc=0): %s\n", ret == 0 ? "OK" : "ERR");
+  ok &= (ret == 0);
 
-  memset(&live, 0, sizeof(live));
-  memset(&spec, 0, sizeof(spec));
+  ret = prctl(PR_SET_ORT_DOMAIN2, (int)ORT_DOMAIN2_PACK(1, 0), (int)b);
+  printf("[overlap] bind B(phys=1,svc=0): %s\n", ret == 0 ? "OK" : "ERR");
+  ok &= (ret == 0);
 
-  live.name       = "hotprobe-live";
-  live.domain     = 0;
-  live.protocol   = 1;
-  live.pid        = pid;
-  live.admitted_ms = 1;
+  /* 同一物理域再绑 → 必须 EBUSY（一物理域一实例）。 */
 
-  spec.name       = "hotprobe-warm";
-  spec.domain     = 0;
-  spec.protocol   = 1;      /* 声明"可热替换" —— 平台兑现不了 */
-  spec.version    = 2;
-  spec.max_restarts = 2;
+  ret = prctl(PR_SET_ORT_DOMAIN2, (int)ORT_DOMAIN2_PACK(0, 1), (int)c);
+  printf("[overlap] bind C(phys=0,svc=1): %s (%d)\n",
+         ret == -EBUSY ? "EBUSY" : "不该", ret);
+  ok &= (ret == -EBUSY);
 
-  if (replace_cg(&live, &spec))
-    {
-      printf("[hotprobe] replace=true（不该：平台无重叠能力）\n");
-      ok = false;
-    }
-  else
-    {
-      printf("[hotprobe] replace=false\n");
-    }
+  usleep(1200 * 1000);
+  printf("[overlap] state=%s (0x%x)\n",
+         g_overlap_state == 0x121u ? "SHARED" : "MISSING",
+         (unsigned)g_overlap_state);
+  ok &= (g_overlap_state == 0x121u);
 
-  if (spec.pid != -1)
-    {
-      printf("[hotprobe] spec pid=%d（不该：接替者已被创建）\n", (int)spec.pid);
-      ok = false;
-    }
-  else
-    {
-      printf("[hotprobe] spec pid=-1（未创建接替者）\n");
-    }
+  kill(c, SIGKILL);
+  waitpid(c, &st, 0);
+  kill(a, SIGKILL);
+  waitpid(a, &st, 0);
+  kill(b, SIGKILL);
+  waitpid(b, &st, 0);
 
-  /* 旧实例必须继续服务（没有被 stop_cg 撤下）。 */
-
-  usleep(300 * 1000);
-  if (kill(pid, 0) == 0)
-    {
-      printf("[hotprobe] live=alive（旧实例继续）\n");
-    }
-  else
-    {
-      printf("[hotprobe] live=gone（不该）\n");
-      ok = false;
-    }
-
-  /* ── 冷替换正臂（protocol=0）：能力闸不得误伤 ────────────────────
-   *
-   *   这是"热替换明示不可用"的另一半：M 的替换路径必须仍然可用 ——
-   *   先停后起（stop_cg → start_cg → 重新绑域，§119 的闸在旧组
-   *   销毁后放行）。只有 Cold 成功，才谈得上"冷替换可用"。
-   *
-   *   冷路径返回 true 不等于绑定成功（start_cg 失败时也返回 true，
-   *   只是 spec->failed=1）；判据看 spec.pid > 0 且 !spec.failed。 */
-
-  if (ok)
-    {
-      memset(&spec, 0, sizeof(spec));
-      spec.name         = "hotprobe-cold";
-      spec.domain       = 0;
-      spec.protocol     = 0;   /* 未声明生命周期协议 → 冷替换 */
-      spec.version      = 2;
-      spec.max_restarts = 2;
-
-      if (!replace_cg(&live, &spec))
-        {
-          printf("[hotprobe] cold=false（不该：冷替换不受能力闸限制）\n");
-          ok = false;
-        }
-      else if (spec.pid <= 0 || spec.failed)
-        {
-          printf("[hotprobe] cold=ERR pid=%d failed=%d\n",
-                 (int)spec.pid, (int)spec.failed);
-          ok = false;
-        }
-      else
-        {
-          printf("[hotprobe] cold=OK pid=%d（先停后起）\n", (int)spec.pid);
-
-          /* 冷替换的接替者是真实容器：立刻收掉，别让它 3 s 后自己故障
-           * （本探针只证明"绑定成功"，不演故障线）。 */
-
-          kill(spec.pid, SIGKILL);
-          waitpid(spec.pid, &st, 0);
-          printf("[hotprobe] cold status=%d\n", st);
-        }
-    }
-
-  /* live 已被 stop_cg 撤下（冷替换）；补收尸，失败无害。 */
-
-  waitpid(pid, &st, 0);
-  printf("[hotprobe] live status=%d\n", st);
-
-  /* ★ stop_cg 的宽限等待会调 PR_ORT_HEARTBEAT（监督者"在干活"），
-   *   于是内核看门狗被**武装**。探针是干净退出，必须像主循环收尾
-   *   一样显式解除 —— 否则 3 s 后看门狗 PANIC，日志看起来像内核
-   *   故障（首版实测：HOTPROBE RESULT: PASS 后紧跟 Assertion panic）。
-   *   任何调用 stop_cg / 替换等待的探针都要做这一步。 */
-
-  prctl(PR_ORT_HEARTBEAT_STOP);
-
-  printf("HOTPROBE RESULT: %s\n", ok ? "PASS" : "FAIL");
+  printf("OVERLAP RESULT: %s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
 #endif /* !CONFIG_BUILD_KERNEL */
@@ -4430,6 +4439,7 @@ static int manifest_reload(void)
               scratch[k].restarts    = live->restarts;
               scratch[k].faults      = live->faults;
               scratch[k].failed      = live->failed;
+              scratch[k].phys_domain = live->phys_domain;  /* [§121] 旧实例继续 */
 
               /* ★ 证伪结论必须跟着走。
                *   它是**运行期实测**出来的，不是 manifest 里的声明 ——
@@ -4451,6 +4461,7 @@ static int manifest_reload(void)
           scratch[k].restarts    = live->restarts;
           scratch[k].faults      = live->faults;
           scratch[k].failed      = live->failed;
+          scratch[k].phys_domain = live->phys_domain;  /* [§121] 不换实例 */
           scratch[k].protocol_falsified = live->protocol_falsified;
         }
     }
@@ -4531,6 +4542,74 @@ static bool admit_ok(FAR const struct ort_cg_s *cg)
          (g_caps & ORT_CAP_FAULT_HANDLER) != 0;
 }
 
+/* [§121] 物理域分配。
+ *
+ *   已占用 = 当前配置里有实例的 CG 的 phys_domain（>=0）。热替换的
+ *   现任在 g_cgs 里，所以它的块**自动**被排除 —— 接替者拿另一块；
+ *   冷替换先 stop 旧实例（释放块），再分配，天然可复用同一块。
+ *
+ *   优先 prefer（=manifest 逻辑域）：初次启动 phys==逻辑域，日志/
+ *   IPC 键与既有行为一致；不可用则取最低空闲块（fail-closed：无空闲
+ *   返回 -1，不猜、不共用）。
+ */
+
+static bool ort_phys_used(int d)
+{
+  int i;
+
+  for (i = 0; i < (int)NCGS; i++)
+    {
+      if (g_cgs[i].phys_domain == d)
+        {
+          return true;
+        }
+    }
+
+  return false;
+}
+
+static int ort_phys_alloc(int prefer)
+{
+  int cap = (int)prctl(PR_GET_ORT_DOMCAP);
+  int d;
+
+  if (cap <= 0)
+    {
+      return -1;
+    }
+
+  if (prefer >= 0 && prefer < cap && !ort_phys_used(prefer))
+    {
+      return prefer;
+    }
+
+  for (d = 0; d < cap; d++)
+    {
+      if (!ort_phys_used(d))
+        {
+          return d;
+        }
+    }
+
+  return -1;
+}
+
+/* [§121] 启动失败收尾：容器已创建但未准入（无域 → 不会发 EXIT 事件），
+ *   杀掉并收尸，同时释放物理块。不收拾的话它会空转到 admission 超时。 */
+
+static void ort_start_abort(pid_t pid, FAR struct ort_cg_s *cg)
+{
+  int st;
+
+  if (pid > 0)
+    {
+      kill(pid, SIGKILL);
+      waitpid(pid, &st, 0);
+    }
+
+  cg->phys_domain = -1;
+}
+
 static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
                     bool standby)
 {
@@ -4539,6 +4618,7 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
   char dbuf[8];
   char lbuf[8];
   pid_t pid;
+  int rc;
 
   /* ── 准入门禁 ──────────────────────────────────────────────────────
    *
@@ -4557,6 +4637,21 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
 
       cg->failed = true;
       return -1;
+    }
+
+  /* [§121] 先分配物理块（实例身份：MPU 块 + IPC 键），再创建容器。
+   *   失败 = 无空闲块（热替换的重叠期需要一块备用）→ fail-closed。 */
+
+  if (cg->phys_domain < 0)
+    {
+      cg->phys_domain = ort_phys_alloc(cg->domain);
+      if (cg->phys_domain < 0)
+        {
+          printf("[ortsup] *** %s: 无空闲物理域（重叠替换需要备用块）"
+                 " -> 拒绝启动 ***\n", cg->name);
+          fflush(stdout);
+          return -1;
+        }
     }
 
   snprintf(dbuf, sizeof(dbuf), "%d", cg->domain);
@@ -4704,6 +4799,7 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
       {
         printf("[ortsup] 启动 %s 失败: posix_spawn ret=%d\n",
                cg->name, ret);
+        cg->phys_domain = -1;         /* [§121] 容器没起来 → 释放块 */
         return -ret;
       }
   }
@@ -4717,6 +4813,7 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
   if (pid < 0)
     {
       printf("[ortsup] 启动 %s 失败: %d\n", cg->name, (int)pid);
+      cg->phys_domain = -1;           /* [§121] 容器没起来 → 释放块 */
       return (int)pid;
     }
 
@@ -4734,19 +4831,13 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
              cg->critical ? "关键" : "非关键", cg->max_restarts);
     }
 
-  /* 绑域：**只有监督者能做**（容器自申报会被 -EPERM 拒绝）。
-   * 这一步是"容器"与"一段任意代码"的分界线 —— 从此刻起它才有内存域。
-   */
-
-  if (prctl(PR_SET_ORT_DOMAIN, cg->domain, (int)pid) != 0)
-    {
-      printf("[ortsup] 绑域失败 %s pid=%d\n", cg->name, (int)pid);
-      return -1;
-    }
-
   /* [§104] 设备白名单下发（manifest 可选字段 devices）。失败 =
    * fail-closed：不启动一个"声明了名单却没下发成"的实例 ——
-   * 否则监督者以为有名单、内核侧却是全拒绝（或反之），两侧语义分叉。 */
+   * 否则监督者以为有名单、内核侧却是全拒绝（或反之），两侧语义分叉。
+   *
+   * ★ [§121] 必须排在**绑域之前**：绑域会唤醒准入等待，容器从此刻
+   *   起就可能 open 设备 —— devwl 晚一步就会漏出"名单未生效"的窗口。
+   *   （spawnprobe 一直按这个顺序；start_cg 这里此前是反的。） */
 
   if (cg->devwl[0] != '\0')
     {
@@ -4754,9 +4845,32 @@ static int start_cg(FAR struct ort_cg_s *cg, FAR const char *mode, int delay,
         {
           printf("[ortsup] 设备白名单下发失败 %s pid=%d\n",
                  cg->name, (int)pid);
+          ort_start_abort(pid, cg);
           return -1;
         }
     }
+
+  /* 绑域：**只有监督者能做**（容器自申报会被 -EPERM 拒绝）。
+   * 这一步是"容器"与"一段任意代码"的分界线 —— 从此刻起它才有内存域。
+   *
+   * [§121] 两维绑定：physical = 本实例的块（内存 + IPC 键）；
+   * service = manifest 的逻辑域（状态槽/部署身份）。热替换的接替者
+   * 拿不同 physical、同 service。
+   */
+
+  rc = prctl(PR_SET_ORT_DOMAIN2,
+             (int)ORT_DOMAIN2_PACK(cg->phys_domain, cg->domain), (int)pid);
+  if (rc != 0)
+    {
+      printf("[ortsup] 绑域失败 %s pid=%d physical=%d service=%d ret=%d\n",
+             cg->name, (int)pid, cg->phys_domain, cg->domain, rc);
+      ort_start_abort(pid, cg);
+      return -1;
+    }
+
+  printf("[ortsup]   绑域 %s: service=%d physical=%d\n",
+         cg->name, cg->domain, cg->phys_domain);
+  fflush(stdout);
 
   cg->pid         = pid;
   cg->admitted_ms = g_now_ms;    /* ★ 准入时刻 —— 启动窗口从这里开始算 */
@@ -5175,9 +5289,9 @@ int main(int argc, FAR char *argv[])
       return ort_bindprobe_driver();
     }
 
-  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "hotprobe") == 0)
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "overlapprobe") == 0)
     {
-      return ort_hotprobe_driver();
+      return ort_overlapprobe_driver();
     }
 
   if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "gcprobe-arm") == 0)
