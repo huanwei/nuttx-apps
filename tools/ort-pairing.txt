@@ -9,14 +9,14 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-21 ORT（§114 **IPC 面第三刀：绑域即清旧实例队列** ——
-#               M 的 IPC 键=域，域在 CG 重启复用；同域先后两个容器，后者
-#               读到前者未 unlink 的队列（check=OLD）。新增
-#               nxmq_purge_prefix；三份 bind 在落域前清理（M 两遍式、区外
-#               可睡眠、失败 fail-closed）。A 全电池绿 ×2 + 双负臂；M 双编
-#               run5+mqprobe+fdprobe+spawnprobe+reuseprobe 两 SKU PASS。
-#               内核 9ed72f1ba7。apps 侧 §114 = ortsup reuseprobe（仅 M）。）
+# 最近配对事件：2026-10-21 ORT（§115 **IPC 面第四刀：实例死亡异步回收** ——
+#               A 的 nsid 唯一不复用但旧队列永留；ort_pidns_put 返回
+#               "最后引用"，group_drop 交给 LPWORK 清 ort.n<nsid>.；
+#               nsid 不复用 ⇒ 不误伤新实例。判据=宿主 ls /var/mqueue 无
+#               ort.*（见证行仅人读，控制台会字符级交错）。A 全电池绿
+#               ×2 + 双负臂；M 双编 run5+四探针 两 SKU PASS。
+#               内核 f12abbfe75。apps 侧无源码变更（只 bump 配对）。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=9ed72f1ba7b6809d3eefab3571e5e40fa3a4c84d
+nuttx=f12abbfe753a1a00448454221a0c85e3fb3a8e31
