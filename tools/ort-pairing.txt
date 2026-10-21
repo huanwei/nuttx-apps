@@ -9,13 +9,15 @@
 #   · 本地      tools/ort-check-pairing.sh --ci
 #   · 构建面    tools/ort-check-pairing.sh（工作树模式，查 export 新鲜度）
 #
-# 最近配对事件：2026-10-21 ORT（§116 **合并态目录 rename：只补缺项 merge-copy** ——
-#               §110 的 -ENOTSUP 退役：上层已有 shadow 时只把下层尚未上移
-#               的缺项并入上层（白障/opq 感知、两边真目录才递归），随后
-#               普通 rename + 旧名白障。A 全电池绿 ×2 + 双负臂（e2e ㊱）；
-#               M 双编 run5+四探针 两 SKU 回归 PASS。内核 de6a7d4ac8。
-#               apps 侧 §116 = 夹具 layer0 增两层都有的 dir3。）
+# 最近配对事件：2026-10-21 ORT（§117 **IPC 面第五刀：M 域键命名空间退出 GC** ——
+#               每域组引用（绑定/§113 继承 +1，组销毁 -1）+ 代际；归零 →
+#               LPWORK 异步清 ort.d<enc>.；rebind 换域 -EINVAL。
+#               ★ LPWORK 在未配置低优先队列的 SKU 上重定向到 HPWORK，
+#               首版 #ifdef CONFIG_SCHED_LPWORK 圈死导致 M 降级（实锤）。
+#               A 全电池绿 ×2 + 双负臂；M 双编 run5+五探针（含 gcprobe）
+#               两 SKU PASS。内核 2767129357。
+#               apps 侧 §117 = ortsup gcprobe（仅 M）。）
 #
 # 配对历史见 git log -p tools/ort-pairing.txt
 #
-nuttx=de6a7d4ac839735ade4163773743a174a378d0c3
+nuttx=27671293571a86d13d1fcaf976e16e69939f34fd

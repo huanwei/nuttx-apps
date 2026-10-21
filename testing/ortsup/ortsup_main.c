@@ -2875,6 +2875,87 @@ static int ort_reuseprobe_driver(void)
 }
 #endif /* !CONFIG_BUILD_KERNEL */
 
+#ifndef CONFIG_BUILD_KERNEL
+/* [§117] 域键 IPC 名空间退出 GC 自测：容器（domain 0）留一条 /ortgc
+ * 后退出；**不再绑新实例** —— 旧队列只能靠"最后一个组离开"的异步
+ * 清理收掉。见证行：`mqueue ns purge: ort.d1. (1)`。 */
+
+static int ort_gcprobe_arm(int argc, FAR char *argv[])
+{
+  mqd_t mq;
+  int ret;
+
+  ret = prctl(PR_ORT_WAIT_ADMISSION, 3000);
+  if (ret != 0)
+    {
+      printf("[gcprobe] admission failed %d\n", ret);
+      return 1;
+    }
+
+  mq = mq_open("/ortgc", O_CREAT | O_RDWR, 0666, NULL);
+  if (mq == (mqd_t)-1)
+    {
+      printf("[gcprobe] open failed errno=%d\n", errno);
+      return 1;
+    }
+
+  if (mq_send(mq, "OLD", 4, 1) < 0)
+    {
+      printf("[gcprobe] send failed errno=%d\n", errno);
+      mq_close(mq);
+      return 1;
+    }
+
+  mq_close(mq);              /* 故意不 unlink */
+  printf("[gcprobe] leave=OK\n");
+  return 0;
+}
+
+static int ort_gcprobe_driver(void)
+{
+  FAR char *cargv[3];
+  pid_t pid;
+  int st = 0;
+  int ret;
+
+  cargv[0] = (FAR char *)"ortsup";
+  cargv[1] = (FAR char *)"gcprobe-arm";
+  cargv[2] = NULL;
+
+  pid = task_create("gcprobe", CONTAINER_PRIO, CONTAINER_STACK,
+                    ort_gcprobe_arm, cargv);
+  if (pid < 0)
+    {
+      printf("[gcprobe] *** create 失败: %d ***\n", (int)pid);
+      return 1;
+    }
+
+  prctl(PR_ORT_SUPERVISOR_RESET);
+  if (prctl(PR_SET_ORT_SUPERVISOR, CONFIG_ORT_SUPERVISOR_TOKEN) != 0)
+    {
+      printf("[gcprobe] *** 注册监督者失败 ***\n");
+      return 1;
+    }
+
+  ret = prctl(PR_SET_ORT_DOMAIN, 0, (int)pid);
+  if (ret != 0)
+    {
+      printf("[gcprobe] *** 绑域失败: %d ***\n", ret);
+      return 1;
+    }
+
+  waitpid(pid, &st, 0);
+  printf("[gcprobe] arm status=%d\n", st);
+
+  /* 给异步 GC（LPWORK）时间；之后不再绑该域，队列只能靠退出 GC 清 */
+
+  sleep(2);
+  printf("[gcprobe] done\n");
+  printf("GCPROBE DONE\n");
+  return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : 1;
+}
+#endif /* !CONFIG_BUILD_KERNEL */
+
 static int ort_container_main(int argc, FAR char *argv[])
 {
   FAR const char *mode = NULL;
@@ -4751,6 +4832,16 @@ int main(int argc, FAR char *argv[])
   if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "reuseprobe") == 0)
     {
       return ort_reuseprobe_driver();
+    }
+
+  if (argc > 2 && argv[1] != NULL && strcmp(argv[1], "gcprobe-arm") == 0)
+    {
+      return ort_gcprobe_arm(argc, argv);
+    }
+
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "gcprobe") == 0)
+    {
+      return ort_gcprobe_driver();
     }
 #endif
 
